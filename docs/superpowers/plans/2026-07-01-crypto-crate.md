@@ -706,7 +706,10 @@ git commit -m "feat: add identity keys, prekeys, and fingerprint"
   - `pub struct InitMessage { pub alice_identity_pub: ed25519_dalek::VerifyingKey, pub alice_ephemeral_pub: x25519_dalek::PublicKey, pub bob_signed_prekey_id: u32, pub bob_one_time_prekey_id: Option<u32> }` — `serde` derive, `Clone`
   - `pub fn initiate(alice: &IdentityKey, bob_bundle: &PreKeyBundle, one_time_prekey_id: Option<u32>) -> Result<(SessionInit, InitMessage), CryptoError>`
     - Verifies the bundle (`bob_bundle.verify()`). Picks the one-time prekey matching `one_time_prekey_id` (or `None` if the bundle has none / caller passes `None`). Generates Alice's ephemeral X25519 keypair. Computes the four DH shared secrets:
-      - `DH1 = DH(alice identity → x25519, bob signed prekey pub)`. **Note:** Alice's identity is an Ed25519 key; X3DH requires converting the Ed25519 private scalar to an X25519 secret. Use `ed25519_dalek::SigningKey::to_scalar()` (available in ed25519-dalek 2.x) to get the scalar, then construct `x25519_dalek::StaticSecret` from the 32-byte scalar. Do the same for Bob's identity public key: convert `ed25519_dalek::VerifyingKey` to a Montgomery point via `x25519_dalek::PublicKey::from_ed25519_pubkey(&bytes)` — but **x25519-dalek 2 does not export a direct Ed→Montgomery converter**. Instead, derive the X25519 public key from the Ed25519 verifying key using `curve25519-dalek`'s `MontgomeryPoint` conversion. **Verified approach:** use the `ed25519_dalek` + `x25519_dalek` interop by computing `x25519_dalek::PublicKey::from(StaticSecret::from(scalar))` where `scalar = alice.signing.to_scalar().to_bytes()`. For Bob's Ed25519 public key → X25519 public key, use the function below (a well-known Montgomery conversion) — **this is the one piece requiring `curve25519-dalek`**; add it as a dependency.
+      - `DH1 = DH(alice identity → x25519, bob signed prekey pub)`. **Note:** Alice's identity is an Ed25519 key; X3DH requires converting it to an X25519 key. The conversion is **verified against installed crate versions** (ed25519-dalek 2, x25519-dalek 2.0.1, curve25519-dalek 4.1.3): the naive `to_scalar()` path is WRONG and produces mismatched keys — do not use it. The correct interop is:
+        - **Private (Ed25519 → X25519):** `SHA-512(seed)[..32]` where `seed = sk.to_bytes()`, then `x25519_dalek::StaticSecret::from(those_32_bytes)`. x25519-dalek clamps internally on use. Requires `sha2`'s `Sha512` (already a dependency).
+        - **Public (Ed25519 → X25519):** `curve25519_dalek::edwards::CompressedEdwardsY::from_slice(&vk.to_bytes())` → `.decompress()?` → `.to_montgomery().to_bytes()` → `x25519_dalek::PublicKey::from(bytes)`. `from_slice` returns `Result`; `decompress` returns `Option`. Both failures → `CryptoError::MalformedBundle`.
+        - This requires `curve25519-dalek = { version = "4", features = ["digest"] }` as a dependency.
     - `DH2 = DH(alice ephemeral priv, bob identity pub → x25519)`
     - `DH3 = DH(alice ephemeral priv, bob signed prekey pub)`
     - `DH4 = DH(alice ephemeral priv, bob one-time prekey pub)` if present
@@ -723,8 +726,8 @@ git commit -m "feat: add identity keys, prekeys, and fingerprint"
       - Returns `SessionInit` with Bob's view (root_key, alice_identity reconstructed from `init.alice_identity_pub` as a `VerifyingKey`-only `IdentityKey` — Bob does not have Alice's signing key; store `IdentityKey` with a zeroed `signing` field and the real `verifying`). `alice_ephemeral_priv` is unknown to Bob → store as a zeroed `StaticSecret`; only `alice_ephemeral_pub` (from `init`) is meaningful on Bob's side.
 
   **Ed25519↔X25519 conversion dependency:** Add `curve25519-dalek = { version = "4", features = ["digest"] }` to `[dependencies]`. Implement two helpers in `x3dh.rs`:
-  - `fn ed25519_priv_to_x25519(sk: &ed25519_dalek::SigningKey) -> x25519_dalek::StaticSecret` — `x25519_dalek::StaticSecret::from(sk.to_scalar().to_bytes())`.
-  - `fn ed25519_pub_to_x25519(vk: &ed25519_dalek::VerifyingKey) -> x25519_dalek::PublicKey` — convert via `curve25519_dalek::edwards::CompressedEdwardsY::from_bytes(&vk.to_bytes()).unwrap()` → `.to_montgomery().to_bytes()` → `x25519_dalek::PublicKey::from(bytes)`. **The `unwrap()` here is acceptable ONLY because a valid Ed25519 verifying key always decompresses to a valid Edwards point; however, to honor the no-panic rule, wrap in `Result` and return `CryptoError::MalformedBundle` on failure.** So the helper signature is `fn ed25519_pub_to_x25519(vk: &VerifyingKey) -> Result<PublicKey, CryptoError>`.
+  - `fn ed25519_priv_to_x25519(sk: &ed25519_dalek::SigningKey) -> x25519_dalek::StaticSecret` — `let mut h = Sha512::new(); h.update(sk.to_bytes()); let d = h.finalize(); StaticSecret::from(d[..32].try_into().unwrap())`. The `try_into().unwrap()` is infallible because `d[..32]` is exactly 32 bytes; use `let mut k = [0u8;32]; k.copy_from_slice(&d[..32]); StaticSecret::from(k)` to avoid even that.
+  - `fn ed25519_pub_to_x25519(vk: &ed25519_dalek::VerifyingKey) -> Result<x25519_dalek::PublicKey, CryptoError>` — `CompressedEdwardsY::from_slice(&vk.to_bytes()).map_err(|_| CryptoError::MalformedBundle)?` then `.decompress().ok_or(CryptoError::MalformedBundle)?` then `.to_montgomery()`, copy 32 bytes, `PublicKey::from(bytes)`. No panics.
 
 - [ ] **Step 1: Add the curve25519-dalek dependency**
 
@@ -742,6 +745,7 @@ Create `crates/crypto/src/x3dh.rs`:
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::aead::{hkdf_extract, X3DH_SALT};
@@ -767,15 +771,21 @@ pub struct InitMessage {
 }
 
 fn ed25519_priv_to_x25519(sk: &SigningKey) -> StaticSecret {
-    StaticSecret::from(sk.to_scalar().to_bytes())
+    let mut h = Sha512::new();
+    h.update(sk.to_bytes());
+    let digest = h.finalize();
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&digest[..32]);
+    StaticSecret::from(k)
 }
 
 fn ed25519_pub_to_x25519(vk: &VerifyingKey) -> Result<PublicKey, CryptoError> {
-    let compressed = CompressedEdwardsY::from_bytes(&vk.to_bytes());
-    if compressed.is_none().into() {
-        return Err(CryptoError::MalformedBundle);
-    }
-    let mont = compressed.unwrap().to_montgomery();
+    let compressed = CompressedEdwardsY::from_slice(&vk.to_bytes())
+        .map_err(|_| CryptoError::MalformedBundle)?;
+    let mont = compressed
+        .decompress()
+        .ok_or(CryptoError::MalformedBundle)?
+        .to_montgomery();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&mont.to_bytes());
     Ok(PublicKey::from(bytes))
@@ -991,7 +1001,7 @@ pub use error::CryptoError;
 Run: `cargo test -p um_crypto x3dh`
 Expected: PASS — 5 tests pass.
 
-  **If `SigningKey::from_bytes(&[0u8; 32])` or `to_scalar()` does not exist in the installed version:** `ed25519-dalek` 2.x exposes `SigningKey::from_bytes(&[u8;32])` and `SigningKey::to_scalar()` returning a `curve25519_dalek::scalar::Scalar`. If `to_scalar` is unavailable, use `StaticSecret::from(sk.to_bytes())` directly (the Ed25519 secret seed's SHA-512-derived clamped scalar equals the X25519 static secret only via the standard derivation; the canonical interop is `to_scalar`). Verify by the test passing — if `to_scalar` is missing, fall back to `StaticSecret::from(sk.to_bytes())` and re-run; the round-trip test will still pass because both sides use the same conversion. Prefer `to_scalar()` if present.
+  **Note on the Ed25519↔X25519 conversion:** the conversion helpers (`ed25519_priv_to_x25519` via SHA-512, `ed25519_pub_to_x25519` via `CompressedEdwardsY::from_slice` + `decompress` + `to_montgomery`) were verified against the installed crate versions before this plan was committed — both interop tests (`x_pub_from_scalar == montgomery(ed_pub)`, and DH symmetry across two Ed25519 identities) pass. `SigningKey::from_bytes(&[0u8; 32])` is used in `receive` to construct a placeholder Alice identity (Bob does not have Alice's signing key); this is valid. Do NOT switch to `to_scalar()` — it produces mismatched keys and silently breaks X3DH.
 
 - [ ] **Step 6: Commit**
 
@@ -1897,7 +1907,7 @@ git commit -m "test: add cross-module integration and property tests"
 - File/media attachments (per-attachment key via HKDF, chunked) → **deferred to the client/protocol plan** (the crypto primitives — `hkdf_expand`, `seal`/`open` — exist from Task 3; the attachment chunking logic is a client-side concern, not a crypto-crate concern). Not a gap for this plan.
 - Testing posture (proptest, round-trip, out-of-order, tamper) → Tasks 3–8 ✓
 
-**2. Placeholder scan:** No "TBD"/"TODO"/"implement later". Two intentional `expect()` calls in `aead.rs` (`seal`, `hkdf_expand`) are on infallible paths (valid key/nonce lengths, expand within HMAC output limit) — acceptable and documented inline. The Ed25519→Montgomery conversion uses `Result`, not `unwrap`, honoring the no-panic rule. One `unwrap()` remains in `x3dh.rs`'s `ed25519_pub_to_x25519` after the `is_none()` guard — it is provably unreachable after the guard; acceptable.
+**2. Placeholder scan:** No "TBD"/"TODO"/"implement later". Two intentional `expect()` calls in `aead.rs` (`seal`, `hkdf_expand`) are on infallible paths (valid key/nonce lengths, expand within HMAC output limit) — acceptable and documented inline. The Ed25519→Montgomery conversion uses `Result`/`Option` throughout (`from_slice` → `map_err`, `decompress` → `ok_or`), no panics, honoring the no-panic rule. The Ed25519↔X25519 interop was verified by standalone tests before the plan was committed (SHA-512 seed derivation for the private key; `CompressedEdwardsY`→`to_montgomery` for the public key).
 
 **3. Type consistency:**
 - `SessionInit` fields: `root_key`, `alice_identity`, `alice_ephemeral_priv`, `alice_ephemeral_pub`, `bob_signed_prekey_id`, `bob_one_time_prekey_id` (Task 5) + `bob_signed_prekey_pub` (added in Task 6 Step 1). Task 6's `init_alice` uses `session_init.bob_signed_prekey_pub` ✓.
