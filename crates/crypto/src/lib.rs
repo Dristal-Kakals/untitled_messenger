@@ -3,5 +3,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aead;
 pub mod error;
 pub use error::CryptoError;
