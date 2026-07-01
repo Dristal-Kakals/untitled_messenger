@@ -21,6 +21,12 @@ use crate::ClientError;
 /// A client's cryptographic session state. Owns the identity key, the
 /// signed prekey, the one-time prekeys, a ratchet session per peer (keyed by
 /// the peer's identity pub), and a Sender Keys `GroupSession` per group id.
+///
+/// `Serialize`/`Deserialize` so the GUI bridge can persist the whole session
+/// (encrypted) to the local store under a single key and restore it on unlock.
+/// All fields are serde-capable crypto types; the derived impl round-trips
+/// through postcard in `Store::put`/`get`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClientSession {
     identity: IdentityKey,
     signed_prekey: SignedPreKey,
@@ -53,6 +59,12 @@ impl ClientSession {
     /// This client's identity public key (32 bytes).
     pub fn identity_pub(&self) -> [u8; 32] {
         self.identity.verifying.to_bytes()
+    }
+
+    /// This client's identity fingerprint (`SHA-256` of the identity pub),
+    /// for manual/QR verification in the UI.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.identity.fingerprint()
     }
 
     /// Build the protocol `PreKeyBundle` to register with the server.

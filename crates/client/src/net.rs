@@ -50,6 +50,57 @@ impl Client {
             self.buf.extend_from_slice(&chunk[..n]);
         }
     }
+
+    /// Split this client into a reader and a writer that can be moved to
+    /// separate tasks (the GUI bridge runs a recv-loop and a command loop
+    /// concurrently). The reader owns the read half + framing buffer; the
+    /// writer owns the write half. Both are `Send`.
+    pub fn into_split(self) -> (ClientReader, ClientWriter) {
+        let Client {
+            reader,
+            writer,
+            buf,
+        } = self;
+        (ClientReader { reader, buf }, ClientWriter { writer })
+    }
+}
+
+/// The read half of a split [`Client`]. Owns the framed read buffer.
+pub struct ClientReader {
+    reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    buf: Vec<u8>,
+}
+
+impl ClientReader {
+    /// Receive one server message. Returns `None` on EOF.
+    pub async fn recv_msg(&mut self) -> Result<Option<ServerMessage>, ClientError> {
+        loop {
+            if let Ok((msg, consumed)) = decode::<ServerMessage>(&self.buf) {
+                self.buf.drain(0..consumed);
+                return Ok(Some(msg));
+            }
+            let mut chunk = [0u8; 4096];
+            let n = self.reader.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}
+
+/// The write half of a split [`Client`].
+pub struct ClientWriter {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl ClientWriter {
+    /// Send one client message (framed).
+    pub async fn send_msg(&mut self, msg: &ClientMessage) -> Result<(), ClientError> {
+        let frame = encode(msg)?;
+        self.writer.write_all(&frame).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

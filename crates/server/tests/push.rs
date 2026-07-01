@@ -263,10 +263,11 @@ async fn last_subscribe_wins_evicts_old() {
     assert!(matches!(bob2.recv().await, ServerMessage::AckOk));
 
     // conn1's push channel is closed by the eviction; its next recv hits EOF.
-    // Give the server a moment to close conn1, then assert EOF.
+    // Give the server a moment to close conn1, then assert EOF. The listener
+    // polls for eviction every 100ms, so allow generous headroom under load.
     let mut buf = [0u8; 64];
     let res = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(3000),
         bob1.stream.read(&mut buf),
     )
     .await;

@@ -1,0 +1,33 @@
+[package]
+name = "um_gui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "um_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "um-gui"
+path = "src/main.rs"
+
+[dependencies]
+um_client = { path = "../client" }
+um_protocol = { path = "../protocol" }
+um_crypto = { path = "../crypto" }
+iced = { version = "0.13", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+thiserror = "1"
+sha2 = "0.10"
+postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+um_server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "test-util"] }

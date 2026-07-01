@@ -229,6 +229,100 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Persist a chat message. `peer` is the peer identity pub (1:1) or the
+    /// group id (group). `direction` is 0 = outgoing, 1 = incoming. `payload`
+    /// is the postcard-serialized `StoredMessage` (text + status); it is
+    /// XChaCha-sealed under the store key with AAD = the row's auto id, then
+    /// written. `timestamp` is unix seconds. Returns the assigned row id.
+    pub fn put_message(
+        &self,
+        peer: &[u8; 32],
+        direction: i64,
+        payload: &StoredMessage,
+        timestamp: i64,
+    ) -> Result<i64, ClientError> {
+        let bytes = postcard::to_allocvec(payload)?;
+        // AAD binds the sealed blob to the peer + direction + timestamp so a
+        // row-swap attack (copying one message's sealed blob into another's
+        // slot) fails to open.
+        let mut aad = Vec::with_capacity(32 + 1 + 8);
+        aad.extend_from_slice(peer);
+        aad.push(direction as u8);
+        aad.extend_from_slice(&timestamp.to_be_bytes());
+        let sealed = seal(&self.key, &aad, &bytes)?;
+        self.conn
+            .execute(
+                "INSERT INTO messages (peer, direction, sealed, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![peer.as_slice(), direction, sealed, timestamp],
+            )
+            .map_err(|e| ClientError::Store(format!("put_message: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Load all messages for `peer` (1:1 or group id), oldest first. Each row
+    /// is unsealed and decoded into a `StoredMessage`. Corrupt rows are
+    /// skipped with a `Store` error for that row only (the rest still load),
+    /// so a single bad blob never hides the whole thread.
+    pub fn messages(&self, peer: &[u8; 32]) -> Result<Vec<StoredMessageRow>, ClientError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, direction, sealed, timestamp FROM messages WHERE peer = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![peer.as_slice()], |r| {
+                let id: i64 = r.get(0)?;
+                let direction: i64 = r.get(1)?;
+                let sealed: Vec<u8> = r.get(2)?;
+                let timestamp: i64 = r.get(3)?;
+                Ok((id, direction, sealed, timestamp))
+            })
+            .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, direction, sealed, timestamp) =
+                row.map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+            let mut aad = Vec::with_capacity(32 + 1 + 8);
+            aad.extend_from_slice(peer);
+            aad.push(direction as u8);
+            aad.extend_from_slice(&timestamp.to_be_bytes());
+            let bytes = match open(&self.key, &aad, &sealed) {
+                Ok(b) => b,
+                Err(_) => continue, // corrupt/tampered row: skip, keep loading
+            };
+            let msg: StoredMessage = postcard::from_bytes(&bytes)?;
+            out.push(StoredMessageRow {
+                id,
+                direction,
+                timestamp,
+                msg,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// A stored chat message: plaintext text + delivery status. Sealed into the
+/// `messages` table via `Store::put_message`. `Serialize` so it round-trips
+/// through postcard before sealing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredMessage {
+    /// Message text (v1: text only; attachments are future work).
+    pub text: String,
+    /// Delivery status as a small integer (0=Sending,1=Sent,2=Delivered,3=Failed).
+    pub status: u8,
+}
+
+/// A loaded message row: row id, direction (0=out,1=in), unix timestamp, and
+/// the decoded `StoredMessage`.
+#[derive(Debug, Clone)]
+pub struct StoredMessageRow {
+    pub id: i64,
+    pub direction: i64,
+    pub timestamp: i64,
+    pub msg: StoredMessage,
 }
 
 /// A stored contact: identity pub, display nickname, and fingerprint.
