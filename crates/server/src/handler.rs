@@ -52,7 +52,26 @@ pub fn handle(
             if !recipients.iter().all(|r| store.is_registered(r)) {
                 return ServerMessage::Error(um_protocol::ServerError::UnknownRecipient);
             }
-            let _delivered = store.deliver(&recipients, envelope);
+            let delivered = store.deliver(&recipients, envelope);
+            // Push to any live subscriber. try_send is non-blocking; on Full
+            // (slow client) or Closed (subscriber gone) we skip the push — the
+            // envelope remains in the outbox and is recovered on the next
+            // Subscribe-flush or Poll.
+            for (recipient, _id, env) in delivered {
+                if let Some(tx) = subs.get(&recipient) {
+                    match tx.try_send(ServerMessage::Delivered(vec![env])) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                "push channel full for recipient, envelope stays in outbox"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // Subscriber vanished between get and send; ignore.
+                        }
+                    }
+                }
+            }
             ServerMessage::AckOk
         }
         ClientMessage::Poll { since } => {
@@ -280,5 +299,116 @@ mod tests {
         let (id, _) = real_bundle(true);
         let reply = handle(&store, &Subscribers::new(), &id, ClientMessage::Subscribe);
         assert_eq!(reply, ServerMessage::AckOk);
+    }
+
+    #[test]
+    fn send_pushes_to_live_subscriber() {
+        let store = Store::new();
+        let subs = Subscribers::new();
+        let (alice, bundle_a) = real_bundle(true);
+        let (bob, bundle_b) = real_bundle(true);
+        handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &subs,
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
+        // Bob subscribes: register a push channel for bob.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ServerMessage>(256);
+        subs.register(bob, tx);
+        // Alice sends to bob.
+        let reply = handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Send {
+                recipients: vec![bob],
+                envelope: envelope(0),
+            },
+        );
+        assert_eq!(reply, ServerMessage::AckOk);
+        // Bob's push channel received a Delivered frame.
+        let pushed = rx.try_recv().expect("push delivered");
+        match pushed {
+            ServerMessage::Delivered(v) => assert_eq!(v.len(), 1),
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_to_offline_recipient_no_push_but_delivered() {
+        let store = Store::new();
+        let subs = Subscribers::new();
+        let (alice, bundle_a) = real_bundle(true);
+        let (bob, bundle_b) = real_bundle(true);
+        handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &subs,
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
+        // Bob is NOT subscribed (no push channel registered).
+        let reply = handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Send {
+                recipients: vec![bob],
+                envelope: envelope(0),
+            },
+        );
+        assert_eq!(reply, ServerMessage::AckOk);
+        // No push channel exists for bob, so nothing to recv. The envelope is
+        // still in bob's outbox.
+        assert_eq!(store.poll(&bob, 0).len(), 1);
+    }
+
+    #[test]
+    fn send_push_full_channel_skips_keeps_outbox() {
+        let store = Store::new();
+        let subs = Subscribers::new();
+        let (alice, bundle_a) = real_bundle(true);
+        let (bob, bundle_b) = real_bundle(true);
+        handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &subs,
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
+        // Bob's push channel has capacity 1 and is already full.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ServerMessage>(1);
+        tx.try_send(ServerMessage::AckOk).expect("seed full");
+        subs.register(bob, tx);
+        // Alice sends to bob; try_send hits Full, push is skipped.
+        let reply = handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Send {
+                recipients: vec![bob],
+                envelope: envelope(0),
+            },
+        );
+        assert_eq!(reply, ServerMessage::AckOk);
+        // The envelope is still in bob's outbox (recoverable on flush/poll).
+        assert_eq!(store.poll(&bob, 0).len(), 1);
     }
 }

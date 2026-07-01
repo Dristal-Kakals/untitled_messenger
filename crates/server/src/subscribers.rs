@@ -102,7 +102,7 @@ mod tests {
         // The registry still holds tx2 (the current subscriber).
         assert!(subs
             .get(&[0x11; 32])
-            .map_or(false, |s| s.same_channel(&tx2_clone)));
+            .is_some_and(|s| s.same_channel(&tx2_clone)));
     }
 
     #[test]
