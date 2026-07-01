@@ -65,9 +65,11 @@ fn envelope() -> EncryptedEnvelope {
     EncryptedEnvelope {
         id: 0,
         sender: [0x55; 32],
+        kind: um_protocol::MessageKind::Direct,
         header: vec![1, 2, 3],
         init: None,
         ciphertext: vec![0xAA; 8],
+        signature: vec![],
     }
 }
 
@@ -105,9 +107,11 @@ async fn subscribe_receives_push_for_new_message() {
             envelope: EncryptedEnvelope {
                 id: 0,
                 sender: alice_pub,
+                kind: um_protocol::MessageKind::Direct,
                 header: vec![1, 2, 3],
                 init: None,
                 ciphertext: vec![0xAA; 8],
+                signature: vec![],
             },
         })
         .await;

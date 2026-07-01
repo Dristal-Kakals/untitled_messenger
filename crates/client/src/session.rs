@@ -1,26 +1,32 @@
-//! Client session state: identity, prekeys, and per-peer Double Ratchet
-//! sessions. This is the crypto-facing core of the client — it owns the
-//! keys and drives X3DH + the ratchet. No networking; callers hand it
-//! bundles/envelopes and it returns envelopes/plaintext.
+//! Client session state: identity, prekeys, per-peer Double Ratchet
+//! sessions, and per-group Sender Keys sessions. This is the crypto-facing
+//! core of the client — it owns the keys and drives X3DH + the ratchet for
+//! 1:1 traffic and Sender Keys for group traffic. No networking; callers hand
+//! it bundles/envelopes and it returns envelopes/plaintext.
 
 use std::collections::HashMap;
 
 use um_crypto::double_ratchet::RatchetSession;
 use um_crypto::identity::{IdentityKey, OneTimePreKey, PreKeyBundle as CryptoBundle, SignedPreKey};
+use um_crypto::sender_keys::{GroupEncrypted, GroupSession, SenderKeyState};
 use um_crypto::x3dh;
-use um_protocol::{EncryptedEnvelope, PreKeyBundle};
+use um_protocol::{EncryptedEnvelope, MessageKind, PreKeyBundle};
 
-use crate::crypto_bridge::{encrypted_from_envelope, envelope_from_encrypted, init_from_envelope};
+use crate::crypto_bridge::{
+    encrypted_from_envelope, envelope_from_encrypted, envelope_from_group_encrypted,
+    group_encrypted_from_envelope, init_from_envelope,
+};
 use crate::ClientError;
 
 /// A client's cryptographic session state. Owns the identity key, the
-/// signed prekey, the one-time prekeys, and a ratchet session per peer
-/// (keyed by the peer's identity pub).
+/// signed prekey, the one-time prekeys, a ratchet session per peer (keyed by
+/// the peer's identity pub), and a Sender Keys `GroupSession` per group id.
 pub struct ClientSession {
     identity: IdentityKey,
     signed_prekey: SignedPreKey,
     one_time_prekeys: HashMap<u32, OneTimePreKey>,
     ratchets: HashMap<[u8; 32], RatchetSession>,
+    groups: HashMap<[u8; 32], GroupSession>,
 }
 
 impl ClientSession {
@@ -40,6 +46,7 @@ impl ClientSession {
             signed_prekey,
             one_time_prekeys,
             ratchets: HashMap::new(),
+            groups: HashMap::new(),
         }
     }
 
@@ -110,10 +117,89 @@ impl ClientSession {
         Ok(envelope)
     }
 
-    /// Receive and decrypt an envelope. If it carries an X3DH init and no
-    /// session exists yet, seeds a new ratchet (Bob's side). Returns the
-    /// decrypted plaintext and the sender's identity pub.
+    // ---- Group (Sender Keys) ------------------------------------------------
+
+    /// Create a fresh group session for `group_id`. The caller is the group
+    /// founder; their own sender-key state is generated and stored. Peers are
+    /// added later via `add_group_peer` after their distribution state is
+    /// received (typically sent individually-encrypted over each 1:1 ratchet).
+    pub fn create_group(&mut self, group_id: [u8; 32]) -> Result<(), ClientError> {
+        let session = GroupSession::new(group_id, &self.identity)?;
+        self.groups.insert(group_id, session);
+        Ok(())
+    }
+
+    /// Export this client's own sender-key distribution state for `group_id`,
+    /// to be sent to every other member of the group. In a real client this is
+    /// individually-encrypted to each peer over their 1:1 Double Ratchet and
+    /// sent via the relay; here we just hand back the typed state so the
+    /// caller can transport it however they like. Fails if the group is
+    /// unknown.
+    pub fn group_distribution(&self, group_id: &[u8; 32]) -> Result<SenderKeyState, ClientError> {
+        let session = self
+            .groups
+            .get(group_id)
+            .ok_or(ClientError::NoGroupSession(hex_id(group_id)))?;
+        Ok(session.export_self_state())
+    }
+
+    /// Import a peer's sender-key distribution state into the group session
+    /// for `group_id`. After this the client can decrypt group messages from
+    /// that peer. Fails if the local group session does not exist (the peer
+    /// must already have `create_group`'d or otherwise imported the group).
+    pub fn add_group_peer(
+        &mut self,
+        group_id: &[u8; 32],
+        state: SenderKeyState,
+    ) -> Result<(), ClientError> {
+        let session = self
+            .groups
+            .get_mut(group_id)
+            .ok_or(ClientError::NoGroupSession(hex_id(group_id)))?;
+        session.add_peer(state)?;
+        Ok(())
+    }
+
+    /// Encrypt a group message for `group_id`. Returns a wire envelope with
+    /// `kind = Group`. The envelope id is left 0; the server assigns the real
+    /// id. The caller is responsible for fanning the envelope out to every
+    /// group member's identity pub via the relay's `recipients` list.
+    pub fn send_group(
+        &mut self,
+        group_id: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<EncryptedEnvelope, ClientError> {
+        let session = self
+            .groups
+            .get_mut(group_id)
+            .ok_or(ClientError::NoGroupSession(hex_id(group_id)))?;
+        let group_encrypted: GroupEncrypted = session.encrypt(plaintext)?;
+        let envelope = envelope_from_group_encrypted(0, self.identity_pub(), &group_encrypted)?;
+        Ok(envelope)
+    }
+
+    /// True if a group session for `group_id` exists locally.
+    pub fn has_group(&self, group_id: &[u8; 32]) -> bool {
+        self.groups.contains_key(group_id)
+    }
+
+    /// Receive and decrypt an envelope. Routes by `kind`: `Direct` runs the
+    /// 1:1 Double Ratchet path (seeding a new ratchet from the X3DH init on
+    /// first contact); `Group` runs the Sender Keys path against the matching
+    /// `GroupSession`. Returns the decrypted plaintext and the sender's
+    /// identity pub.
     pub fn receive(
+        &mut self,
+        envelope: &EncryptedEnvelope,
+    ) -> Result<(Vec<u8>, [u8; 32]), ClientError> {
+        match envelope.kind {
+            MessageKind::Direct => self.receive_direct(envelope),
+            MessageKind::Group => self.receive_group(envelope),
+        }
+    }
+
+    /// 1:1 Double Ratchet receive path.
+    fn receive_direct(
         &mut self,
         envelope: &EncryptedEnvelope,
     ) -> Result<(Vec<u8>, [u8; 32]), ClientError> {
@@ -150,6 +236,22 @@ impl ClientSession {
         Ok((plaintext, sender))
     }
 
+    /// Group Sender Keys receive path. Looks up the `GroupSession` by the
+    /// `group_id` encoded in the group header and decrypts with it.
+    fn receive_group(
+        &mut self,
+        envelope: &EncryptedEnvelope,
+    ) -> Result<(Vec<u8>, [u8; 32]), ClientError> {
+        let group_encrypted = group_encrypted_from_envelope(envelope)?;
+        let group_id = group_encrypted.header.group_id;
+        let session = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(ClientError::NoGroupSession(hex_id(&group_id)))?;
+        let plaintext = session.decrypt(&group_encrypted)?;
+        Ok((plaintext, envelope.sender))
+    }
+
     /// Reconstruct a typed crypto `PreKeyBundle` from a protocol bundle.
     fn reconstruct_peer_bundle(&self, bundle: &PreKeyBundle) -> Result<CryptoBundle, ClientError> {
         use um_crypto::{Signature, VerifyingKey};
@@ -176,6 +278,15 @@ impl ClientSession {
 /// Decode 32 bytes into an X25519 `PublicKey`.
 fn x25519_pub(bytes: &[u8; 32]) -> Result<x25519_dalek::PublicKey, ClientError> {
     Ok(x25519_dalek::PublicKey::from(*bytes))
+}
+
+/// Render a 32-byte id as a short hex string for error messages.
+fn hex_id(id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in &id[..4] {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -238,9 +349,11 @@ mod tests {
         let env = EncryptedEnvelope {
             id: 1,
             sender: [0x77; 32],
+            kind: um_protocol::MessageKind::Direct,
             header: vec![1, 2, 3],
             init: None,
             ciphertext: vec![0xAA; 8],
+            signature: vec![],
         };
         let err = alice.receive(&env).unwrap_err();
         assert!(matches!(err, ClientError::NoSession));
@@ -261,5 +374,100 @@ mod tests {
         let env_b = bob.send(&alice.identity_pub(), b"world").unwrap();
         let (pt, _) = alice.receive(&env_b).unwrap();
         assert_eq!(pt, b"world");
+    }
+
+    // ---- Group (Sender Keys) session tests ----------------------------------
+
+    /// Two members create a group, exchange distributions, and each can
+    /// encrypt + decrypt group messages through the session API.
+    #[test]
+    fn group_two_members_round_trip() {
+        let mut alice = ClientSession::generate(1);
+        let mut bob = ClientSession::generate(1);
+        let gid = [0xAA; 32];
+
+        alice.create_group(gid).unwrap();
+        bob.create_group(gid).unwrap();
+
+        // Exchange distributions (in-band this rides the 1:1 ratchet; here we
+        // pass the typed state directly).
+        let alice_state = alice.group_distribution(&gid).unwrap();
+        let bob_state = bob.group_distribution(&gid).unwrap();
+        alice.add_group_peer(&gid, bob_state).unwrap();
+        bob.add_group_peer(&gid, alice_state).unwrap();
+
+        // Alice -> group.
+        let env = alice.send_group(&gid, b"hi group").unwrap();
+        assert_eq!(env.kind, MessageKind::Group);
+        assert!(env.init.is_none());
+        assert!(
+            !env.signature.is_empty(),
+            "group env must carry a signature"
+        );
+        let (pt, sender) = bob.receive(&env).unwrap();
+        assert_eq!(pt, b"hi group");
+        assert_eq!(sender, alice.identity_pub());
+
+        // Bob -> group.
+        let env2 = bob.send_group(&gid, b"hello back").unwrap();
+        let (pt2, _) = alice.receive(&env2).unwrap();
+        assert_eq!(pt2, b"hello back");
+    }
+
+    /// A three-member group: each member distributes to the other two, and
+    /// any member's message decrypts for both peers.
+    #[test]
+    fn group_three_members_all_decrypt() {
+        let mut a = ClientSession::generate(1);
+        let mut b = ClientSession::generate(1);
+        let mut c = ClientSession::generate(1);
+        let gid = [0xBB; 32];
+
+        for s in [&mut a, &mut b, &mut c] {
+            s.create_group(gid).unwrap();
+        }
+        // Full mesh distribution.
+        let a_state = a.group_distribution(&gid).unwrap();
+        let b_state = b.group_distribution(&gid).unwrap();
+        let c_state = c.group_distribution(&gid).unwrap();
+        b.add_group_peer(&gid, a_state.clone()).unwrap();
+        c.add_group_peer(&gid, a_state).unwrap();
+        a.add_group_peer(&gid, b_state.clone()).unwrap();
+        c.add_group_peer(&gid, b_state).unwrap();
+        a.add_group_peer(&gid, c_state.clone()).unwrap();
+        b.add_group_peer(&gid, c_state).unwrap();
+
+        // A sends; b and c both decrypt.
+        let env = a.send_group(&gid, b"from a").unwrap();
+        assert_eq!(b.receive(&env).unwrap().0, b"from a");
+        assert_eq!(c.receive(&env).unwrap().0, b"from a");
+
+        // C sends; a and b both decrypt.
+        let env2 = c.send_group(&gid, b"from c").unwrap();
+        assert_eq!(a.receive(&env2).unwrap().0, b"from c");
+        assert_eq!(b.receive(&env2).unwrap().0, b"from c");
+    }
+
+    /// Receiving a group message with no local group session errors.
+    #[test]
+    fn group_receive_without_session_errors() {
+        let mut alice = ClientSession::generate(1);
+        // Build a real group envelope from a stranger's group alice never
+        // joined, so the header/signature are well-formed and the only failure
+        // is the missing local group session.
+        let mut stranger = ClientSession::generate(1);
+        let gid = [0x77; 32];
+        stranger.create_group(gid).unwrap();
+        let env = stranger.send_group(&gid, b"injected").unwrap();
+        let err = alice.receive(&env).unwrap_err();
+        assert!(matches!(err, ClientError::NoGroupSession(_)));
+    }
+
+    /// `send_group` on an unknown group errors rather than panicking.
+    #[test]
+    fn send_group_without_session_errors() {
+        let mut alice = ClientSession::generate(1);
+        let err = alice.send_group(&[0x99; 32], b"hi").unwrap_err();
+        assert!(matches!(err, ClientError::NoGroupSession(_)));
     }
 }

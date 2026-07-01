@@ -134,9 +134,11 @@ mod tests {
         EncryptedEnvelope {
             id,
             sender: [0x55; 32],
+            kind: um_protocol::MessageKind::Direct,
             header: vec![1, 2, 3],
             init: None,
             ciphertext: vec![0xAA; 8],
+            signature: vec![],
         }
     }
 

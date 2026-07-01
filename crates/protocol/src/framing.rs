@@ -44,15 +44,17 @@ pub fn decode<T: for<'de> serde::Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{ClientMessage, EncryptedEnvelope, ServerMessage};
+    use crate::message::{ClientMessage, EncryptedEnvelope, MessageKind, ServerMessage};
 
     fn sample_envelope(id: u64) -> EncryptedEnvelope {
         EncryptedEnvelope {
             id,
             sender: [0xBB; 32],
+            kind: MessageKind::Direct,
             header: vec![1, 2, 3],
             init: None,
             ciphertext: b"test payload".to_vec(),
+            signature: vec![],
         }
     }
 

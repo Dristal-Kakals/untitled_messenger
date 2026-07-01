@@ -15,6 +15,8 @@ pub enum ClientError {
     Sqlite(#[from] rusqlite::Error),
     #[error("no session with peer")]
     NoSession,
+    #[error("no group session with id {0}")]
+    NoGroupSession(String),
     #[error("no one-time prekey with id {0}")]
     NoOneTimePreKey(u32),
     #[error("store error: {0}")]

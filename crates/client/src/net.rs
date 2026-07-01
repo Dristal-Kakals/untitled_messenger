@@ -159,9 +159,11 @@ mod tests {
                 envelope: um_protocol::EncryptedEnvelope {
                     id: 0,
                     sender: alice_pub,
+                    kind: um_protocol::MessageKind::Direct,
                     header: vec![1, 2, 3],
                     init: None,
                     ciphertext: vec![0xAA; 8],
+                    signature: vec![],
                 },
             })
             .await

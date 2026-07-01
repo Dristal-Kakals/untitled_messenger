@@ -219,3 +219,141 @@ async fn e2e_alternating_messages_stay_in_sync() {
         last_alice = db[0].id;
     }
 }
+
+/// E2E group exchange over real TCP. Three members register, each fetches the
+/// others' bundles, they establish pairwise 1:1 ratchets, then found a group
+/// and distribute their Sender Key states to each other *over those 1:1
+/// ratchets* (as the spec requires). Finally any member's group message
+/// decrypts for both peers through the relay.
+///
+/// Distribution payloads are carried as the plaintext of 1:1 ratchet messages;
+/// the receiver decrypts the 1:1 envelope, then feeds the recovered typed
+/// `SenderKeyState` into its group session. This mirrors how a real client
+/// transports sender-key distribution without a dedicated wire message.
+#[tokio::test]
+async fn e2e_group_three_members_decrypt_each_other() {
+    let store = Arc::new(Store::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs).await.expect("serve");
+
+    let mut sa = ClientSession::generate(5);
+    let mut sb = ClientSession::generate(5);
+    let mut sc = ClientSession::generate(5);
+    let pa = sa.identity_pub();
+    let pb = sb.identity_pub();
+    let pc = sc.identity_pub();
+
+    let mut ca = Client::connect(addr).await.expect("a connect");
+    let mut cb = Client::connect(addr).await.expect("b connect");
+    let mut cc = Client::connect(addr).await.expect("c connect");
+    register(&mut ca, &sa).await;
+    register(&mut cb, &sb).await;
+    register(&mut cc, &sc).await;
+
+    // Establish pairwise 1:1 sessions. A fetches B and C; B fetches C. Each
+    // first 1:1 message carries the X3DH init so the peer seeds a ratchet.
+    // Each delivered envelope is acked right after it is consumed, so a later
+    // poll never re-delivers an already-processed envelope (which would desync
+    // the ratchet recv chain).
+    let bundle_b = fetch_bundle(&mut ca, pb).await;
+    let bundle_c = fetch_bundle(&mut ca, pc).await;
+    let bundle_c_for_b = fetch_bundle(&mut cb, pc).await;
+
+    // A -> B: seed + a throwaway first message.
+    let env = sa
+        .start_session(&bundle_b, b"a->b seed")
+        .expect("a start b");
+    send_envelope(&mut ca, vec![pb], env).await;
+    let d = poll(&mut cb, 0).await;
+    sb.receive(&d[0]).expect("b recv seed");
+    ack(&mut cb, vec![d[0].id]).await;
+
+    // A -> C: seed.
+    let env = sa
+        .start_session(&bundle_c, b"a->c seed")
+        .expect("a start c");
+    send_envelope(&mut ca, vec![pc], env).await;
+    let d = poll(&mut cc, 0).await;
+    sc.receive(&d[0]).expect("c recv seed");
+    ack(&mut cc, vec![d[0].id]).await;
+
+    // B -> C: seed.
+    let env = sb
+        .start_session(&bundle_c_for_b, b"b->c seed")
+        .expect("b start c");
+    send_envelope(&mut cb, vec![pc], env).await;
+    let d = poll(&mut cc, 0).await;
+    sc.receive(&d[0]).expect("c recv b seed");
+    ack(&mut cc, vec![d[0].id]).await;
+
+    // Found the group on every member.
+    let gid = [0x42; 32];
+    sa.create_group(gid).expect("a create group");
+    sb.create_group(gid).expect("b create group");
+    sc.create_group(gid).expect("c create group");
+
+    // Helper: ship one member's distribution state to a peer over their 1:1
+    // ratchet. The state is postcard-encoded as the 1:1 plaintext; the
+    // receiver decrypts, decodes it, and acks so a later poll never
+    // re-delivers it.
+    async fn ship_distribution(
+        sender_net: &mut Client,
+        sender_sess: &mut ClientSession,
+        to_pub: [u8; 32],
+        recv_net: &mut Client,
+        recv_sess: &mut ClientSession,
+        gid: [u8; 32],
+    ) {
+        let state = sender_sess.group_distribution(&gid).expect("dist");
+        let bytes = postcard::to_allocvec(&state).expect("encode dist");
+        let env = sender_sess.send(&to_pub, &bytes).expect("send dist");
+        send_envelope(sender_net, vec![to_pub], env).await;
+        let d = poll(recv_net, 0).await;
+        let (pt, _) = recv_sess.receive(&d[0]).expect("recv dist");
+        ack(recv_net, vec![d[0].id]).await;
+        let state: um_crypto::sender_keys::SenderKeyState =
+            postcard::from_bytes(&pt).expect("decode dist");
+        recv_sess.add_group_peer(&gid, state).expect("add peer");
+    }
+
+    // Full-mesh distribution: each member sends its state to the other two.
+    ship_distribution(&mut ca, &mut sa, pb, &mut cb, &mut sb, gid).await; // a->b
+    ship_distribution(&mut ca, &mut sa, pc, &mut cc, &mut sc, gid).await; // a->c
+    ship_distribution(&mut cb, &mut sb, pa, &mut ca, &mut sa, gid).await; // b->a
+    ship_distribution(&mut cb, &mut sb, pc, &mut cc, &mut sc, gid).await; // b->c
+    ship_distribution(&mut cc, &mut sc, pa, &mut ca, &mut sa, gid).await; // c->a
+    ship_distribution(&mut cc, &mut sc, pb, &mut cb, &mut sb, gid).await; // c->b
+
+    // A sends a group message fanned out to B and C. Both decrypt it.
+    let genv = sa.send_group(&gid, b"hello group").expect("a group send");
+    assert_eq!(genv.kind, um_protocol::MessageKind::Group);
+    let recipients = vec![pb, pc];
+    send_envelope(&mut ca, recipients, genv).await;
+
+    let db = poll(&mut cb, 0).await;
+    assert_eq!(db.len(), 1);
+    let (ptb, sb_sender) = sb.receive(&db[0]).expect("b group recv");
+    assert_eq!(ptb, b"hello group");
+    assert_eq!(sb_sender, pa);
+    ack(&mut cb, vec![db[0].id]).await;
+
+    let dc = poll(&mut cc, 0).await;
+    assert_eq!(dc.len(), 1);
+    let (ptc, sc_sender) = sc.receive(&dc[0]).expect("c group recv");
+    assert_eq!(ptc, b"hello group");
+    assert_eq!(sc_sender, pa);
+    ack(&mut cc, vec![dc[0].id]).await;
+
+    // B replies to the group; A and C decrypt.
+    let genv2 = sb.send_group(&gid, b"hi from b").expect("b group send");
+    send_envelope(&mut cb, vec![pa, pc], genv2).await;
+    let da = poll(&mut ca, 0).await;
+    assert_eq!(da.len(), 1);
+    let (pta, _) = sa.receive(&da[0]).expect("a group recv");
+    assert_eq!(pta, b"hi from b");
+    ack(&mut ca, vec![da[0].id]).await;
+    let dc2 = poll(&mut cc, 0).await;
+    assert_eq!(dc2.len(), 1);
+    let (ptc2, _) = sc.receive(&dc2[0]).expect("c group recv b");
+    assert_eq!(ptc2, b"hi from b");
+}

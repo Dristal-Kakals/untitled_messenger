@@ -5,14 +5,16 @@
 //! `serde` impls. No logic — just encoding.
 
 use um_crypto::double_ratchet::{Encrypted, Header};
+use um_crypto::sender_keys::{GroupEncrypted, GroupHeader};
 use um_crypto::x3dh::InitMessage;
-use um_protocol::EncryptedEnvelope;
+use um_protocol::{EncryptedEnvelope, MessageKind};
 
 use crate::ClientError;
 
-/// Build a wire `EncryptedEnvelope` from a ratchet `Encrypted` payload.
+/// Build a wire `EncryptedEnvelope` from a 1:1 ratchet `Encrypted` payload.
 /// `sender` is the sender's identity pub. `init` is the X3DH init message,
-/// present only on the first message of a 1:1 session.
+/// present only on the first message of a 1:1 session. The `kind` is set to
+/// `Direct` and `signature` is empty (1:1 auth is via the ratchet AEAD + DH).
 pub fn envelope_from_encrypted(
     id: u64,
     sender: [u8; 32],
@@ -27,14 +29,42 @@ pub fn envelope_from_encrypted(
     Ok(EncryptedEnvelope {
         id,
         sender,
+        kind: MessageKind::Direct,
         header,
         init: init_bytes,
         ciphertext: encrypted.ciphertext.clone(),
+        signature: Vec::new(),
+    })
+}
+
+/// Build a wire `EncryptedEnvelope` from a group `GroupEncrypted` payload.
+/// `sender` is the sender's identity pub (the group-oblivious outer sender).
+/// The group header, ciphertext, and the sender's group signing signature are
+/// carried opaquely; `kind` is `Group` and `init` is `None`.
+pub fn envelope_from_group_encrypted(
+    id: u64,
+    sender: [u8; 32],
+    group: &GroupEncrypted,
+) -> Result<EncryptedEnvelope, ClientError> {
+    let header = postcard::to_allocvec(&group.header)?;
+    Ok(EncryptedEnvelope {
+        id,
+        sender,
+        kind: MessageKind::Group,
+        header,
+        init: None,
+        ciphertext: group.ciphertext.clone(),
+        signature: group.signature.to_bytes().to_vec(),
     })
 }
 
 /// Recover a ratchet `Header` from a wire envelope's opaque `header` bytes.
 pub fn header_from_envelope(env: &EncryptedEnvelope) -> Result<Header, ClientError> {
+    Ok(postcard::from_bytes(&env.header)?)
+}
+
+/// Recover a group `GroupHeader` from a wire envelope's opaque `header` bytes.
+pub fn group_header_from_envelope(env: &EncryptedEnvelope) -> Result<GroupHeader, ClientError> {
     Ok(postcard::from_bytes(&env.header)?)
 }
 
@@ -54,6 +84,22 @@ pub fn encrypted_from_envelope(env: &EncryptedEnvelope) -> Result<Encrypted, Cli
     Ok(Encrypted {
         header,
         ciphertext: env.ciphertext.clone(),
+    })
+}
+
+/// Reconstruct a group `GroupEncrypted` (header + ciphertext + signature) from
+/// a wire envelope. The header and signature are deserialized; the ciphertext
+/// is taken verbatim.
+pub fn group_encrypted_from_envelope(
+    env: &EncryptedEnvelope,
+) -> Result<GroupEncrypted, ClientError> {
+    let header = group_header_from_envelope(env)?;
+    let signature = um_crypto::Signature::from_slice(&env.signature)
+        .map_err(|_| ClientError::Store("bad group signature".into()))?;
+    Ok(GroupEncrypted {
+        header,
+        ciphertext: env.ciphertext.clone(),
+        signature,
     })
 }
 

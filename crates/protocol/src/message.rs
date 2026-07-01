@@ -1,24 +1,51 @@
 use serde::{Deserialize, Serialize};
 
+/// What kind of ciphertext an `EncryptedEnvelope` carries. The server treats
+/// this as opaque metadata (it already infers 1:1-vs-group from the
+/// `recipients` list length); the client uses it to route decryption to the
+/// right state machine without a destructive trial-and-error decrypt (a failed
+/// 1:1 ratchet decrypt would advance the recv chain and skip message keys).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageKind {
+    /// 1:1 Double Ratchet message (`header` = ratchet `Header`, `ciphertext`
+    /// = AEAD ciphertext, `init` present on the first message).
+    #[default]
+    Direct,
+    /// Group Sender Keys message (`header` = `GroupHeader`, `ciphertext` =
+    /// group AEAD ciphertext, `signature` = sender's Ed25519 signature over
+    /// header ‖ ciphertext, `init` always `None`).
+    Group,
+}
+
 /// Opaque encrypted envelope relayed by the server. The server never
-/// inspects `ciphertext` or `header`; both are produced/consumed by the
-/// crypto crate on the client side. `id` is a server-assigned monotonic id
-/// used for acknowledgement. `sender` is the sender's identity public key
-/// (32-byte Ed25519 verifying key, opaque bytes to the server).
+/// inspects `ciphertext`, `header`, or `signature`; all three are produced/
+/// consumed by the crypto crate on the client side. `id` is a server-assigned
+/// monotonic id used for acknowledgement. `sender` is the sender's identity
+/// public key (32-byte Ed25519 verifying key, opaque bytes to the server).
+/// `kind` tells the client which decrypt path to take (see `MessageKind`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedEnvelope {
     /// Server-assigned monotonic id, used for `Ack`.
     pub id: u64,
     /// Sender's long-term identity public key (32 bytes).
     pub sender: [u8; 32],
+    /// Which decrypt path the client should take. Opaque to the server.
+    #[serde(default)]
+    pub kind: MessageKind,
     /// Double Ratchet / Sender Keys header, opaque to the server.
     pub header: Vec<u8>,
     /// X3DH init message, present only on the first message of a 1:1
     /// session so the receiver can seed a matching ratchet. Opaque to the
-    /// server.
+    /// server. Always `None` for `Group` messages.
     pub init: Option<Vec<u8>>,
-    /// AEAD ciphertext.
+    /// AEAD ciphertext (1:1) or group AEAD ciphertext (group). Opaque to the
+    /// server.
     pub ciphertext: Vec<u8>,
+    /// Sender's Ed25519 signature over `header ‖ ciphertext`. Empty for
+    /// `Direct` (1:1 auth is via the ratchet's AEAD + DH); the sender's group
+    /// signing key signature for `Group`. Opaque to the server.
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
 
 /// A prekey bundle a client registers with the server and that other
@@ -114,9 +141,11 @@ mod tests {
         EncryptedEnvelope {
             id,
             sender: [0x55; 32],
+            kind: MessageKind::Direct,
             header: vec![1, 2, 3, 4],
             init: if with_init { Some(vec![9, 9, 9]) } else { None },
             ciphertext: vec![0xAA; 16],
+            signature: vec![],
         }
     }
 
@@ -164,6 +193,25 @@ mod tests {
             recipients: vec![[0x01; 32], [0x02; 32], [0x03; 32]],
             envelope: sample_envelope(2, false),
         });
+    }
+
+    #[test]
+    fn encrypted_envelope_group_kind_round_trips() {
+        let env = EncryptedEnvelope {
+            id: 7,
+            sender: [0x55; 32],
+            kind: MessageKind::Group,
+            header: vec![1, 2, 3, 4],
+            init: None,
+            ciphertext: vec![0xBB; 16],
+            signature: vec![0xCC; 64],
+        };
+        round_trip(&env);
+    }
+
+    #[test]
+    fn message_kind_distinct() {
+        assert_ne!(MessageKind::Direct, MessageKind::Group);
     }
 
     #[test]

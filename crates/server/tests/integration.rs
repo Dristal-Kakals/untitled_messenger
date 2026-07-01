@@ -76,9 +76,11 @@ fn envelope() -> EncryptedEnvelope {
     EncryptedEnvelope {
         id: 0, // server assigns
         sender: [0x55; 32],
+        kind: um_protocol::MessageKind::Direct,
         header: vec![1, 2, 3],
         init: None,
         ciphertext: vec![0xAA; 8],
+        signature: vec![],
     }
 }
 
@@ -126,9 +128,11 @@ async fn register_send_poll_ack_round_trip() {
             envelope: EncryptedEnvelope {
                 id: 0,
                 sender: alice_pub,
+                kind: um_protocol::MessageKind::Direct,
                 header: vec![1, 2, 3],
                 init: None,
                 ciphertext: vec![0xAA; 8],
+                signature: vec![],
             },
         })
         .await;
