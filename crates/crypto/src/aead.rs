@@ -67,7 +67,8 @@ pub fn kdf_chain(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 }
 
 pub fn kdf_root_dh(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let okm = hkdf_expand(root_key, ROOT_CHAIN_INFO, 64);
+    let prk = hkdf_extract(root_key, dh_output);
+    let okm = hkdf_expand(&prk, ROOT_CHAIN_INFO, 64);
     let mut new_root = [0u8; 32];
     let mut chain = [0u8; 32];
     new_root.copy_from_slice(&okm[..32]);
@@ -115,7 +116,7 @@ mod tests {
         assert_ne!(nck, ck);
         assert_ne!(mk, ck);
         assert_ne!(nck, mk);
-        let (nck2, mk2) = kdf_chain(&nck);
+        let (_nck2, mk2) = kdf_chain(&nck);
         assert_ne!(mk, mk2);
     }
 
@@ -127,6 +128,19 @@ mod tests {
         assert_ne!(new_root, rk);
         assert_ne!(chain, dh);
         assert_ne!(new_root, chain);
+    }
+
+    #[test]
+    fn kdf_root_dh_mixes_dh_output() {
+        // The DH output is new entropy and MUST change the result.
+        // (Catches the bug where kdf_root_dh ignored dh_output.)
+        let rk = [2u8; 32];
+        let dh_a = [3u8; 32];
+        let dh_b = [4u8; 32];
+        let (root_a, chain_a) = kdf_root_dh(&rk, &dh_a);
+        let (root_b, chain_b) = kdf_root_dh(&rk, &dh_b);
+        assert_ne!(root_a, root_b);
+        assert_ne!(chain_a, chain_b);
     }
 
     #[test]
