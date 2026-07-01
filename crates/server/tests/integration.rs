@@ -10,7 +10,7 @@ use um_protocol::{
     framing::{decode, encode},
     ClientMessage, EncryptedEnvelope, PreKeyBundle, ServerMessage,
 };
-use um_server::{listener::serve, Store};
+use um_server::{listener::serve, Store, Subscribers};
 
 /// A minimal framed TCP client for tests.
 struct TestClient {
@@ -85,7 +85,8 @@ fn envelope() -> EncryptedEnvelope {
 #[tokio::test]
 async fn register_send_poll_ack_round_trip() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store.clone()).await.expect("serve");
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store.clone(), subs).await.expect("serve");
 
     let (alice_id, alice_bundle) = real_bundle();
     let (bob_id, bob_bundle) = real_bundle();
@@ -158,7 +159,9 @@ async fn register_send_poll_ack_round_trip() {
 #[tokio::test]
 async fn fetch_bundle_for_unregistered_returns_none() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
 
     let (_, bundle) = real_bundle();
     let mut alice = TestClient::connect(addr).await;
@@ -177,7 +180,9 @@ async fn fetch_bundle_for_unregistered_returns_none() {
 #[tokio::test]
 async fn send_to_unregistered_recipient_errors() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
 
     let (_, bundle) = real_bundle();
     let mut alice = TestClient::connect(addr).await;
@@ -201,7 +206,9 @@ async fn send_to_unregistered_recipient_errors() {
 #[tokio::test]
 async fn bad_signature_register_rejected() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
 
     let (_, mut bundle) = real_bundle();
     bundle.signed_prekey_sig[0] ^= 0xFF; // corrupt
@@ -218,7 +225,9 @@ async fn bad_signature_register_rejected() {
 #[tokio::test]
 async fn poll_before_register_errors() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
 
     let mut alice = TestClient::connect(addr).await;
     // Poll without registering first.

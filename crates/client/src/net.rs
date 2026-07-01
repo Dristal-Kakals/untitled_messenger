@@ -58,7 +58,7 @@ mod tests {
     use std::sync::Arc;
     use um_crypto::identity::{IdentityKey, OneTimePreKey, SignedPreKey};
     use um_protocol::PreKeyBundle;
-    use um_server::{listener::serve, Store};
+    use um_server::{listener::serve, Store, Subscribers};
 
     fn real_bundle() -> (IdentityKey, PreKeyBundle) {
         let id = IdentityKey::generate();
@@ -82,7 +82,13 @@ mod tests {
     #[tokio::test]
     async fn client_registers_and_fetches_bundle() {
         let store = Arc::new(Store::new());
-        let addr = serve("127.0.0.1:0", store).await.expect("serve");
+        let addr = serve(
+            "127.0.0.1:0",
+            store,
+            std::sync::Arc::new(Subscribers::new()),
+        )
+        .await
+        .expect("serve");
 
         let (id, bundle) = real_bundle();
         let mut client = Client::connect(addr).await.expect("connect");
@@ -112,7 +118,13 @@ mod tests {
     #[tokio::test]
     async fn two_clients_exchange_envelopes() {
         let store = Arc::new(Store::new());
-        let addr = serve("127.0.0.1:0", store).await.expect("serve");
+        let addr = serve(
+            "127.0.0.1:0",
+            store,
+            std::sync::Arc::new(Subscribers::new()),
+        )
+        .await
+        .expect("serve");
 
         let (alice_id, alice_bundle) = real_bundle();
         let (bob_id, bob_bundle) = real_bundle();

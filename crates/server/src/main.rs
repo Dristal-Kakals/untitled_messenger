@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use um_server::{listener::serve, Store};
+use um_server::{listener::serve, Store, Subscribers};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -12,7 +12,8 @@ async fn main() -> std::io::Result<()> {
 
     let addr = std::env::var("UM_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".into());
     let store = Arc::new(Store::new());
-    let bound = serve(&addr, store).await?;
+    let subs = Arc::new(Subscribers::new());
+    let bound = serve(&addr, store, subs).await?;
     tracing::info!("um-server listening on {bound}");
     // Serve runs in spawned tasks; keep the main task alive forever.
     std::future::pending::<()>().await;

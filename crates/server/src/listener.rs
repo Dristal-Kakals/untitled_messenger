@@ -14,11 +14,15 @@ use um_protocol::framing::{decode, encode};
 use um_protocol::{ClientMessage, ServerMessage};
 
 use crate::handler::handle;
-use crate::Store;
+use crate::{Store, Subscribers};
 
 /// Serve the relay on `addr` until the task is cancelled. Returns the bound
 /// address (useful for ephemeral-port tests).
-pub async fn serve(addr: &str, store: Arc<Store>) -> std::io::Result<std::net::SocketAddr> {
+pub async fn serve(
+    addr: &str,
+    store: Arc<Store>,
+    subs: Arc<Subscribers>,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tokio::spawn(async move {
@@ -28,14 +32,15 @@ pub async fn serve(addr: &str, store: Arc<Store>) -> std::io::Result<std::net::S
                 Err(_) => continue,
             };
             let store = store.clone();
-            tokio::spawn(handle_conn(stream, store));
+            let subs = subs.clone();
+            tokio::spawn(handle_conn(stream, store, subs));
         }
     });
     Ok(local)
 }
 
 /// Handle one connection to completion.
-async fn handle_conn(stream: TcpStream, store: Arc<Store>) {
+async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers>) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::new();
@@ -81,7 +86,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>) {
                 }
             };
 
-            let reply = handle(&store, &id, msg);
+            let reply = handle(&store, &subs, &id, msg);
             match encode(&reply) {
                 Ok(frame) => {
                     if writer.write_all(&frame).await.is_err() {

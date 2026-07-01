@@ -9,7 +9,7 @@ use std::sync::Arc;
 use um_client::net::Client;
 use um_client::session::ClientSession;
 use um_protocol::{ClientMessage, ServerMessage};
-use um_server::{listener::serve, Store};
+use um_server::{listener::serve, Store, Subscribers};
 
 /// Register a session's prekey bundle over a fresh TCP connection and wait
 /// for the server's `AckOk`. The relay requires `Register` as the first frame
@@ -92,7 +92,8 @@ async fn ack(client: &mut Client, ids: Vec<u64>) {
 #[tokio::test]
 async fn e2e_full_exchange_decrypts_end_to_end() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs).await.expect("serve");
 
     let mut alice_session = ClientSession::generate(5);
     let mut bob_session = ClientSession::generate(5);
@@ -169,7 +170,8 @@ async fn e2e_full_exchange_decrypts_end_to_end() {
 #[tokio::test]
 async fn e2e_alternating_messages_stay_in_sync() {
     let store = Arc::new(Store::new());
-    let addr = serve("127.0.0.1:0", store).await.expect("serve");
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs).await.expect("serve");
 
     let mut alice_session = ClientSession::generate(5);
     let mut bob_session = ClientSession::generate(5);
