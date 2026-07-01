@@ -511,8 +511,8 @@ pub struct SignedPreKey {
 
 impl SignedPreKey {
     pub fn generate(id: u32, identity: &IdentityKey) -> Self {
-        let mut rng = OsRng;
-        let priv_key = StaticSecret::random_from_rng(&mut rng);
+        let rng = OsRng;
+        let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
         let signature = identity.sign(&pub_key.to_bytes());
         Self { id, priv_key, pub_key, signature }
@@ -534,8 +534,8 @@ pub struct OneTimePreKey {
 
 impl OneTimePreKey {
     pub fn generate(id: u32) -> Self {
-        let mut rng = OsRng;
-        let priv_key = StaticSecret::random_from_rng(&mut rng);
+        let rng = OsRng;
+        let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
         Self { id, priv_key, pub_key }
     }
@@ -813,8 +813,8 @@ pub fn initiate(
 ) -> Result<(SessionInit, InitMessage), CryptoError> {
     bob_bundle.verify()?;
 
-    let mut rng = OsRng;
-    let alice_eph_priv = StaticSecret::random_from_rng(&mut rng);
+    let rng = OsRng;
+    let alice_eph_priv = StaticSecret::random_from_rng(rng);
     let alice_eph_pub = PublicKey::from(&alice_eph_priv);
 
     let bob_id_x = ed25519_pub_to_x25519(&bob_bundle.identity_pub)?;
@@ -1138,8 +1138,8 @@ fn evict_if_full(skipped: &mut HashMap<(PublicKey, u32), [u8; 32]>) {
 
 impl RatchetSession {
     pub fn init_alice(session_init: &SessionInit) -> Result<Self, CryptoError> {
-        let mut rng = rand::rngs::OsRng;
-        let dh_priv = StaticSecret::random_from_rng(&mut rng);
+        let rng = rand::rngs::OsRng;
+        let dh_priv = StaticSecret::random_from_rng(rng);
         let dh_pub = PublicKey::from(&dh_priv);
 
         let dh_output = dh_priv.diffie_hellman(&session_init.bob_signed_prekey_pub).to_bytes();
@@ -1235,8 +1235,8 @@ impl RatchetSession {
             self.nr = 0;
 
             // DH ratchet (sending): new self priv × new peer pub.
-            let mut rng = rand::rngs::OsRng;
-            self.dh_priv = StaticSecret::random_from_rng(&mut rng);
+            let rng = rand::rngs::OsRng;
+            self.dh_priv = StaticSecret::random_from_rng(rng);
             self.dh_pub = PublicKey::from(&self.dh_priv);
             let dh_send = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
             let (new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send);

@@ -58,8 +58,8 @@ fn evict_if_full(skipped: &mut HashMap<(PublicKey, u32), [u8; 32]>) {
 
 impl RatchetSession {
     pub fn init_alice(session_init: &SessionInit) -> Result<Self, CryptoError> {
-        let mut rng = rand::rngs::OsRng;
-        let dh_priv = StaticSecret::random_from_rng(&mut rng);
+        let rng = rand::rngs::OsRng;
+        let dh_priv = StaticSecret::random_from_rng(rng);
         let dh_pub = PublicKey::from(&dh_priv);
 
         let dh_output = dh_priv.diffie_hellman(&session_init.bob_signed_prekey_pub).to_bytes();
@@ -155,8 +155,8 @@ impl RatchetSession {
             self.nr = 0;
 
             // DH ratchet (sending): new self priv × new peer pub.
-            let mut rng = rand::rngs::OsRng;
-            self.dh_priv = StaticSecret::random_from_rng(&mut rng);
+            let rng = rand::rngs::OsRng;
+            self.dh_priv = StaticSecret::random_from_rng(rng);
             self.dh_pub = PublicKey::from(&self.dh_priv);
             let dh_send = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
             let (new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send);

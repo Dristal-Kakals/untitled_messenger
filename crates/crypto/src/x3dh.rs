@@ -55,8 +55,8 @@ pub fn initiate(
 ) -> Result<(SessionInit, InitMessage), CryptoError> {
     bob_bundle.verify()?;
 
-    let mut rng = OsRng;
-    let alice_eph_priv = StaticSecret::random_from_rng(&mut rng);
+    let rng = OsRng;
+    let alice_eph_priv = StaticSecret::random_from_rng(rng);
     let alice_eph_pub = PublicKey::from(&alice_eph_priv);
 
     let bob_id_x = ed25519_pub_to_x25519(&bob_bundle.identity_pub)?;

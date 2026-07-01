@@ -48,8 +48,8 @@ pub struct SignedPreKey {
 
 impl SignedPreKey {
     pub fn generate(id: u32, identity: &IdentityKey) -> Self {
-        let mut rng = OsRng;
-        let priv_key = StaticSecret::random_from_rng(&mut rng);
+        let rng = OsRng;
+        let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
         let signature = identity.sign(&pub_key.to_bytes());
         Self { id, priv_key, pub_key, signature }
@@ -71,8 +71,8 @@ pub struct OneTimePreKey {
 
 impl OneTimePreKey {
     pub fn generate(id: u32) -> Self {
-        let mut rng = OsRng;
-        let priv_key = StaticSecret::random_from_rng(&mut rng);
+        let rng = OsRng;
+        let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
         Self { id, priv_key, pub_key }
     }
