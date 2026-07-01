@@ -11,6 +11,8 @@ pub enum ClientError {
     Postcard(#[from] postcard::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("no session with peer")]
     NoSession,
     #[error("no one-time prekey with id {0}")]
