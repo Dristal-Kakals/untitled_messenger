@@ -2,3 +2,6 @@
 //! No I/O, no async, no panics.
 
 #![forbid(unsafe_code)]
+
+pub mod error;
+pub use error::CryptoError;
