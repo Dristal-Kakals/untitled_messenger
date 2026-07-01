@@ -10,7 +10,7 @@ use iced::{Element, Subscription, Task};
 use tokio::sync::mpsc;
 
 use um_gui::config::Config;
-use um_gui::types::{ChatId, ContactView, MessageView, Status};
+use um_gui::types::{ChatId, ContactView, GroupView, MessageView, Status};
 use um_gui::{Command, Event};
 
 use crate::views;
@@ -37,6 +37,14 @@ pub struct UmApp {
     pub open_chat: Option<ChatId>,
     /// In-memory message cache per open chat. The store is source of truth.
     pub threads: HashMap<ChatId, Vec<MessageView>>,
+    /// Group threads the app knows about, rebuilt from `Event::GroupCreated` /
+    /// `Event::GroupInvited` each session (v1 has no persisted group table).
+    /// Drives the ContactList "Groups" section.
+    pub groups: Vec<GroupView>,
+    /// Unread-message count per chat, bumped on `Event::Decrypted` when that
+    /// chat is not the open one, cleared when the chat is opened. Drives the
+    /// unread badge on ContactList.
+    pub unread: HashMap<ChatId, u32>,
     /// Monotonic id for optimistic-send matching.
     pub next_local_id: u64,
     /// Transient form state.
@@ -81,13 +89,13 @@ pub enum Message {
     OpenContactList,
     OpenSettings,
     OpenChat([u8; 32]),
-    /// Open a group thread from a future persisted group list. Not yet wired
-    /// (v1 has no group list view; groups open via `Event::GroupCreated`).
-    #[allow(dead_code)]
+    /// Open a group thread from the ContactList "Groups" section.
     OpenGroup([u8; 32]),
     Back,
     // Contacts.
     AddContact,
+    /// Mark the open 1:1 peer's fingerprint as manually verified.
+    VerifyFingerprint([u8; 32]),
     // Chat.
     SendPressed,
     // Group.
@@ -95,6 +103,8 @@ pub enum Message {
     // Settings.
     RotateSignedPrekey,
     ReplenishOneTimePrekeys,
+    /// Apply the edited server address (disconnect + reconnect to it).
+    ChangeServer,
     Logout,
     // Bridge events.
     Event(Event),
@@ -114,6 +124,8 @@ impl UmApp {
             contacts: Vec::new(),
             open_chat: None,
             threads: HashMap::new(),
+            groups: Vec::new(),
+            unread: HashMap::new(),
             next_local_id: 1,
             passphrase_input: String::new(),
             passphrase_confirm: String::new(),
@@ -171,6 +183,27 @@ impl UmApp {
             }
         }
     }
+
+    /// Record (or refresh) a known group thread. Idempotent: a re-emit for an
+    /// existing id updates the name but never duplicates.
+    fn upsert_group(&mut self, id: [u8; 32], name: String) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
+            if g.name != name {
+                g.name = name;
+            }
+            return;
+        }
+        self.groups.push(GroupView { id, name });
+    }
+
+    /// Mark a contact's fingerprint as verified in the cached contact list.
+    fn mark_verified(&mut self, identity_pub: [u8; 32]) {
+        for c in self.contacts.iter_mut() {
+            if c.identity_pub == identity_pub {
+                c.verified = true;
+            }
+        }
+    }
 }
 
 /// The iced `update` function: maps `Message`s to state changes + bridge
@@ -209,12 +242,16 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::OpenContactList => app.view = View::ContactList,
         Message::OpenSettings => app.view = View::Settings,
         Message::OpenChat(peer) => {
-            app.open_chat = Some(ChatId::Peer(peer));
+            let chat = ChatId::Peer(peer);
+            app.open_chat = Some(chat);
+            app.unread.remove(&chat);
             app.view = View::ChatThread(peer);
             app.send_cmd(Command::LoadThread { peer });
         }
         Message::OpenGroup(group) => {
-            app.open_chat = Some(ChatId::Group(group));
+            let chat = ChatId::Group(group);
+            app.open_chat = Some(chat);
+            app.unread.remove(&chat);
             app.view = View::GroupChat(group);
             app.send_cmd(Command::LoadGroupThread { group });
         }
@@ -235,6 +272,11 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             }
             Err(e) => app.error = Some(e),
         },
+
+        Message::VerifyFingerprint(peer) => {
+            app.send_cmd(Command::VerifyFingerprint { identity_pub: peer });
+            app.mark_verified(peer);
+        }
 
         Message::SendPressed => {
             let text = app.compose_input.trim().to_string();
@@ -298,11 +340,22 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::ReplenishOneTimePrekeys => {
             app.send_cmd(Command::ReplenishOneTimePrekeys { count: 10 });
         }
+        Message::ChangeServer => match app.server_input.trim().parse() {
+            Ok(addr) => {
+                app.error = None;
+                app.send_cmd(Command::ChangeServer { addr });
+            }
+            Err(_) => {
+                app.error = Some("invalid server address".into());
+            }
+        },
         Message::Logout => {
             app.send_cmd(Command::Logout);
             app.identity_pub = None;
             app.contacts.clear();
             app.threads.clear();
+            app.groups.clear();
+            app.unread.clear();
             app.view = View::Login;
             app.passphrase_input.clear();
             app.connected = false;
@@ -347,9 +400,13 @@ fn handle_event(app: &mut UmApp, ev: Event) {
             app.threads.insert(chat, msgs);
         }
         Event::Decrypted { chat, msg } => {
-            // Only append if this chat is open; else the unread badge logic
-            // (v1: a simple re-render) would bump a count.
-            app.threads.entry(chat).or_default().push(msg);
+            // If this chat is open, append to the visible thread. Otherwise
+            // bump the unread count so the ContactList shows a badge.
+            if app.open_chat == Some(chat) {
+                app.threads.entry(chat).or_default().push(msg);
+            } else {
+                *app.unread.entry(chat).or_insert(0) += 1;
+            }
         }
         Event::Sent {
             chat,
@@ -366,16 +423,21 @@ fn handle_event(app: &mut UmApp, ev: Event) {
             app.update_outgoing_status(chat, local_id, Status::Failed);
             app.error = Some(reason);
         }
-        Event::FingerprintVerified { identity_pub: _ } => {
-            // v1: verification is UI-local; no state change beyond the contact
-            // list re-emit the bridge already sent.
+        Event::FingerprintVerified { identity_pub } => {
+            // Mirror the bridge's verification into the cached contact row.
+            app.mark_verified(identity_pub);
         }
-        Event::GroupCreated { group, name: _ } => {
-            app.open_chat = Some(ChatId::Group(group));
+        Event::GroupCreated { group, name } => {
+            app.upsert_group(group, name.clone());
+            let chat = ChatId::Group(group);
+            app.open_chat = Some(chat);
+            app.unread.remove(&chat);
             app.view = View::GroupChat(group);
         }
-        Event::GroupInvited { group: _, name: _ } => {
-            // v1: a notification; the group appears once a message arrives.
+        Event::GroupInvited { group, name } => {
+            // Record the group so it appears in the ContactList "Groups"
+            // section, then surface a notification banner.
+            app.upsert_group(group, name);
             app.error = Some("you were added to a group".into());
         }
     }
@@ -430,5 +492,172 @@ pub fn view(app: &UmApp) -> Element<'_, Message> {
         column![banner, content].into()
     } else {
         content
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use um_gui::types::Direction;
+
+    /// A minimal app for state-logic tests: no bridge channels needed since the
+    /// tests only touch pure helpers + `handle_event`, never `send_cmd`.
+    fn test_app() -> UmApp {
+        let (_tx, _rx) = mpsc::channel::<Command>(1);
+        let bridge_cmd = Arc::new(_tx);
+        UmApp::new(bridge_cmd, View::ContactList, Config::default())
+    }
+
+    fn incoming(text: &str) -> MessageView {
+        MessageView {
+            local_id: 0,
+            text: text.into(),
+            dir: Direction::In,
+            timestamp: 0,
+            status: Status::Delivered,
+        }
+    }
+
+    #[test]
+    fn decrypted_when_chat_open_appends_to_thread() {
+        let mut app = test_app();
+        let chat = ChatId::Peer([0x11; 32]);
+        app.open_chat = Some(chat);
+        handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("hi"),
+            },
+        );
+        let thread = app.threads.get(&chat).expect("thread cached");
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].text, "hi");
+        assert_eq!(app.unread.get(&chat), None, "no unread when open");
+    }
+
+    #[test]
+    fn decrypted_when_chat_closed_bumps_unread() {
+        let mut app = test_app();
+        let chat = ChatId::Peer([0x11; 32]);
+        // Chat not open → unread bumps, thread cache stays empty.
+        handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("a"),
+            },
+        );
+        handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("b"),
+            },
+        );
+        assert_eq!(app.unread.get(&chat), Some(&2));
+        assert!(!app.threads.contains_key(&chat));
+    }
+
+    #[test]
+    fn opening_chat_clears_its_unread() {
+        let mut app = test_app();
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        app.unread.insert(chat, 3);
+        let _ = update(&mut app, Message::OpenChat(peer));
+        assert_eq!(app.open_chat, Some(chat));
+        assert_eq!(app.view, View::ChatThread(peer));
+        assert_eq!(app.unread.get(&chat), None, "unread cleared on open");
+    }
+
+    #[test]
+    fn group_events_upsert_without_duplicate() {
+        let mut app = test_app();
+        let gid = [0x22; 32];
+        handle_event(
+            &mut app,
+            Event::GroupCreated {
+                group: gid,
+                name: "team".into(),
+            },
+        );
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].name, "team");
+        assert_eq!(app.view, View::GroupChat(gid));
+        // A re-invite with the same id refreshes the name, no duplicate row.
+        handle_event(
+            &mut app,
+            Event::GroupInvited {
+                group: gid,
+                name: "team v2".into(),
+            },
+        );
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].name, "team v2");
+    }
+
+    #[test]
+    fn verify_fingerprint_marks_cached_contact() {
+        let mut app = test_app();
+        let peer = [0x33; 32];
+        app.contacts.push(ContactView {
+            identity_pub: peer,
+            nickname: "bob".into(),
+            fingerprint: [0u8; 32],
+            verified: false,
+        });
+        let _ = update(&mut app, Message::VerifyFingerprint(peer));
+        assert!(app.contacts[0].verified);
+    }
+
+    #[test]
+    fn change_server_rejects_bad_address() {
+        let mut app = test_app();
+        app.server_input = "not an addr".into();
+        let _ = update(&mut app, Message::ChangeServer);
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("invalid server"));
+    }
+
+    #[test]
+    fn logout_clears_groups_and_unread() {
+        let mut app = test_app();
+        app.groups.push(GroupView {
+            id: [0x22; 32],
+            name: "team".into(),
+        });
+        app.unread.insert(ChatId::Peer([0x11; 32]), 2);
+        let _ = update(&mut app, Message::Logout);
+        assert!(app.groups.is_empty());
+        assert!(app.unread.is_empty());
+        assert_eq!(app.view, View::Login);
+    }
+
+    #[test]
+    fn optimistic_send_then_sent_flips_status() {
+        let mut app = test_app();
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        app.optimistic_send(chat, "hi".into(), 7);
+        assert_eq!(app.threads.get(&chat).unwrap()[0].status, Status::Sending);
+        handle_event(
+            &mut app,
+            Event::Sent {
+                chat,
+                local_id: 7,
+                msg: MessageView {
+                    local_id: 7,
+                    text: "hi".into(),
+                    dir: Direction::Out,
+                    timestamp: 0,
+                    status: Status::Sent,
+                },
+            },
+        );
+        assert_eq!(app.threads.get(&chat).unwrap()[0].status, Status::Sent);
     }
 }

@@ -18,6 +18,7 @@ pub fn settings(app: &UmApp) -> Element<'_, Message> {
         text(identity).size(10),
         text("Server address:"),
         text_input("server address", &app.server_input).on_input(Message::ServerChanged),
+        button("apply server change").on_press(Message::ChangeServer),
         row![
             button("rotate signed prekey").on_press(Message::RotateSignedPrekey),
             button("replenish one-time prekeys").on_press(Message::ReplenishOneTimePrekeys),

@@ -28,4 +28,4 @@ pub use bridge::Bridge;
 pub use command::Command;
 pub use config::Config;
 pub use event::Event;
-pub use types::{ChatId, ContactView, Direction, MessageView, Status};
+pub use types::{ChatId, ContactView, Direction, GroupView, MessageView, Status};

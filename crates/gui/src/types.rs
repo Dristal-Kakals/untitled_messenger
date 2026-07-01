@@ -36,6 +36,17 @@ pub struct ContactView {
     pub verified: bool,
 }
 
+/// A group thread as the GUI lists it: group id + display name. Plain data
+/// mirroring the bridge's in-memory `group_names`; the app keeps a `Vec` of
+/// these so the ContactList "Groups" section can list + open group threads
+/// (v1 has no persisted group table, so this is rebuilt from
+/// `Event::GroupCreated` / `Event::GroupInvited` each session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupView {
+    pub id: [u8; 32],
+    pub name: String,
+}
+
 /// A single chat message as the GUI displays it. `local_id` is the app's
 /// monotonic id used to match optimistic-send rows to later `Event::Sent` /
 /// `Event::SendFailed`.
@@ -105,6 +116,29 @@ mod tests {
         assert!(peer.is_peer());
         assert!(!group.is_peer());
         assert_ne!(peer, group);
+    }
+
+    #[test]
+    fn group_view_equality() {
+        let g = GroupView {
+            id: [0x55; 32],
+            name: "team".into(),
+        };
+        assert_eq!(g, g.clone());
+        assert_ne!(
+            g,
+            GroupView {
+                id: [0x56; 32],
+                ..g.clone()
+            }
+        );
+        assert_ne!(
+            g,
+            GroupView {
+                name: "squad".into(),
+                ..g.clone()
+            }
+        );
     }
 
     #[test]

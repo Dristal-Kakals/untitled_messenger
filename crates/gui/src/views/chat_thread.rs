@@ -11,6 +11,7 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
     let header = row![
         button("← back").on_press(Message::Back),
         text(format!("peer {}", hex32(&peer))).size(12),
+        button("verify fingerprint").on_press(Message::VerifyFingerprint(peer)),
     ]
     .spacing(10);
 
