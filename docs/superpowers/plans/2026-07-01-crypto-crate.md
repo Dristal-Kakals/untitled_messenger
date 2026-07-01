@@ -716,7 +716,7 @@ git commit -m "feat: add identity keys, prekeys, and fingerprint"
 **Interfaces:**
 - Consumes: `crate::identity::{IdentityKey, SignedPreKey, OneTimePreKey, PreKeyBundle}`, `crate::aead::{hkdf_extract, hkdf_expand, X3DH_SALT}`, `crate::CryptoError`, `x25519_dalek`, `ed25519_dalek`, `rand`
 - Produces:
-  - `pub struct SessionInit { pub root_key: [u8;32], pub alice_identity: IdentityKey, pub alice_ephemeral_priv: x25519_dalek::StaticSecret, pub alice_ephemeral_pub: x25519_dalek::PublicKey, pub bob_signed_prekey_id: u32, pub bob_one_time_prekey_id: Option<u32> }` — `serde` derive, `Clone`
+  - `pub struct SessionInit { pub root_key: [u8;32], pub alice_identity: IdentityKey, pub alice_ephemeral_priv: x25519_dalek::StaticSecret, pub alice_ephemeral_pub: x25519_dalek::PublicKey, pub bob_signed_prekey_id: u32, pub bob_signed_prekey_pub: x25519_dalek::PublicKey, pub bob_one_time_prekey_id: Option<u32> }` — `serde` derive, `Clone`. The `bob_signed_prekey_pub` field is included here (not deferred to Task 6) so Task 6's `init_alice` can perform the initial DH ratchet step.
   - `pub struct InitMessage { pub alice_identity_pub: ed25519_dalek::VerifyingKey, pub alice_ephemeral_pub: x25519_dalek::PublicKey, pub bob_signed_prekey_id: u32, pub bob_one_time_prekey_id: Option<u32> }` — `serde` derive, `Clone`
   - `pub fn initiate(alice: &IdentityKey, bob_bundle: &PreKeyBundle, one_time_prekey_id: Option<u32>) -> Result<(SessionInit, InitMessage), CryptoError>`
     - Verifies the bundle (`bob_bundle.verify()`). Picks the one-time prekey matching `one_time_prekey_id` (or `None` if the bundle has none / caller passes `None`). Generates Alice's ephemeral X25519 keypair. Computes the four DH shared secrets:
@@ -728,7 +728,7 @@ git commit -m "feat: add identity keys, prekeys, and fingerprint"
     - `DH3 = DH(alice ephemeral priv, bob signed prekey pub)`
     - `DH4 = DH(alice ephemeral priv, bob one-time prekey pub)` if present
     - Concatenate `DH1 ‖ DH2 ‖ DH3 ‖ DH4` (omit DH4 if no one-time prekey), `root_key = hkdf_extract(X3DH_SALT, concat)`.
-    - Returns `(SessionInit{ root_key, alice_identity: alice.clone(), alice_ephemeral_priv, alice_ephemeral_pub, bob_signed_prekey_id: bob_bundle.signed_prekey_id, bob_one_time_prekey_id }, InitMessage{ alice_identity_pub: alice.verifying, alice_ephemeral_pub, bob_signed_prekey_id, bob_one_time_prekey_id })`.
+    - Returns `(SessionInit{ root_key, alice_identity: alice.clone(), alice_ephemeral_priv, alice_ephemeral_pub, bob_signed_prekey_id: bob_bundle.signed_prekey_id, bob_signed_prekey_pub: bob_bundle.signed_prekey_pub, bob_one_time_prekey_id }, InitMessage{ alice_identity_pub: alice.verifying, alice_ephemeral_pub, bob_signed_prekey_id, bob_one_time_prekey_id })`.
   - `pub fn receive(bob_identity: &IdentityKey, bob_signed: &SignedPreKey, bob_one_time: Option<&OneTimePreKey>, init: &InitMessage) -> Result<SessionInit, CryptoError>`
     - Reconstructs the same four DHs from Bob's side:
       - `DH1 = DH(bob identity → x25519, alice signed prekey... )` — wait, Bob's side: `DH1 = DH(bob identity priv→x25519, alice_identity_pub→x25519)` is wrong. The four DHs are **directional** and must match Alice's exactly. Alice computed `DH1 = DH(alice_id_priv, bob_spk_pub)`, so Bob computes `DH1 = DH(bob_spk_priv, alice_id_pub→x25519)`. Correct mapping (Bob's side):
@@ -773,6 +773,7 @@ pub struct SessionInit {
     pub alice_ephemeral_priv: StaticSecret,
     pub alice_ephemeral_pub: PublicKey,
     pub bob_signed_prekey_id: u32,
+    pub bob_signed_prekey_pub: PublicKey,
     pub bob_one_time_prekey_id: Option<u32>,
 }
 
@@ -863,6 +864,7 @@ pub fn initiate(
         alice_ephemeral_priv: alice_eph_priv,
         alice_ephemeral_pub: alice_eph_pub,
         bob_signed_prekey_id: bob_bundle.signed_prekey_id,
+        bob_signed_prekey_pub: bob_bundle.signed_prekey_pub,
         bob_one_time_prekey_id,
     };
 
@@ -915,6 +917,7 @@ pub fn receive(
         alice_ephemeral_priv: StaticSecret::from([0u8; 32]),
         alice_ephemeral_pub: alice_eph_pub,
         bob_signed_prekey_id: init.bob_signed_prekey_id,
+        bob_signed_prekey_pub: bob_signed.pub_key,
         bob_one_time_prekey_id,
     };
 
@@ -963,7 +966,7 @@ mod tests {
         let other = IdentityKey::generate();
         bundle.signed_prekey_sig = other.sign(&spk.pub_key.to_bytes());
         let alice = IdentityKey::generate();
-        assert_eq!(initiate(&alice, &bundle, Some(10)), Err(CryptoError::MalformedBundle));
+        assert!(matches!(initiate(&alice, &bundle, Some(10)), Err(CryptoError::MalformedBundle)));
     }
 
     #[test]
@@ -973,7 +976,7 @@ mod tests {
         let (_, init) = initiate(&alice, &bundle, Some(10)).unwrap();
         // Bob does not have the one-time prekey that the init references.
         let bob_session = receive(&bob, &spk, None, &init);
-        assert_eq!(bob_session, Err(CryptoError::MissingPreKey));
+        assert!(matches!(bob_session, Err(CryptoError::MissingPreKey)));
     }
 
     #[test]
@@ -1070,16 +1073,9 @@ git commit -m "feat: add X3DH session establishment"
 
   **Skipped cache eviction:** when inserting and `skipped.len() >= MAX_SKIPPED`, remove the entry with the smallest `(pn, n)` (approximate "oldest"). Use `skipped.iter().min_by_key(|((_, n), _)| *n)` — since keys are `(dh_pub, n)` and `n` resets per chain, use a secondary `pn` stored... **simplification for v1:** evict the entry with the smallest `n` value across the cache (good enough; the cap is a DoS guard, not a correctness mechanism). Implement `fn evict_if_full(skipped: &mut HashMap<(PublicKey,u32), [u8;32]>)`.
 
-- [ ] **Step 1: Extend SessionInit with bob_signed_prekey_pub**
+- [ ] **Step 1: Write the failing test + implementation**
 
-Modify `crates/crypto/src/x3dh.rs`:
-- Add field `pub bob_signed_prekey_pub: x25519_dalek::PublicKey` to `SessionInit`.
-- In `initiate`, set it to `bob_bundle.signed_prekey_pub`.
-- In `receive`, set it to `bob_signed.pub_key`.
-
-The exact edits: in the `SessionInit` struct definition add the field after `bob_signed_prekey_id`; in `initiate`'s `let session = SessionInit { ... }` add `bob_signed_prekey_pub: bob_bundle.signed_prekey_pub,`; in `receive`'s `let session = SessionInit { ... }` add `bob_signed_prekey_pub: bob_signed.pub_key,`. Add `use x25519_dalek::PublicKey;` is already present.
-
-- [ ] **Step 2: Write the failing test + implementation**
+`SessionInit.bob_signed_prekey_pub` was already added in Task 5 (struct + both `initiate`/`receive` populate it), so no `x3dh.rs` edit is needed here — `init_alice` below can use `session_init.bob_signed_prekey_pub` directly.
 
 Create `crates/crypto/src/double_ratchet.rs`:
 
@@ -1353,12 +1349,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p um_crypto double_ratchet`
 Expected: FAIL — `double_ratchet` module not declared in `lib.rs`.
 
-- [ ] **Step 4: Wire the module into the crate root**
+- [ ] **Step 3: Wire the module into the crate root**
 
 Modify `crates/crypto/src/lib.rs` to:
 
@@ -1376,15 +1372,15 @@ pub mod x3dh;
 pub use error::CryptoError;
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p um_crypto double_ratchet`
 Expected: PASS — 7 tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/crypto/src/double_ratchet.rs crates/crypto/src/lib.rs crates/crypto/src/x3dh.rs
+git add crates/crypto/src/double_ratchet.rs crates/crypto/src/lib.rs
 git commit -m "feat: add Double Ratchet with skipped-key cache"
 ```
 
@@ -1924,7 +1920,7 @@ git commit -m "test: add cross-module integration and property tests"
 **2. Placeholder scan:** No "TBD"/"TODO"/"implement later". Two intentional `expect()` calls in `aead.rs` (`seal`, `hkdf_expand`) are on infallible paths (valid key/nonce lengths, expand within HMAC output limit) — acceptable and documented inline. The Ed25519→Montgomery conversion uses `Result`/`Option` throughout (`from_slice` → `map_err`, `decompress` → `ok_or`), no panics, honoring the no-panic rule. The Ed25519↔X25519 interop was verified by standalone tests before the plan was committed (SHA-512 seed derivation for the private key; `CompressedEdwardsY`→`to_montgomery` for the public key).
 
 **3. Type consistency:**
-- `SessionInit` fields: `root_key`, `alice_identity`, `alice_ephemeral_priv`, `alice_ephemeral_pub`, `bob_signed_prekey_id`, `bob_one_time_prekey_id` (Task 5) + `bob_signed_prekey_pub` (added in Task 6 Step 1). Task 6's `init_alice` uses `session_init.bob_signed_prekey_pub` ✓.
+- `SessionInit` fields: `root_key`, `alice_identity`, `alice_ephemeral_priv`, `alice_ephemeral_pub`, `bob_signed_prekey_id`, `bob_signed_prekey_pub`, `bob_one_time_prekey_id` (all defined in Task 5). Task 6's `init_alice` uses `session_init.bob_signed_prekey_pub` ✓.
 - `RatchetSession::init_bob` takes `&StaticSecret` named `bob_signed_priv`; Task 6 tests pass `&spk.priv_key` ✓.
 - `SenderKeyState` has `generation: u32` (added in Task 7 design); `GroupSession::peer_states` value is `(SenderChainKey, u32, VerifyingKey)` ✓.
 - `CryptoError` variants used consistently: `InvalidSignature`, `DecryptionFailed`, `MissingPreKey`, `MalformedBundle`, `InvalidState`, `SkippedMessageLimit` (`SkippedMessageLimit` is defined but unused in v1 — kept for forward use; no warning because it's a public enum variant) ✓.

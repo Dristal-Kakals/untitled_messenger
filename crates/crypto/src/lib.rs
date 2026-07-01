@@ -6,4 +6,5 @@
 pub mod aead;
 pub mod error;
 pub mod identity;
+pub mod x3dh;
 pub use error::CryptoError;
