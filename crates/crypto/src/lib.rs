@@ -9,5 +9,5 @@ pub mod error;
 pub mod identity;
 pub mod sender_keys;
 pub mod x3dh;
-pub use ed25519_dalek::VerifyingKey;
+pub use ed25519_dalek::{Signature, VerifyingKey};
 pub use error::CryptoError;
