@@ -169,7 +169,12 @@ mod tests {
     fn register_with_bad_signature_rejected_and_not_stored() {
         let store = Store::new();
         let (id, bundle) = real_bundle(false);
-        let reply = handle(&store, &Subscribers::new(), &id, ClientMessage::Register { bundle });
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &id,
+            ClientMessage::Register { bundle },
+        );
         assert_eq!(reply, ServerMessage::Error(ServerError::InvalidSignature));
         assert!(!store.is_registered(&id));
     }
@@ -178,8 +183,18 @@ mod tests {
     fn fetch_bundle_returns_some_for_registered() {
         let store = Store::new();
         let (id, bundle) = real_bundle(true);
-        handle(&store, &Subscribers::new(), &id, ClientMessage::Register { bundle });
-        let reply = handle(&store, &Subscribers::new(), &id, ClientMessage::FetchBundle { target: id });
+        handle(
+            &store,
+            &Subscribers::new(),
+            &id,
+            ClientMessage::Register { bundle },
+        );
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &id,
+            ClientMessage::FetchBundle { target: id },
+        );
         assert!(matches!(reply, ServerMessage::Bundle(Some(_))));
     }
 
@@ -201,8 +216,18 @@ mod tests {
         let store = Store::new();
         let (alice, bundle_a) = real_bundle(true);
         let (bob, bundle_b) = real_bundle(true);
-        handle(&store, &Subscribers::new(), &alice, ClientMessage::Register { bundle: bundle_a });
-        handle(&store, &Subscribers::new(), &bob, ClientMessage::Register { bundle: bundle_b });
+        handle(
+            &store,
+            &Subscribers::new(),
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &Subscribers::new(),
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
         let reply = handle(
             &store,
             &Subscribers::new(),
@@ -220,7 +245,12 @@ mod tests {
     fn send_to_unregistered_recipient_rejected() {
         let store = Store::new();
         let (alice, bundle_a) = real_bundle(true);
-        handle(&store, &Subscribers::new(), &alice, ClientMessage::Register { bundle: bundle_a });
+        handle(
+            &store,
+            &Subscribers::new(),
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
         let reply = handle(
             &store,
             &Subscribers::new(),
@@ -238,7 +268,12 @@ mod tests {
     #[test]
     fn poll_before_register_returns_not_registered() {
         let store = Store::new();
-        let reply = handle(&store, &Subscribers::new(), &[0x77; 32], ClientMessage::Poll { since: 0 });
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &[0x77; 32],
+            ClientMessage::Poll { since: 0 },
+        );
         assert_eq!(reply, ServerMessage::Error(ServerError::NotRegistered));
     }
 
@@ -247,8 +282,18 @@ mod tests {
         let store = Store::new();
         let (alice, bundle_a) = real_bundle(true);
         let (bob, bundle_b) = real_bundle(true);
-        handle(&store, &Subscribers::new(), &alice, ClientMessage::Register { bundle: bundle_a });
-        handle(&store, &Subscribers::new(), &bob, ClientMessage::Register { bundle: bundle_b });
+        handle(
+            &store,
+            &Subscribers::new(),
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &Subscribers::new(),
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
         handle(
             &store,
             &Subscribers::new(),
@@ -258,7 +303,12 @@ mod tests {
                 envelope: envelope(0),
             },
         );
-        let reply = handle(&store, &Subscribers::new(), &bob, ClientMessage::Poll { since: 0 });
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &bob,
+            ClientMessage::Poll { since: 0 },
+        );
         match reply {
             ServerMessage::Delivered(v) => assert_eq!(v.len(), 1),
             _ => panic!("expected Delivered"),
@@ -270,8 +320,18 @@ mod tests {
         let store = Store::new();
         let (alice, bundle_a) = real_bundle(true);
         let (bob, bundle_b) = real_bundle(true);
-        handle(&store, &Subscribers::new(), &alice, ClientMessage::Register { bundle: bundle_a });
-        handle(&store, &Subscribers::new(), &bob, ClientMessage::Register { bundle: bundle_b });
+        handle(
+            &store,
+            &Subscribers::new(),
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &Subscribers::new(),
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
         handle(
             &store,
             &Subscribers::new(),

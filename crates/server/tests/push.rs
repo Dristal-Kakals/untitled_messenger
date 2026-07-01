@@ -85,7 +85,9 @@ async fn subscribe_receives_push_for_new_message() {
 
     let mut alice = TestClient::connect(addr).await;
     alice
-        .send(&ClientMessage::Register { bundle: alice_bundle })
+        .send(&ClientMessage::Register {
+            bundle: alice_bundle,
+        })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
 
@@ -130,7 +132,9 @@ async fn subscribe_flushes_unacked_outbox() {
 
     let mut alice = TestClient::connect(addr).await;
     alice
-        .send(&ClientMessage::Register { bundle: alice_bundle })
+        .send(&ClientMessage::Register {
+            bundle: alice_bundle,
+        })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
 
@@ -175,7 +179,9 @@ async fn reconnect_repushes_unacked() {
 
     let mut alice = TestClient::connect(addr).await;
     alice
-        .send(&ClientMessage::Register { bundle: alice_bundle })
+        .send(&ClientMessage::Register {
+            bundle: alice_bundle,
+        })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
 
@@ -228,7 +234,9 @@ async fn last_subscribe_wins_evicts_old() {
 
     let mut alice = TestClient::connect(addr).await;
     alice
-        .send(&ClientMessage::Register { bundle: alice_bundle })
+        .send(&ClientMessage::Register {
+            bundle: alice_bundle,
+        })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
 
@@ -259,9 +267,9 @@ async fn last_subscribe_wins_evicts_old() {
     )
     .await;
     match res {
-        Ok(Ok(0)) => {}            // EOF — expected
+        Ok(Ok(0)) => {} // EOF — expected
         Ok(Ok(_)) => panic!("conn1 should have been closed, got data"),
-        Ok(Err(_)) => {}           // connection error — also acceptable
+        Ok(Err(_)) => {} // connection error — also acceptable
         Err(_) => panic!("conn1 read did not resolve (no eviction)"),
     }
 
@@ -287,7 +295,9 @@ async fn poll_still_works_alongside_subscribe() {
 
     let mut alice = TestClient::connect(addr).await;
     alice
-        .send(&ClientMessage::Register { bundle: alice_bundle })
+        .send(&ClientMessage::Register {
+            bundle: alice_bundle,
+        })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
 

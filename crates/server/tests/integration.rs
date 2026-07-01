@@ -86,7 +86,9 @@ fn envelope() -> EncryptedEnvelope {
 async fn register_send_poll_ack_round_trip() {
     let store = Arc::new(Store::new());
     let subs = Arc::new(Subscribers::new());
-    let addr = serve("127.0.0.1:0", store.clone(), subs).await.expect("serve");
+    let addr = serve("127.0.0.1:0", store.clone(), subs)
+        .await
+        .expect("serve");
 
     let (alice_id, alice_bundle) = real_bundle();
     let (bob_id, bob_bundle) = real_bundle();
