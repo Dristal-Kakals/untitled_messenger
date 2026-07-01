@@ -1,0 +1,11 @@
+[package]
+name = "um_protocol"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+um_crypto = { path = "../crypto" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+thiserror = "1"
