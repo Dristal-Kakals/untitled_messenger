@@ -12,7 +12,7 @@
 
 - Rust edition 2021; toolchain 1.96+ (already installed: `rustc 1.96.1`).
 - The `crypto` crate MUST have zero `async`, zero `std::net`, zero `iced`, zero `tokio`. It is pure functions over byte arrays and key structs.
-- No panics in any crypto code path — all fallible operations return `Result<_, CryptoError>`. No `unwrap()`/`expect()`/`panic!()`/`unreachable!()` in non-test code. Indexing that could panic must be bounds-checked.
+- No panics in any crypto code path — all fallible operations return `Result<_, CryptoError>`. No `unwrap()`/`expect()`/`panic!()`/`unreachable!()` in non-test code. Indexing that could panic must be bounds-checked. **Documented infallible-path exceptions** (`.expect()` allowed only here, on operations that cannot fail for the given fixed-size input): `seal`'s XChaCha encrypt (valid key/nonce), `hkdf_expand`/`hkdf_extract`'s length paths, and `kdf_chain`'s `<HmacSha256 as Mac>::new_from_slice(&[u8;32])` (HMAC-SHA256 accepts any key length, input is a fixed 32-byte array).
 - No FFI, no C dependencies. Only Rust crates from crates.io.
 - All ECDH outputs and key material are `[u8; 32]` fixed arrays. AEAD nonces are `[u8; 24]` (XChaCha20-Poly1305).
 - AEAD associated data (AAD) for message encryption is always the serialized ratchet header — this binds ciphertext to sender DH key + counters.
@@ -239,7 +239,7 @@ git commit -m "feat: add CryptoError type"
   - `pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8;32]`
   - `pub fn hkdf_expand(prk: &[u8;32], info: &[u8], len: usize) -> Vec<u8>`
   - `pub fn kdf_chain(ck: &[u8;32]) -> ([u8;32], [u8;32])` → returns `(new_chain_key, message_key)`
-  - `pub fn kdf_root_dh(root_key: &[u8;32], dh_output: &[u8;32]) -> ([u8;32], [u8;32])` → returns `(new_root_key, chain_key)` via HKDF expand of 64 bytes over `ROOT_CHAIN_INFO`, split into two 32-byte halves.
+  - `pub fn kdf_root_dh(root_key: &[u8;32], dh_output: &[u8;32]) -> ([u8;32], [u8;32])` → returns `(new_root_key, chain_key)`. The DH output is the new entropy and MUST feed the KDF: `prk = hkdf_extract(root_key, dh_output)` (root_key as salt, dh_output as IKM), then `okm = hkdf_expand(&prk, ROOT_CHAIN_INFO, 64)`, split into two 32-byte halves. This is the standard Signal root-chain KDF — without mixing `dh_output`, the DH ratchet injects no new entropy and forward secrecy is broken.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -315,7 +315,8 @@ pub fn kdf_chain(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 }
 
 pub fn kdf_root_dh(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let okm = hkdf_expand(root_key, ROOT_CHAIN_INFO, 64);
+    let prk = hkdf_extract(root_key, dh_output);
+    let okm = hkdf_expand(&prk, ROOT_CHAIN_INFO, 64);
     let mut new_root = [0u8; 32];
     let mut chain = [0u8; 32];
     new_root.copy_from_slice(&okm[..32]);
@@ -375,6 +376,19 @@ mod tests {
         assert_ne!(new_root, rk);
         assert_ne!(chain, dh);
         assert_ne!(new_root, chain);
+    }
+
+    #[test]
+    fn kdf_root_dh_mixes_dh_output() {
+        // The DH output is new entropy and MUST change the result.
+        // (Catches the bug where kdf_root_dh ignored dh_output.)
+        let rk = [2u8; 32];
+        let dh_a = [3u8; 32];
+        let dh_b = [4u8; 32];
+        let (root_a, chain_a) = kdf_root_dh(&rk, &dh_a);
+        let (root_b, chain_b) = kdf_root_dh(&rk, &dh_b);
+        assert_ne!(root_a, root_b);
+        assert_ne!(chain_a, chain_b);
     }
 
     #[test]
