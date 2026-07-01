@@ -9,4 +9,4 @@ pub mod message;
 
 pub use error::ProtocolError;
 pub use framing::{decode, encode, MAX_FRAME_SIZE};
-pub use message::{ClientMessage, EncryptedEnvelope, ServerError, ServerMessage};
+pub use message::{ClientMessage, EncryptedEnvelope, PreKeyBundle, ServerError, ServerMessage};

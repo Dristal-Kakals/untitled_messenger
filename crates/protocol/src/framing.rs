@@ -46,14 +46,21 @@ mod tests {
     use super::*;
     use crate::message::{ClientMessage, EncryptedEnvelope, ServerMessage};
 
+    fn sample_envelope(id: u64) -> EncryptedEnvelope {
+        EncryptedEnvelope {
+            id,
+            sender: [0xBB; 32],
+            header: vec![1, 2, 3],
+            init: None,
+            ciphertext: b"test payload".to_vec(),
+        }
+    }
+
     #[test]
     fn encode_decode_round_trip() {
         let msg = ClientMessage::Send {
-            recipient_key: [0xAA; 32],
-            envelope: EncryptedEnvelope {
-                sender_key: [0xBB; 32],
-                ciphertext: b"test payload".to_vec(),
-            },
+            recipients: vec![[0xAA; 32]],
+            envelope: sample_envelope(1),
         };
         let frame = encode(&msg).expect("encode");
         assert!(frame.len() >= 4);
@@ -64,7 +71,7 @@ mod tests {
 
     #[test]
     fn encode_decode_server_message() {
-        let msg = ServerMessage::Ack;
+        let msg = ServerMessage::AckOk;
         let frame = encode(&msg).expect("encode");
         let (decoded, consumed): (ServerMessage, usize) = decode(&frame).expect("decode");
         assert_eq!(decoded, msg);
@@ -80,7 +87,7 @@ mod tests {
 
     #[test]
     fn decode_incomplete_payload() {
-        let msg = ClientMessage::Fetch;
+        let msg = ClientMessage::Subscribe;
         let frame = encode(&msg).expect("encode");
         // Truncate one byte from the payload
         let truncated = &frame[..frame.len() - 1];
@@ -100,7 +107,7 @@ mod tests {
 
     #[test]
     fn partial_second_frame_not_consumed() {
-        let msg = ClientMessage::Fetch;
+        let msg = ClientMessage::Subscribe;
         let mut buf = encode(&msg).expect("encode");
         // Append a partial second frame
         buf.extend_from_slice(&[0, 0, 0, 10, 1, 2]); // claims 10 bytes, only 2 present
