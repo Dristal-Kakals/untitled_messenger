@@ -8,7 +8,7 @@ license.workspace = true
 um_protocol = { path = "../protocol" }
 um_crypto = { path = "../crypto" }
 ed25519-dalek = { version = "2", features = ["alloc"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 tracing = "0.1"
