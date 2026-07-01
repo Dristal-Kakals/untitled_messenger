@@ -43,7 +43,7 @@ pub fn handle(store: &Store, self_id: &[u8; 32], msg: ClientMessage) -> ServerMe
             if !recipients.iter().all(|r| store.is_registered(r)) {
                 return ServerMessage::Error(um_protocol::ServerError::UnknownRecipient);
             }
-            store.deliver(&recipients, envelope);
+            let _delivered = store.deliver(&recipients, envelope);
             ServerMessage::AckOk
         }
         ClientMessage::Poll { since } => {

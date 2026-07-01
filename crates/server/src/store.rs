@@ -62,16 +62,20 @@ impl Store {
             .cloned()
     }
 
-    /// Append `envelope` to every recipient's outbox, assigning each copy a
-    /// fresh monotonic id. Returns the ids in recipient order. Recipients
-    /// that are not registered are skipped (the caller decides whether to
-    /// surface `UnknownRecipient`).
-    pub fn deliver(&self, recipients: &[[u8; 32]], mut envelope: EncryptedEnvelope) -> Vec<u64> {
+    /// Append `envelope` to every registered recipient's outbox, assigning
+    /// each copy a fresh monotonic id. Returns `(recipient, id, envelope)`
+    /// triples for the recipients that were actually delivered to, in
+    /// recipient order. Unregistered recipients are skipped (absent from the
+    /// return; the caller decides whether to surface `UnknownRecipient`).
+    pub fn deliver(
+        &self,
+        recipients: &[[u8; 32]],
+        mut envelope: EncryptedEnvelope,
+    ) -> Vec<([u8; 32], u64, EncryptedEnvelope)> {
         let mut g = self.inner.lock().expect("store mutex poisoned");
-        let mut ids = Vec::with_capacity(recipients.len());
+        let mut out = Vec::with_capacity(recipients.len());
         for recipient in recipients {
             if !g.registered.contains(recipient) {
-                ids.push(0);
                 continue;
             }
             envelope.id = g.next_envelope_id;
@@ -81,9 +85,9 @@ impl Store {
                 .entry(*recipient)
                 .or_default()
                 .push(envelope.clone());
-            ids.push(id);
+            out.push((*recipient, id, envelope.clone()));
         }
-        ids
+        out
     }
 
     /// Drain all undelivered envelopes for `identity` with id > `since`.
@@ -161,8 +165,10 @@ mod tests {
         store.register(bundle(alice));
         store.register(bundle(bob));
         // Alice sends two messages to bob.
-        let ids1 = store.deliver(&[bob], envelope(0));
-        let ids2 = store.deliver(&[bob], envelope(0));
+        let d1 = store.deliver(&[bob], envelope(0));
+        let d2 = store.deliver(&[bob], envelope(0));
+        let ids1: Vec<u64> = d1.iter().map(|(_, id, _)| *id).collect();
+        let ids2: Vec<u64> = d2.iter().map(|(_, id, _)| *id).collect();
         assert_eq!(ids1, vec![1]);
         assert_eq!(ids2, vec![2]);
         // Bob's outbox has both, in order.
@@ -177,8 +183,9 @@ mod tests {
         let store = Store::new();
         let bob = [0x02; 32];
         // bob is NOT registered.
-        let ids = store.deliver(&[bob], envelope(0));
-        assert_eq!(ids, vec![0]);
+        let delivered = store.deliver(&[bob], envelope(0));
+        // Unregistered recipients are absent from the return (not id=0 entries).
+        assert!(delivered.is_empty());
         assert!(store.poll(&bob, 0).is_empty());
     }
 
@@ -191,11 +198,13 @@ mod tests {
         store.register(bundle(m1));
         store.register(bundle(m2));
         // m3 not registered.
-        let ids = store.deliver(&[m1, m2, m3], envelope(0));
-        assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0], 1);
-        assert_eq!(ids[1], 2);
-        assert_eq!(ids[2], 0); // m3 skipped
+        let delivered = store.deliver(&[m1, m2, m3], envelope(0));
+        // Only registered recipients (m1, m2) appear; m3 is absent.
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].0, m1);
+        assert_eq!(delivered[0].1, 1);
+        assert_eq!(delivered[1].0, m2);
+        assert_eq!(delivered[1].1, 2);
         assert_eq!(store.poll(&m1, 0).len(), 1);
         assert_eq!(store.poll(&m2, 0).len(), 1);
         assert_eq!(store.poll(&m3, 0).len(), 0);
