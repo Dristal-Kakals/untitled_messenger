@@ -1439,9 +1439,8 @@ git commit -m "feat: add Double Ratchet with skipped-key cache"
   **decrypt:**
   1. Look up `peer_states[header.sender_id]` → `(chain_key, signing_pub)`. If absent, `Err(CryptoError::MissingPreKey)` (caller must obtain the sender's distribution message first).
   2. Verify `signing_pub.verify(aad ‖ ciphertext, signature)` → `Err(CryptoError::InvalidSignature)` on failure.
-  3. Advance the peer's chain key to `header.generation`: while `peer_generation < header.generation`, `msg_key = chain_key.ratchet()`, bump generation. Track peer generation — store it alongside the chain key: change `peer_states` value to `(SenderChainKey, u32, VerifyingKey)` (chain key, generation, signing pub). If `header.generation < peer_generation`, the message is a replay/duplicate from a known earlier position — **v1: reject as `Err(CryptoError::DecryptionFailed)`** (no skipped cache for groups; out-of-order group messages are not supported in v1, per scope).
-  4. `msg_key = chain_key.ratchet()` for the current message; bump stored generation.
-  5. `aad = group_header_aad(&header)`. `open(&msg_key, &nonce, &aad, &ciphertext)`.
+  3. Advance the peer's chain key to `header.generation`: while `peer_generation < header.generation`, `msg_key = chain_key.ratchet()`, bump generation. Track peer generation — store it alongside the chain key: change `peer_states` value to `(SenderChainKey, u32, VerifyingKey)` (chain key, generation, signing pub). If `header.generation <= peer_generation`, the message is a replay/duplicate from a known earlier position — **v1: reject as `Err(CryptoError::DecryptionFailed)`** (no skipped cache for groups; out-of-order group messages are not supported in v1, per scope). **Generation alignment:** the sender's first message is generation 1 (it ratchets then bumps); a freshly-added peer stores generation 0. Each `chain_key.ratchet()` produces the key for `peer_gen + 1`, so to reach the key for `header.generation` the receiver ratchets while `peer_gen + 1 < header.generation` (discarding skipped keys) and then one final `ratchet()` yields the message key, bumping `peer_gen` to `header.generation` — `header.generation - peer_gen` ratchets total, not one more, or the receiver consumes the next chain key and decryption fails.
+  4. `aad = group_header_aad(&header)`. `open(&msg_key, &nonce, &aad, &ciphertext)`.
 
   **new:** generate a random `SenderChainKey` seed (32 random bytes), a fresh Ed25519 signing keypair for the sender, `member_id = self_identity.fingerprint()`. Return `GroupSession { group_id, self_state: SenderKeyState { member_id, chain_key, signing_priv, signing_pub, generation: 0 }, peer_states: HashMap::new() }`.
 
@@ -1585,11 +1584,16 @@ impl GroupSession {
             .verify(&signed, &message.signature)
             .map_err(|_| CryptoError::InvalidSignature)?;
 
-        if message.header.generation < *peer_gen {
+        if message.header.generation <= *peer_gen {
             return Err(CryptoError::DecryptionFailed);
         }
 
-        while *peer_gen < message.header.generation {
+        // Ratchet the peer's chain forward until the next ratchet lands on
+        // the message's generation. Each `ratchet()` produces the message key
+        // for generation `peer_gen + 1`; we discard keys for any generations
+        // we skipped (v1 has no group skipped-message cache) and use the final
+        // one for this message.
+        while *peer_gen + 1 < message.header.generation {
             chain_key.ratchet();
             *peer_gen += 1;
         }
@@ -1704,7 +1708,7 @@ mod tests {
         let stranger = IdentityKey::generate();
         let mut stranger_session = GroupSession::new(group, &stranger).unwrap();
         let ct = stranger_session.encrypt(b"inject").unwrap();
-        assert_eq!(sa.decrypt(&ct), Err(CryptoError::MissingPreKey));
+        assert!(matches!(sa.decrypt(&ct), Err(CryptoError::MissingPreKey)));
     }
 
     #[test]
@@ -1719,7 +1723,7 @@ mod tests {
 
         let mut ct = sa.encrypt(b"hi").unwrap();
         ct.ciphertext[0] ^= 0xff;
-        assert_eq!(sb.decrypt(&ct), Err(CryptoError::InvalidSignature));
+        assert!(matches!(sb.decrypt(&ct), Err(CryptoError::InvalidSignature)));
     }
 
     #[test]
@@ -1748,7 +1752,7 @@ mod tests {
         let ct2 = sa.encrypt(b"second").unwrap();
         assert_eq!(sb.decrypt(&ct2).unwrap(), b"second");
         // Replaying ct1 (older generation) must fail.
-        assert_eq!(sb.decrypt(&ct1), Err(CryptoError::DecryptionFailed));
+        assert!(matches!(sb.decrypt(&ct1), Err(CryptoError::DecryptionFailed)));
     }
 }
 ```
