@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn initiate_rejects_tampered_bundle() {
-        let (bob, spk, _otpk, mut bundle) = bob_setup();
+        let (_bob, spk, _otpk, mut bundle) = bob_setup();
         let other = IdentityKey::generate();
         bundle.signed_prekey_sig = other.sign(&spk.pub_key.to_bytes());
         let alice = IdentityKey::generate();

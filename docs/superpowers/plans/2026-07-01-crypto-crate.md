@@ -1041,7 +1041,7 @@ git commit -m "feat: add X3DH session establishment"
 - Produces:
   - `pub struct Header { pub dh_pub: x25519_dalek::PublicKey, pub pn: u32, pub n: u32, pub nonce: [u8;24] }` — `serde` derive, `Clone, Copy` not possible (PublicKey is not Copy) → `Clone` only.
   - `pub struct Encrypted { pub header: Header, pub ciphertext: Vec<u8> }` — `serde` derive, `Clone`.
-  - `pub struct RatchetSession { root_key: [u8;32], dh_priv: x25519_dalek::StaticSecret, dh_pub: x25519_dalek::PublicKey, ns: u32, nr: u32, pn: u32, cks: Option<[u8;32]>, ckr: Option<[u8;32]>, skipped: HashMap<(x25519_dalek::PublicKey, u32), [u8;32]> }` — `serde` derive, `Clone`. `skipped` keys are `(dh_pub, n)` → message key.
+  - `pub struct RatchetSession { root_key: [u8;32], dh_priv: x25519_dalek::StaticSecret, dh_pub: x25519_dalek::PublicKey, peer_dh_pub: Option<x25519_dalek::PublicKey>, ns: u32, nr: u32, pn: u32, cks: Option<[u8;32]>, ckr: Option<[u8;32]>, skipped: HashMap<(x25519_dalek::PublicKey, u32), [u8;32]> }` — `serde` derive, `Clone`. `skipped` keys are `(dh_pub, n)` → message key. `peer_dh_pub` tracks the sender's current DH ratchet public key (the key messages are encrypted under); `None` until the first received message. It is what `decrypt` compares incoming `header.dh_pub` against to detect a new DH ratchet — NOT `self.dh_pub` (which is the receiver's own send key). `init_alice` seeds it with `session_init.bob_signed_prekey_pub`; `init_bob` leaves it `None`.
   - `impl RatchetSession {
       pub fn init_alice(session_init: &SessionInit) -> Result<Self, CryptoError>;
       pub fn init_bob(session_init: &SessionInit, bob_signed_priv: &x25519_dalek::StaticSecret) -> Result<Self, CryptoError>;
@@ -1064,10 +1064,11 @@ git commit -m "feat: add X3DH session establishment"
 
   **decrypt (receiving):**
   1. Check skipped cache for `(header.dh_pub, header.n)`: if present, remove + use that msg_key to `open` with `header.nonce` + `header_aad`. Return plaintext.
-  2. If `header.dh_pub != self.dh_pub` (new DH key from sender → DH ratchet step):
-     a. Skip any messages in the current recv chain: while `self.nr < self.pn + (cks chain length)`... — **simplified:** before ratcheting, save skipped keys for the current `ckr` up to `header.pn` (the previous chain's length). For each `n` from `self.nr` to `header.pn - 1`, derive `(new_ckr, mk) = kdf_chain(ckr)`, store `((old_dh_pub, n), mk)` in skipped (evict oldest if over cap), advance `ckr`. This handles messages lost before the DH ratchet.
-     b. Perform DH ratchet: `dh_output = self.dh_priv.diffie_hellman(&header.dh_pub)`; `(new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_output)`; set `self.root_key = new_root`, `self.ckr = Some(new_ckr)`, `self.pn = self.ns`, generate new `dh_priv`/`dh_pub`, reset `self.ns = 0`, `self.nr = 0`.
-  3. Skip messages in the new recv chain up to `header.n`: while `self.nr < header.n`, derive `(new_ckr, mk) = kdf_chain(ckr)`, store skipped, advance.
+  2. If `peer_dh_pub` is `None` (first message) OR `header.dh_pub != peer_dh_pub` (new DH key from sender → DH ratchet step):
+     a. Skip any messages in the current recv chain: before ratcheting, save skipped keys for the current `ckr` up to `header.pn` (the previous chain's length). For each `n` from `self.nr` to `header.pn - 1`, derive `(new_ckr, mk) = kdf_chain(ckr)`, store `((old_peer_dh_pub, n), mk)` in skipped (evict oldest if over cap), advance `ckr`. This handles messages lost before the DH ratchet.
+     b. Receiving DH ratchet: set `self.peer_dh_pub = Some(header.dh_pub)`; `dh_recv = self.dh_priv.diffie_hellman(&header.dh_pub)`; `(new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_recv)`; set `self.root_key = new_root`, `self.ckr = Some(new_ckr)`, `self.pn = self.ns`, `self.nr = 0`.
+     c. Sending DH ratchet: generate new `dh_priv`/`dh_pub`; `dh_send = self.dh_priv.diffie_hellman(&header.dh_pub)`; `(new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send)`; set `self.root_key = new_root`, `self.cks = Some(new_cks)`, `self.ns = 0`. (This is the standard Signal two-step DH ratchet: the receiver derives BOTH a new recv chain from the old priv × peer new pub AND a new send chain from a fresh priv × peer new pub. Omitting the send chain means the receiver cannot reply after ratcheting — `cks` stays `None` and `encrypt` returns `InvalidState`. Comparing against `self.dh_pub` instead of `peer_dh_pub` causes a spurious re-ratchet on every message after the first, re-deriving `ckr` from the wrong DH and breaking decryption of the 2nd message onward.)
+  3. Skip messages in the new recv chain up to `header.n`: while `self.nr < header.n`, derive `(new_ckr, mk) = kdf_chain(ckr)`, store skipped (keyed by `peer_dh_pub`), advance.
   4. `(new_ckr, msg_key) = kdf_chain(ckr)`; `self.ckr = Some(new_ckr)`; `self.nr += 1`.
   5. `aad = header_aad(&header)`; `open(&msg_key, &header.nonce, &aad, &ciphertext)`.
 
@@ -1109,6 +1110,7 @@ pub struct RatchetSession {
     root_key: [u8; 32],
     dh_priv: StaticSecret,
     dh_pub: PublicKey,
+    peer_dh_pub: Option<PublicKey>,
     ns: u32,
     nr: u32,
     pn: u32,
@@ -1147,6 +1149,7 @@ impl RatchetSession {
             root_key: new_root,
             dh_priv,
             dh_pub,
+            peer_dh_pub: Some(session_init.bob_signed_prekey_pub),
             ns: 0,
             nr: 0,
             pn: 0,
@@ -1165,6 +1168,7 @@ impl RatchetSession {
             root_key: session_init.root_key,
             dh_priv: bob_signed_priv.clone(),
             dh_pub,
+            peer_dh_pub: None,
             ns: 0,
             nr: 0,
             pn: 0,
@@ -1202,39 +1206,51 @@ impl RatchetSession {
             return open(&msg_key, &message.header.nonce, &aad, &message.ciphertext);
         }
 
-        // 2. DH ratchet step if new DH key.
-        if message.header.dh_pub != self.dh_pub {
+        // 2. DH ratchet step if the sender used a new DH ratchet key.
+        let new_sender = match self.peer_dh_pub {
+            Some(p) => message.header.dh_pub != p,
+            None => true,
+        };
+
+        if new_sender {
             // Skip messages in the previous recv chain up to header.pn.
-            if let Some(mut ckr) = self.ckr {
+            if let (Some(old_peer), Some(mut ckr)) = (self.peer_dh_pub, self.ckr) {
                 while self.nr < message.header.pn {
                     let (new_ckr, mk) = kdf_chain(&ckr);
                     evict_if_full(&mut self.skipped);
-                    self.skipped.insert((self.dh_pub, self.nr), mk);
+                    self.skipped.insert((old_peer, self.nr), mk);
                     ckr = new_ckr;
                     self.nr += 1;
                 }
                 self.ckr = Some(ckr);
             }
 
-            // DH ratchet.
-            let dh_output = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
-            let (new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_output);
+            // DH ratchet (receiving): old self priv × new peer pub.
+            self.peer_dh_pub = Some(message.header.dh_pub);
+            let dh_recv = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
+            let (new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_recv);
             self.root_key = new_root;
             self.ckr = Some(new_ckr);
             self.pn = self.ns;
+            self.nr = 0;
+
+            // DH ratchet (sending): new self priv × new peer pub.
             let mut rng = rand::rngs::OsRng;
             self.dh_priv = StaticSecret::random_from_rng(&mut rng);
             self.dh_pub = PublicKey::from(&self.dh_priv);
+            let dh_send = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
+            let (new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send);
+            self.root_key = new_root;
+            self.cks = Some(new_cks);
             self.ns = 0;
-            self.nr = 0;
         }
 
-        // 3. Skip messages in the new recv chain up to header.n.
-        if let Some(mut ckr) = self.ckr {
+        // 3. Skip messages in the current recv chain up to header.n.
+        if let (Some(peer), Some(mut ckr)) = (self.peer_dh_pub, self.ckr) {
             while self.nr < message.header.n {
                 let (new_ckr, mk) = kdf_chain(&ckr);
                 evict_if_full(&mut self.skipped);
-                self.skipped.insert((self.dh_pub, self.nr), mk);
+                self.skipped.insert((peer, self.nr), mk);
                 ckr = new_ckr;
                 self.nr += 1;
             }
@@ -1335,7 +1351,7 @@ mod tests {
         let (mut alice, mut bob, _) = make_pair();
         let mut ct = alice.encrypt(b"hello").unwrap();
         ct.ciphertext[0] ^= 0xff;
-        assert_eq!(bob.decrypt(&ct), Err(CryptoError::DecryptionFailed));
+        assert!(matches!(bob.decrypt(&ct), Err(CryptoError::DecryptionFailed)));
         // Session still usable.
         let ct2 = alice.encrypt(b"next").unwrap();
         assert_eq!(bob.decrypt(&ct2).unwrap(), b"next");
@@ -1344,7 +1360,7 @@ mod tests {
     #[test]
     fn bob_cannot_send_before_receiving() {
         let (_alice, mut bob, _) = make_pair();
-        assert_eq!(bob.encrypt(b"premature"), Err(CryptoError::InvalidState));
+        assert!(matches!(bob.encrypt(b"premature"), Err(CryptoError::InvalidState)));
     }
 }
 ```

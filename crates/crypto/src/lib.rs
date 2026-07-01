@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aead;
+pub mod double_ratchet;
 pub mod error;
 pub mod identity;
 pub mod x3dh;
