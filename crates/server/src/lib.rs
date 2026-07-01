@@ -7,5 +7,7 @@
 pub mod handler;
 pub mod listener;
 pub mod store;
+pub mod subscribers;
 
 pub use store::Store;
+pub use subscribers::Subscribers;
