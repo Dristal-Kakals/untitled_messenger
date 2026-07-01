@@ -37,8 +37,8 @@ fn ed25519_priv_to_x25519(sk: &SigningKey) -> StaticSecret {
 }
 
 fn ed25519_pub_to_x25519(vk: &VerifyingKey) -> Result<PublicKey, CryptoError> {
-    let compressed = CompressedEdwardsY::from_slice(&vk.to_bytes())
-        .map_err(|_| CryptoError::MalformedBundle)?;
+    let compressed =
+        CompressedEdwardsY::from_slice(&vk.to_bytes()).map_err(|_| CryptoError::MalformedBundle)?;
     let mont = compressed
         .decompress()
         .ok_or(CryptoError::MalformedBundle)?
@@ -86,7 +86,11 @@ pub fn initiate(
         Some(pk) => {
             let dh4 = alice_eph_priv.diffie_hellman(&pk).to_bytes();
             ikm.extend_from_slice(&dh4);
-            one_time_prekey_id.or(bob_bundle.one_time_prekeys.iter().find(|(_, p)| *p == pk).map(|(id, _)| *id))
+            one_time_prekey_id.or(bob_bundle
+                .one_time_prekeys
+                .iter()
+                .find(|(_, p)| *p == pk)
+                .map(|(id, _)| *id))
         }
         None => None,
     };
@@ -126,7 +130,10 @@ pub fn receive(
 
     let dh1 = bob_signed.priv_key.diffie_hellman(&alice_id_x).to_bytes();
     let dh2 = bob_id_priv.diffie_hellman(&alice_eph_pub).to_bytes();
-    let dh3 = bob_signed.priv_key.diffie_hellman(&alice_eph_pub).to_bytes();
+    let dh3 = bob_signed
+        .priv_key
+        .diffie_hellman(&alice_eph_pub)
+        .to_bytes();
 
     let mut ikm = Vec::with_capacity(32 * 4);
     ikm.extend_from_slice(&dh1);
@@ -208,7 +215,10 @@ mod tests {
         let other = IdentityKey::generate();
         bundle.signed_prekey_sig = other.sign(&spk.pub_key.to_bytes());
         let alice = IdentityKey::generate();
-        assert!(matches!(initiate(&alice, &bundle, Some(10)), Err(CryptoError::MalformedBundle)));
+        assert!(matches!(
+            initiate(&alice, &bundle, Some(10)),
+            Err(CryptoError::MalformedBundle)
+        ));
     }
 
     #[test]

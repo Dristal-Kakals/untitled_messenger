@@ -62,7 +62,9 @@ impl RatchetSession {
         let dh_priv = StaticSecret::random_from_rng(rng);
         let dh_pub = PublicKey::from(&dh_priv);
 
-        let dh_output = dh_priv.diffie_hellman(&session_init.bob_signed_prekey_pub).to_bytes();
+        let dh_output = dh_priv
+            .diffie_hellman(&session_init.bob_signed_prekey_pub)
+            .to_bytes();
         let (new_root, cks) = kdf_root_dh(&session_init.root_key, &dh_output);
 
         Ok(Self {
@@ -121,7 +123,10 @@ impl RatchetSession {
 
     pub fn decrypt(&mut self, message: &Encrypted) -> Result<Vec<u8>, CryptoError> {
         // 1. Check skipped cache.
-        if let Some(msg_key) = self.skipped.remove(&(message.header.dh_pub, message.header.n)) {
+        if let Some(msg_key) = self
+            .skipped
+            .remove(&(message.header.dh_pub, message.header.n))
+        {
             let aad = header_aad(&message.header);
             return open(&msg_key, &message.header.nonce, &aad, &message.ciphertext);
         }
@@ -147,7 +152,10 @@ impl RatchetSession {
 
             // DH ratchet (receiving): old self priv × new peer pub.
             self.peer_dh_pub = Some(message.header.dh_pub);
-            let dh_recv = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
+            let dh_recv = self
+                .dh_priv
+                .diffie_hellman(&message.header.dh_pub)
+                .to_bytes();
             let (new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_recv);
             self.root_key = new_root;
             self.ckr = Some(new_ckr);
@@ -158,7 +166,10 @@ impl RatchetSession {
             let rng = rand::rngs::OsRng;
             self.dh_priv = StaticSecret::random_from_rng(rng);
             self.dh_pub = PublicKey::from(&self.dh_priv);
-            let dh_send = self.dh_priv.diffie_hellman(&message.header.dh_pub).to_bytes();
+            let dh_send = self
+                .dh_priv
+                .diffie_hellman(&message.header.dh_pub)
+                .to_bytes();
             let (new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send);
             self.root_key = new_root;
             self.cks = Some(new_cks);
@@ -271,7 +282,10 @@ mod tests {
         let (mut alice, mut bob, _) = make_pair();
         let mut ct = alice.encrypt(b"hello").unwrap();
         ct.ciphertext[0] ^= 0xff;
-        assert!(matches!(bob.decrypt(&ct), Err(CryptoError::DecryptionFailed)));
+        assert!(matches!(
+            bob.decrypt(&ct),
+            Err(CryptoError::DecryptionFailed)
+        ));
         // Session still usable.
         let ct2 = alice.encrypt(b"next").unwrap();
         assert_eq!(bob.decrypt(&ct2).unwrap(), b"next");
@@ -280,6 +294,9 @@ mod tests {
     #[test]
     fn bob_cannot_send_before_receiving() {
         let (_alice, mut bob, _) = make_pair();
-        assert!(matches!(bob.encrypt(b"premature"), Err(CryptoError::InvalidState)));
+        assert!(matches!(
+            bob.encrypt(b"premature"),
+            Err(CryptoError::InvalidState)
+        ));
     }
 }

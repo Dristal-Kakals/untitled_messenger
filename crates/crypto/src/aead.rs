@@ -1,4 +1,7 @@
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, XChaCha20Poly1305};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305,
+};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -15,7 +18,13 @@ pub const ATTACH_INFO: &[u8] = b"UM-attach-v1";
 pub fn seal(key: &[u8; 32], nonce: &[u8; 24], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .encrypt(nonce.into(), Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce.into(),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("xchacha encryption is infallible for valid key/nonce")
 }
 
@@ -27,7 +36,13 @@ pub fn open(
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(nonce.into(), Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::DecryptionFailed)
 }
 
@@ -98,7 +113,10 @@ mod tests {
         let aad = b"header-bytes";
         let mut ct = seal(&key, &nonce, aad, b"secret");
         ct[0] ^= 0xff;
-        assert_eq!(open(&key, &nonce, aad, &ct), Err(CryptoError::DecryptionFailed));
+        assert_eq!(
+            open(&key, &nonce, aad, &ct),
+            Err(CryptoError::DecryptionFailed)
+        );
     }
 
     #[test]
@@ -106,7 +124,10 @@ mod tests {
         let key = [7u8; 32];
         let nonce = random_nonce();
         let ct = seal(&key, &nonce, b"aad-a", b"secret");
-        assert_eq!(open(&key, &nonce, b"aad-b", &ct), Err(CryptoError::DecryptionFailed));
+        assert_eq!(
+            open(&key, &nonce, b"aad-b", &ct),
+            Err(CryptoError::DecryptionFailed)
+        );
     }
 
     #[test]

@@ -52,7 +52,12 @@ impl SignedPreKey {
         let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
         let signature = identity.sign(&pub_key.to_bytes());
-        Self { id, priv_key, pub_key, signature }
+        Self {
+            id,
+            priv_key,
+            pub_key,
+            signature,
+        }
     }
 
     pub fn verify_signature(&self, identity_pub: &VerifyingKey) -> Result<(), CryptoError> {
@@ -74,7 +79,11 @@ impl OneTimePreKey {
         let rng = OsRng;
         let priv_key = StaticSecret::random_from_rng(rng);
         let pub_key = PublicKey::from(&priv_key);
-        Self { id, priv_key, pub_key }
+        Self {
+            id,
+            priv_key,
+            pub_key,
+        }
     }
 }
 
@@ -133,7 +142,10 @@ mod tests {
     fn identity_rejects_wrong_message() {
         let id = IdentityKey::generate();
         let sig = id.sign(b"hello");
-        assert_eq!(id.verify(b"world", &sig), Err(CryptoError::InvalidSignature));
+        assert_eq!(
+            id.verify(b"world", &sig),
+            Err(CryptoError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -157,7 +169,10 @@ mod tests {
         let id_a = IdentityKey::generate();
         let id_b = IdentityKey::generate();
         let spk = SignedPreKey::generate(1, &id_a);
-        assert_eq!(spk.verify_signature(&id_b.verifying), Err(CryptoError::InvalidSignature));
+        assert_eq!(
+            spk.verify_signature(&id_b.verifying),
+            Err(CryptoError::InvalidSignature)
+        );
     }
 
     #[test]

@@ -106,17 +106,19 @@ impl GroupSession {
         signed.extend_from_slice(&ciphertext);
         let signature = self.self_state.signing_priv.sign(&signed);
 
-        Ok(GroupEncrypted { header, ciphertext, signature })
+        Ok(GroupEncrypted {
+            header,
+            ciphertext,
+            signature,
+        })
     }
 
     pub fn decrypt(&mut self, message: &GroupEncrypted) -> Result<Vec<u8>, CryptoError> {
-        let (chain_key, peer_gen, signing_pub) = match self
-            .peer_states
-            .get_mut(&message.header.sender_id)
-        {
-            Some(v) => v,
-            None => return Err(CryptoError::MissingPreKey),
-        };
+        let (chain_key, peer_gen, signing_pub) =
+            match self.peer_states.get_mut(&message.header.sender_id) {
+                Some(v) => v,
+                None => return Err(CryptoError::MissingPreKey),
+            };
 
         let aad = group_header_aad(&message.header);
         let mut signed = aad.clone();
@@ -164,9 +166,15 @@ pub struct DistributionPayload {
     pub state: SenderKeyState,
 }
 
-pub fn encode_distribution(state: &SenderKeyState, group_id: [u8; 32]) -> Result<Vec<u8>, CryptoError> {
-    bincode::serialize(&DistributionPayload { group_id, state: state.clone() })
-        .map_err(|_| CryptoError::InvalidState)
+pub fn encode_distribution(
+    state: &SenderKeyState,
+    group_id: [u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    bincode::serialize(&DistributionPayload {
+        group_id,
+        state: state.clone(),
+    })
+    .map_err(|_| CryptoError::InvalidState)
 }
 
 pub fn decode_distribution(bytes: &[u8]) -> Result<(SenderKeyState, [u8; 32]), CryptoError> {
@@ -264,7 +272,10 @@ mod tests {
 
         let mut ct = sa.encrypt(b"hi").unwrap();
         ct.ciphertext[0] ^= 0xff;
-        assert!(matches!(sb.decrypt(&ct), Err(CryptoError::InvalidSignature)));
+        assert!(matches!(
+            sb.decrypt(&ct),
+            Err(CryptoError::InvalidSignature)
+        ));
     }
 
     #[test]
@@ -293,6 +304,9 @@ mod tests {
         let ct2 = sa.encrypt(b"second").unwrap();
         assert_eq!(sb.decrypt(&ct2).unwrap(), b"second");
         // Replaying ct1 (older generation) must fail.
-        assert!(matches!(sb.decrypt(&ct1), Err(CryptoError::DecryptionFailed)));
+        assert!(matches!(
+            sb.decrypt(&ct1),
+            Err(CryptoError::DecryptionFailed)
+        ));
     }
 }
