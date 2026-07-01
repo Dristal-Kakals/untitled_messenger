@@ -1,5 +1,14 @@
 # Protocol Crate Implementation Plan
 
+> **STATUS: SUPERSEDED (2026-07-01).** Not followed. The actual `um_protocol`
+> crate shipped with a simpler design: modules `error`/`message`/`framing`
+> (not `messages`/`frame`), `ProtocolError { FrameTooLarge(usize), Incomplete,
+> Encode, Decode }`, `EncryptedEnvelope { sender_key: [u8;32], ciphertext }`,
+> `ClientMessage { Send, Fetch, RegisterPrekeys }`, `ServerMessage { Deliver,
+> Ack, Error }`, `ServerError { RecipientNotFound, BadRequest, Internal }`,
+> 16 MiB max frame, no `FrameDecoder`, raw `[u8;32]` identity keys instead of
+> embedded crypto types. Do not execute the tasks below — kept for history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the `protocol` crate — a pure, sync Rust library defining the wire messages (client↔server) and the length-prefixed framing codec, with no async, no networking, and no panics.
