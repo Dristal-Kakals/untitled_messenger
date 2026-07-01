@@ -1,0 +1,26 @@
+[package]
+name = "um_client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+um_protocol = { path = "../protocol" }
+um_crypto = { path = "../crypto" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["alloc"] }
+rand = "0.8"
+tracing = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "test-util"] }
+um_server = { path = "../server" }
