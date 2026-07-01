@@ -109,13 +109,7 @@ fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, ClientError>
     let nonce = chacha20poly1305::XNonce::from_slice(nonce_bytes);
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ct,
-                aad,
-            },
-        )
+        .decrypt(nonce, Payload { msg: ct, aad })
         .map_err(|_| ClientError::Store("open failed (wrong passphrase or corrupt)".into()))
 }
 
@@ -141,10 +135,7 @@ impl Store {
         // reopen (the AEAD tag won't verify with a different key).
         let canary = seal(&key.key, b"store_canary", b"um-store-ok")?;
         set_kv_raw(&conn, "store_canary", &canary)?;
-        Ok(Self {
-            conn,
-            key: key.key,
-        })
+        Ok(Self { conn, key: key.key })
     }
 
     /// Open an existing store, re-deriving the key from `passphrase` + the
@@ -166,10 +157,7 @@ impl Store {
             open(&key.key, b"store_canary", &canary)
                 .map_err(|_| ClientError::Store("wrong passphrase".into()))?;
         }
-        Ok(Self {
-            conn,
-            key: key.key,
-        })
+        Ok(Self { conn, key: key.key })
     }
 
     /// Store a typed value under `key_name`, postcard-serialized then sealed.
@@ -224,7 +212,8 @@ impl Store {
             .map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (pub_bytes, nick, fp) = row.map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
+            let (pub_bytes, nick, fp) =
+                row.map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
             let mut p = [0u8; 32];
             let mut f = [0u8; 32];
             if pub_bytes.len() != 32 || fp.len() != 32 {
@@ -275,9 +264,14 @@ fn get_kv_raw(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, ClientErr
     let mut rows = stmt
         .query(rusqlite::params![key])
         .map_err(|e| ClientError::Store(format!("get_kv: {e}")))?;
-    match rows.next().map_err(|e| ClientError::Store(format!("get_kv: {e}")))? {
+    match rows
+        .next()
+        .map_err(|e| ClientError::Store(format!("get_kv: {e}")))?
+    {
         Some(r) => {
-            let blob: Vec<u8> = r.get(0).map_err(|e| ClientError::Store(format!("get_kv: {e}")))?;
+            let blob: Vec<u8> = r
+                .get(0)
+                .map_err(|e| ClientError::Store(format!("get_kv: {e}")))?;
             Ok(Some(blob))
         }
         None => Ok(None),
@@ -294,7 +288,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 8];
         rng.fill_bytes(&mut bytes);
-        p.push(format!("um-store-test-{}.db", hex::encode(&bytes)));
+        p.push(format!("um-store-test-{}.db", hex_encode(&bytes)));
         p
     }
 
@@ -360,7 +354,9 @@ mod tests {
     fn contacts_round_trip() {
         let path = tmp();
         let store = Store::create(&path, "pw").unwrap();
-        store.put_contact(&[0x11; 32], "alice", &[0x22; 32]).unwrap();
+        store
+            .put_contact(&[0x11; 32], "alice", &[0x22; 32])
+            .unwrap();
         store.put_contact(&[0x33; 32], "bob", &[0x44; 32]).unwrap();
         let mut contacts = store.contacts().unwrap();
         contacts.sort_by_key(|c| c.identity_pub);
