@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 um_protocol = { path = "../protocol" }
 um_crypto = { path = "../crypto" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
