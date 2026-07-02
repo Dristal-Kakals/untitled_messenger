@@ -68,6 +68,8 @@ fn real_bundle() -> (IdentityKey, PreKeyBundle) {
             .iter()
             .map(|(k, v)| (*k, v.to_bytes()))
             .collect(),
+        pq_encapsulation_key: None,
+        pq_encapsulation_key_sig: None,
     };
     (id, bundle)
 }

@@ -129,6 +129,8 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (*k, v.to_bytes()))
                 .collect(),
+            pq_encapsulation_key: None,
+            pq_encapsulation_key_sig: None,
         };
         if !valid_sig {
             // Flip one byte of the signature.

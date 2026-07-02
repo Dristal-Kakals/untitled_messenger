@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::CryptoError;
+use crate::kem::PqEncapsulationKey;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct IdentityKey {
@@ -94,6 +95,17 @@ pub struct PreKeyBundle {
     pub signed_prekey_pub: PublicKey,
     pub signed_prekey_sig: Signature,
     pub one_time_prekeys: Vec<(u32, PublicKey)>,
+    /// Optional post-quantum ML-KEM-768 encapsulation key. When present, the
+    /// initiator encapsulates to it and mixes the KEM shared secret into the
+    /// X3DH root-key derivation (hybrid PQXDH). `None` for legacy/classical-only
+    /// bundles — `x3dh::initiate` falls back to pure X25519 X3DH.
+    #[serde(default)]
+    pub pq_encapsulation_key: Option<PqEncapsulationKey>,
+    /// Identity signature over the PQ encapsulation key, binding it to this
+    /// identity (defends against PQ-key substitution). Present iff
+    /// `pq_encapsulation_key` is. Verified in `PreKeyBundle::verify`.
+    #[serde(default)]
+    pub pq_encapsulation_key_sig: Option<Signature>,
 }
 
 impl PreKeyBundle {
@@ -108,13 +120,52 @@ impl PreKeyBundle {
             signed_prekey_pub: signed.pub_key,
             signed_prekey_sig: signed.signature,
             one_time_prekeys: one_time.iter().map(|k| (k.id, k.pub_key)).collect(),
+            pq_encapsulation_key: None,
+            pq_encapsulation_key_sig: None,
+        }
+    }
+
+    /// Like [`from_identity`](Self::from_identity) but attaches a post-quantum
+    /// ML-KEM-768 encapsulation key, signed by `identity`. The resulting bundle
+    /// enables hybrid PQXDH: initiators encapsulate to `pq_ek` and mix the KEM
+    /// shared secret into the root key.
+    pub fn from_identity_with_pq(
+        identity: &IdentityKey,
+        signed: &SignedPreKey,
+        one_time: &[&OneTimePreKey],
+        pq_ek: &PqEncapsulationKey,
+    ) -> Self {
+        let pq_sig = identity.sign(&pq_ek.0);
+        Self {
+            identity_pub: identity.verifying,
+            signed_prekey_id: signed.id,
+            signed_prekey_pub: signed.pub_key,
+            signed_prekey_sig: signed.signature,
+            one_time_prekeys: one_time.iter().map(|k| (k.id, k.pub_key)).collect(),
+            pq_encapsulation_key: Some(pq_ek.clone()),
+            pq_encapsulation_key_sig: Some(pq_sig),
         }
     }
 
     pub fn verify(&self) -> Result<(), CryptoError> {
         self.identity_pub
             .verify(&self.signed_prekey_pub.to_bytes(), &self.signed_prekey_sig)
-            .map_err(|_| CryptoError::MalformedBundle)
+            .map_err(|_| CryptoError::MalformedBundle)?;
+        // If a PQ encapsulation key is present, its signature must verify
+        // against the identity too — otherwise the PQ key is unbound and could
+        // be substituted by a MITM.
+        if let (Some(pq_ek), Some(pq_sig)) = (
+            self.pq_encapsulation_key.as_ref(),
+            self.pq_encapsulation_key_sig.as_ref(),
+        ) {
+            self.identity_pub
+                .verify(&pq_ek.0, pq_sig)
+                .map_err(|_| CryptoError::MalformedBundle)?;
+        } else if self.pq_encapsulation_key.is_some() || self.pq_encapsulation_key_sig.is_some() {
+            // Half-present (key without sig or vice versa) is malformed.
+            return Err(CryptoError::MalformedBundle);
+        }
+        Ok(())
     }
 }
 

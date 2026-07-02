@@ -109,6 +109,13 @@ async fn e2e_full_exchange_decrypts_end_to_end() {
     // Alice fetches Bob's bundle from the relay.
     let bob_bundle = fetch_bundle(&mut alice, bob_pub).await;
     assert_eq!(bob_bundle.identity_pub, bob_pub);
+    // The relay must carry Bob's PQ encapsulation key + signature through the
+    // Bundle fetch unchanged — this is the hybrid PQXDH precondition.
+    assert!(
+        bob_bundle.pq_encapsulation_key.is_some(),
+        "fetched bundle must carry the PQ encapsulation key"
+    );
+    assert!(bob_bundle.pq_encapsulation_key_sig.is_some());
 
     // Alice starts a session (X3DH) and sends the first message. The envelope
     // carries the X3DH init so Bob can seed his matching ratchet.
@@ -356,4 +363,61 @@ async fn e2e_group_three_members_decrypt_each_other() {
     assert_eq!(dc2.len(), 1);
     let (ptc2, _) = sc.receive(&dc2[0]).expect("c group recv b");
     assert_eq!(ptc2, b"hi from b");
+}
+
+/// Hybrid PQXDH end-to-end over real TCP. Two clients register hybrid bundles
+/// (ML-KEM-768 encapsulation key advertised), Alice fetches Bob's bundle from
+/// the relay, runs hybrid X3DH (encapsulating to Bob's PQ key), sends the first
+/// message, Bob decapsulates + decrypts. Asserts the PQ fields survive the
+/// relay round trip and the hybrid root key is established on both sides — the
+/// full post-quantum path through the network stack, not just the crypto unit.
+#[tokio::test]
+async fn e2e_hybrid_pqxdh_over_tcp() {
+    let store = Arc::new(Store::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs).await.expect("serve");
+
+    let mut alice_session = ClientSession::generate(3);
+    let mut bob_session = ClientSession::generate(3);
+    let alice_pub = alice_session.identity_pub();
+    let bob_pub = bob_session.identity_pub();
+
+    let mut alice = Client::connect(addr).await.expect("alice connect");
+    let mut bob = Client::connect(addr).await.expect("bob connect");
+    register(&mut alice, &alice_session).await;
+    register(&mut bob, &bob_session).await;
+
+    // Bob's bundle must arrive at Alice with the PQ fields intact.
+    let bob_bundle = fetch_bundle(&mut alice, bob_pub).await;
+    let pq_ek = bob_bundle
+        .pq_encapsulation_key
+        .as_ref()
+        .expect("relay must deliver PQ encapsulation key");
+    assert_eq!(pq_ek.len(), um_crypto::EK_768_LEN);
+    assert!(bob_bundle.pq_encapsulation_key_sig.is_some());
+
+    // Hybrid X3DH: Alice encapsulates to Bob's PQ key during initiate.
+    let env = alice_session
+        .start_session(&bob_bundle, b"pq hello")
+        .expect("alice hybrid start");
+    assert!(env.init.is_some(), "first message must carry the X3DH init");
+    send_envelope(&mut alice, vec![bob_pub], env).await;
+
+    // Bob decapsulates + decrypts via the hybrid receive path.
+    let d = poll(&mut bob, 0).await;
+    assert_eq!(d.len(), 1);
+    let (pt, sender) = bob_session.receive(&d[0]).expect("bob hybrid recv");
+    assert_eq!(pt, b"pq hello");
+    assert_eq!(sender, alice_pub);
+    ack(&mut bob, vec![d[0].id]).await;
+
+    // Follow-up on the established (hybrid-rooted) ratchet.
+    let env2 = alice_session
+        .send(&bob_pub, b"pq second")
+        .expect("alice follow-up");
+    send_envelope(&mut alice, vec![bob_pub], env2).await;
+    let d2 = poll(&mut bob, d[0].id).await;
+    assert_eq!(d2.len(), 1);
+    let (pt2, _) = bob_session.receive(&d2[0]).expect("bob follow-up");
+    assert_eq!(pt2, b"pq second");
 }

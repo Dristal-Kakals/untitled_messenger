@@ -128,6 +128,8 @@ mod tests {
             signed_prekey_pub: [0x22; 32],
             signed_prekey_sig: vec![0xAB; 64],
             one_time_prekeys: vec![(10, [0x33; 32])],
+            pq_encapsulation_key: None,
+            pq_encapsulation_key_sig: None,
         }
     }
 

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use um_crypto::double_ratchet::RatchetSession;
 use um_crypto::identity::{IdentityKey, OneTimePreKey, PreKeyBundle as CryptoBundle, SignedPreKey};
+use um_crypto::kem::PqDecapsulationKey;
 use um_crypto::sender_keys::{GroupEncrypted, GroupSession, SenderKeyState};
 use um_crypto::x3dh;
 use um_protocol::{EncryptedEnvelope, MessageKind, PreKeyBundle};
@@ -46,11 +47,20 @@ pub struct ClientSession {
     one_time_prekeys: HashMap<u32, OneTimePreKey>,
     ratchets: HashMap<[u8; 32], RatchetSession>,
     groups: HashMap<[u8; 32], GroupSession>,
+    /// Optional ML-KEM-768 decapsulation key (stored as its 64-byte seed). When
+    /// present, the registration bundle advertises a PQ encapsulation key and
+    /// incoming X3DH inits are decapsulated hybridly. `None` for a
+    /// classical-only session (e.g. one created before PQ support, deserialized
+    /// via `#[serde(default)]`). Retained across signed-prekey rotation — the
+    /// PQ key is independent of the X25519 signed prekey.
+    #[serde(default)]
+    pq_decapsulation_key: Option<PqDecapsulationKey>,
 }
 
 impl ClientSession {
-    /// Generate a fresh session: new identity, signed prekey (id 1), and
-    /// `n` one-time prekeys (ids 1..=n).
+    /// Generate a fresh session: new identity, signed prekey (id 1), `n`
+    /// one-time prekeys (ids 1..=n), and a fresh ML-KEM-768 keypair so the
+    /// registered bundle enables hybrid PQXDH.
     pub fn generate(one_time_count: u32) -> Self {
         let identity = IdentityKey::generate();
         let signed_prekey = SignedPreKey::generate(1, &identity);
@@ -60,6 +70,7 @@ impl ClientSession {
                 (k.id, k)
             })
             .collect();
+        let (pq_dk, _pq_ek) = um_crypto::kem::PqEncapsulationKey::generate_keypair();
         Self {
             identity,
             signed_prekey,
@@ -67,6 +78,7 @@ impl ClientSession {
             one_time_prekeys,
             ratchets: HashMap::new(),
             groups: HashMap::new(),
+            pq_decapsulation_key: Some(pq_dk),
         }
     }
 
@@ -81,7 +93,10 @@ impl ClientSession {
         self.identity.fingerprint()
     }
 
-    /// Build the protocol `PreKeyBundle` to register with the server.
+    /// Build the protocol `PreKeyBundle` to register with the server. When this
+    /// session holds an ML-KEM-768 decapsulation key, the bundle carries the
+    /// matching encapsulation key + identity signature, enabling hybrid PQXDH
+    /// for initiators.
     pub fn registration_bundle(&self) -> PreKeyBundle {
         let crypto_bundle = CryptoBundle::from_identity(
             &self.identity,
@@ -91,6 +106,21 @@ impl ClientSession {
                 .collect::<Vec<_>>()
                 .as_slice(),
         );
+        // If we have a PQ decapsulation key, re-derive the matching
+        // encapsulation key from the seed (ML-KEM keygen is deterministic from
+        // the 64-byte seed) and attach it + the identity signature. Derivation
+        // cannot fail for a key we generated ourselves, so we unwrap; a failure
+        // here would indicate corruption of the stored seed.
+        let (pq_ek, pq_sig) = match &self.pq_decapsulation_key {
+            Some(dk) => {
+                let ek = dk
+                    .derive_encapsulation_key()
+                    .expect("own PQ decapsulation key must re-derive its ek");
+                let sig = self.identity.sign(&ek.0);
+                (Some(ek.0), Some(sig.to_bytes().to_vec()))
+            }
+            None => (None, None),
+        };
         PreKeyBundle {
             identity_pub: self.identity_pub(),
             signed_prekey_id: crypto_bundle.signed_prekey_id,
@@ -101,6 +131,8 @@ impl ClientSession {
                 .iter()
                 .map(|(k, v)| (*k, v.to_bytes()))
                 .collect(),
+            pq_encapsulation_key: pq_ek,
+            pq_encapsulation_key_sig: pq_sig,
         }
     }
 
@@ -295,7 +327,13 @@ impl ClientSession {
                 ),
                 None => None,
             };
-            let session_init = x3dh::receive(&self.identity, spk, otpk, &init)?;
+            let session_init = x3dh::receive_with_pq(
+                &self.identity,
+                spk,
+                otpk,
+                &init,
+                self.pq_decapsulation_key.as_ref(),
+            )?;
             let mut ratchet = RatchetSession::init_bob(&session_init, &spk.priv_key)?;
             let encrypted = encrypted_from_envelope(envelope)?;
             let plaintext = ratchet.decrypt(&encrypted)?;
@@ -360,12 +398,34 @@ impl ClientSession {
             .iter()
             .map(|(id, pub_bytes)| (*id, x25519_pub(pub_bytes)))
             .collect::<Vec<_>>();
+        // Reconstruct the optional PQ encapsulation key + its identity
+        // signature. Both must be present together; a half-present pair is
+        // rejected as malformed (the bundle is not a valid hybrid bundle).
+        let (pq_encapsulation_key, pq_encapsulation_key_sig) = match (
+            bundle.pq_encapsulation_key.as_ref(),
+            bundle.pq_encapsulation_key_sig.as_ref(),
+        ) {
+            (Some(ek_bytes), Some(sig_bytes)) => (
+                Some(
+                    um_crypto::PqEncapsulationKey::from_bytes(ek_bytes)
+                        .map_err(|_| ClientError::Store("bad peer PQ ek".into()))?,
+                ),
+                Some(
+                    Signature::from_slice(sig_bytes)
+                        .map_err(|_| ClientError::Store("bad peer PQ signature".into()))?,
+                ),
+            ),
+            (None, None) => (None, None),
+            _ => return Err(ClientError::Store("malformed peer PQ bundle".into())),
+        };
         Ok(CryptoBundle {
             identity_pub,
             signed_prekey_id: bundle.signed_prekey_id,
             signed_prekey_pub,
             signed_prekey_sig,
             one_time_prekeys,
+            pq_encapsulation_key,
+            pq_encapsulation_key_sig,
         })
     }
 }
@@ -709,5 +769,83 @@ mod tests {
         assert_eq!(back.one_time_prekey_count(), alice.one_time_prekey_count());
         // previous_signed_prekeys survived (serde default made it backward-safe).
         assert!(back.previous_signed_prekeys.contains_key(&1));
+    }
+
+    // ---- Post-quantum hybrid (full ClientSession path) ----------------------
+
+    /// The registration bundle of a freshly generated session advertises an
+    /// ML-KEM-768 encapsulation key + a valid identity signature over it. This
+    /// is the entry point that lets peers run hybrid PQXDH against us.
+    #[test]
+    fn registration_bundle_advertises_pq_key_with_valid_signature() {
+        let bob = ClientSession::generate(3);
+        let bundle = bob.registration_bundle();
+        let pq_ek = bundle
+            .pq_encapsulation_key
+            .as_ref()
+            .expect("bundle must carry a PQ encapsulation key");
+        let pq_sig = bundle
+            .pq_encapsulation_key_sig
+            .as_ref()
+            .expect("bundle must carry a PQ signature");
+        assert_eq!(pq_ek.len(), um_crypto::EK_768_LEN);
+        assert_eq!(pq_sig.len(), 64);
+        // The signature verifies against the identity pub.
+        use ed25519_dalek::Verifier;
+        use um_crypto::{Signature, VerifyingKey};
+        let vk = VerifyingKey::from_bytes(&bundle.identity_pub).unwrap();
+        let sig = Signature::from_slice(pq_sig).unwrap();
+        assert!(
+            vk.verify(pq_ek, &sig).is_ok(),
+            "PQ key signature must verify"
+        );
+    }
+
+    /// Full hybrid PQXDH end-to-end through the session API: Alice starts a
+    /// session against Bob's PQ-capable bundle, Bob receives via the hybrid
+    /// receive path, and both decrypt the same plaintext. This exercises the
+    /// whole chain — `derive_encapsulation_key` on registration, `initiate`
+    /// encapsulating, `receive_with_pq` decapsulating — not just the x3dh unit.
+    #[test]
+    fn hybrid_pqxdh_full_session_round_trip() {
+        let mut alice = ClientSession::generate(2);
+        let mut bob = ClientSession::generate(2);
+        let bob_bundle = bob.registration_bundle();
+        assert!(bob_bundle.pq_encapsulation_key.is_some());
+
+        let env = alice
+            .start_session(&bob_bundle, b"hybrid hello")
+            .expect("alice hybrid start");
+        assert!(env.init.is_some(), "first message must carry the X3DH init");
+        let (pt, sender) = bob.receive(&env).expect("bob hybrid receive");
+        assert_eq!(pt, b"hybrid hello");
+        assert_eq!(sender, alice.identity_pub());
+
+        // Follow-up on the established ratchet (no further PQ involvement).
+        let env2 = alice
+            .send(&bob.identity_pub(), b"hybrid second")
+            .expect("alice follow-up");
+        let (pt2, _) = bob.receive(&env2).expect("bob follow-up");
+        assert_eq!(pt2, b"hybrid second");
+    }
+
+    /// A session whose PQ decapsulation key round-trips through postcard still
+    /// derives the same encapsulation key, so a persisted+restored session can
+    /// still be initiated against hybridly.
+    #[test]
+    fn pq_session_serializes_and_still_advertises_pq_key() {
+        let bob = ClientSession::generate(1);
+        let bundle_before = bob.registration_bundle();
+        let bytes = postcard::to_allocvec(&bob).expect("serialize");
+        let back: ClientSession = postcard::from_bytes(&bytes).expect("deserialize");
+        let bundle_after = back.registration_bundle();
+        assert_eq!(
+            bundle_before.pq_encapsulation_key, bundle_after.pq_encapsulation_key,
+            "re-derived PQ ek must be byte-identical after serialize round trip"
+        );
+        assert_eq!(
+            bundle_before.pq_encapsulation_key_sig,
+            bundle_after.pq_encapsulation_key_sig
+        );
     }
 }

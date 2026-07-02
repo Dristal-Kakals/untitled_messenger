@@ -53,6 +53,12 @@ pub struct EncryptedEnvelope {
 /// except `identity_pub` (used as the registry key) and `signed_prekey_sig`
 /// (verified against `identity_pub` on `Register`). The bundle is the
 /// public half only — the server never holds private keys.
+///
+/// `pq_encapsulation_key` / `pq_encapsulation_key_sig` carry an optional
+/// ML-KEM-768 encapsulation key + the identity signature over it, enabling
+/// hybrid PQXDH. Both are `None` for classical-only clients (backward compat);
+/// the server treats them as opaque bytes. `#[serde(default)]` keeps old
+/// bundles (registered before PQ support) deserializable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     /// Owner identity public key (32-byte Ed25519 verifying key).
@@ -65,6 +71,13 @@ pub struct PreKeyBundle {
     pub signed_prekey_sig: Vec<u8>,
     /// One-time prekey ids + public keys (32-byte X25519 each).
     pub one_time_prekeys: Vec<(u32, [u8; 32])>,
+    /// Optional ML-KEM-768 encapsulation key (1184 bytes), for hybrid PQXDH.
+    #[serde(default)]
+    pub pq_encapsulation_key: Option<Vec<u8>>,
+    /// Optional Ed25519 signature over `pq_encapsulation_key` by
+    /// `identity_pub`. Present iff `pq_encapsulation_key` is.
+    #[serde(default)]
+    pub pq_encapsulation_key_sig: Option<Vec<u8>>,
 }
 
 /// Messages sent from a client to the relay server.
@@ -138,6 +151,8 @@ mod tests {
             signed_prekey_pub: [0x22; 32],
             signed_prekey_sig: vec![0xAB; 64],
             one_time_prekeys: vec![(10, [0x33; 32]), (11, [0x44; 32])],
+            pq_encapsulation_key: None,
+            pq_encapsulation_key_sig: None,
         }
     }
 
@@ -264,5 +279,35 @@ mod tests {
     #[test]
     fn prekey_bundle_round_trips() {
         round_trip(&sample_bundle());
+    }
+
+    #[test]
+    fn prekey_bundle_with_pq_key_round_trips() {
+        let bundle = PreKeyBundle {
+            pq_encapsulation_key: Some(vec![0xAB; 1184]),
+            pq_encapsulation_key_sig: Some(vec![0xCD; 64]),
+            ..sample_bundle()
+        };
+        round_trip(&bundle);
+    }
+
+    #[test]
+    fn prekey_bundle_without_pq_fields_decodes_from_classical_toml() {
+        // A bundle serialized before PQ support (no pq_* fields) must still
+        // deserialize thanks to `#[serde(default)]` — backward compat for
+        // in-flight registrations.
+        let classical = PreKeyBundle {
+            identity_pub: [0x11; 32],
+            signed_prekey_id: 1,
+            signed_prekey_pub: [0x22; 32],
+            signed_prekey_sig: vec![0xAB; 64],
+            one_time_prekeys: vec![(10, [0x33; 32])],
+            pq_encapsulation_key: None,
+            pq_encapsulation_key_sig: None,
+        };
+        let bytes = postcard::to_allocvec(&classical).unwrap();
+        let back: PreKeyBundle = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, classical);
+        assert!(back.pq_encapsulation_key.is_none());
     }
 }

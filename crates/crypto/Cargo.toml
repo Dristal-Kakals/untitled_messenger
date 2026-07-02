@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 hex = "0.4"
 postcard = { version = "1", features = ["alloc"] }
+# Post-quantum hybrid: ML-KEM-768 (FIPS 203, pure Rust). Used as a KEM layer
+# over X3DH so the session root key is bound to a lattice secret in addition to
+# the classical X25519 DH outputs. `getrandom` pulls OS RNG for keygen/encaps.
+ml-kem = { version = "0.3", features = ["getrandom"] }
 
 [dev-dependencies]
 proptest = "1"
