@@ -483,3 +483,222 @@ async fn bridge_reconnect_recovers_offline_mail() {
         })
         .await;
 }
+
+/// The manual fingerprint-verification flag must PERSIST to the encrypted
+/// store, so the UI's ✓ mark survives a store close/reopen. Before the fix,
+/// `handle_verify_fingerprint` was UI-local state and `load_contacts` always
+/// returned `verified: false`, so the mark was lost on every restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_verify_fingerprint_persists_across_reopen() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    let store = Arc::new(ServerStore::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs)
+        .await
+        .expect("serve relay");
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (alice_bridge, alice_pub) = make_bridge(&dir, &server_addr);
+            let (bob_bridge, bob_pub) = make_bridge(&dir, &server_addr);
+
+            let (alice_cmd, mut alice_ev) = spawn_bridge(alice_bridge);
+            let (bob_cmd, mut bob_ev) = spawn_bridge(bob_bridge);
+
+            alice_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("alice connect");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+            bob_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob connect");
+            expect_event(&mut bob_ev, |e| matches!(e, Event::Connected)).await;
+
+            // Alice adds bob as a contact.
+            alice_cmd
+                .send(Command::AddContact {
+                    identity_pub: bob_pub,
+                    nickname: "bob".to_string(),
+                })
+                .await
+                .expect("add contact");
+            let loaded =
+                expect_event(&mut alice_ev, |e| matches!(e, Event::ContactsLoaded(_))).await;
+            match loaded {
+                Event::ContactsLoaded(contacts) => {
+                    let bob = contacts
+                        .iter()
+                        .find(|c| c.identity_pub == bob_pub)
+                        .expect("bob in contacts");
+                    assert!(!bob.verified, "contact starts unverified");
+                }
+                other => panic!("expected ContactsLoaded, got {other:?}"),
+            }
+
+            // Alice marks bob's fingerprint verified.
+            alice_cmd
+                .send(Command::VerifyFingerprint {
+                    identity_pub: bob_pub,
+                })
+                .await
+                .expect("verify");
+            // The bridge emits FingerprintVerified then ContactsLoaded.
+            expect_event(&mut alice_ev, |e| {
+                matches!(e, Event::FingerprintVerified { .. })
+            })
+            .await;
+            let reloaded =
+                expect_event(&mut alice_ev, |e| matches!(e, Event::ContactsLoaded(_))).await;
+            match reloaded {
+                Event::ContactsLoaded(contacts) => {
+                    let bob = contacts
+                        .iter()
+                        .find(|c| c.identity_pub == bob_pub)
+                        .expect("bob in contacts");
+                    assert!(bob.verified, "verified flag set after VerifyFingerprint");
+                }
+                other => panic!("expected ContactsLoaded, got {other:?}"),
+            }
+
+            // Drop alice's bridge (closes the store), reopen the SAME store,
+            // and check the verified flag survived to disk.
+            drop(alice_cmd);
+            drop(alice_ev);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let alice_pub_hex = hex::encode(alice_pub);
+            let path = dir.join(format!("{alice_pub_hex}.db"));
+            let store = Store::open(&path, "test-pass").expect("reopen alice store");
+            let session: ClientSession = store.get("session").expect("load session").unwrap();
+            let contacts = store.contacts().expect("load contacts");
+            let bob = contacts
+                .iter()
+                .find(|c| c.identity_pub == bob_pub)
+                .expect("bob persisted");
+            assert!(
+                bob.verified,
+                "verified flag persisted to disk across store reopen"
+            );
+            // Touch session so it is not unused (proves the round-trip works).
+            assert_eq!(session.identity_pub(), alice_pub);
+
+            drop(bob_cmd);
+        })
+        .await;
+}
+
+/// `RotateSignedPrekey` and `ReplenishOneTimePrekeys` must actually change the
+/// bundle (new signed-prekey id + more one-time prekeys) and re-register it,
+/// not just re-register the same bundle. Before the fix both handlers were
+/// stubs that re-registered the current bundle unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_rotate_and_replenish_change_bundle() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    let store = Arc::new(ServerStore::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs)
+        .await
+        .expect("serve relay");
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (alice_bridge, _alice_pub) = make_bridge(&dir, &server_addr);
+            let (alice_cmd, mut alice_ev) = spawn_bridge(alice_bridge);
+
+            alice_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("alice connect");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+
+            // Snapshot the session from disk to read the pre-key ids before
+            // rotation. The bridge persists the session on every state change,
+            // so after each command we can reload it.
+            let alice_pub_hex = {
+                // We need the identity pub to locate the store; read it from
+                // the first Ready-ish signal is not emitted post-Connect, so
+                // derive it from the store file name instead.
+                let mut entries = std::fs::read_dir(&dir).expect("read dir");
+                let entry = entries.next().expect("one store file").expect("entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".db")
+                    .to_string()
+            };
+            let path = dir.join(format!("{alice_pub_hex}.db"));
+
+            let load_session = || {
+                let store = Store::open(&path, "test-pass").expect("reopen store");
+                store
+                    .get::<ClientSession>("session")
+                    .expect("load session")
+                    .unwrap()
+            };
+
+            let before = load_session();
+            let spk_before = before.signed_prekey_id();
+            let otpk_before = before.one_time_prekey_count();
+
+            // Rotate the signed prekey.
+            alice_cmd
+                .send(Command::RotateSignedPrekey)
+                .await
+                .expect("rotate");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+
+            let after_rotate = load_session();
+            assert_eq!(
+                after_rotate.signed_prekey_id(),
+                spk_before + 1,
+                "signed prekey id bumped after RotateSignedPrekey"
+            );
+
+            // Replenish one-time prekeys.
+            alice_cmd
+                .send(Command::ReplenishOneTimePrekeys { count: 5 })
+                .await
+                .expect("replenish");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+
+            let after_replenish = load_session();
+            assert_eq!(
+                after_replenish.one_time_prekey_count(),
+                otpk_before + 5,
+                "one-time prekey count grew by 5 after ReplenishOneTimePrekeys"
+            );
+            // Rotation id is stable across replenish.
+            assert_eq!(
+                after_replenish.signed_prekey_id(),
+                spk_before + 1,
+                "replenish did not disturb the signed prekey"
+            );
+
+            drop(alice_cmd);
+        })
+        .await;
+}

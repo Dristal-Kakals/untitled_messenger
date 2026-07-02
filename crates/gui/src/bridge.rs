@@ -465,8 +465,14 @@ impl Bridge {
         identity_pub: [u8; 32],
         event_tx: &mpsc::Sender<Event>,
     ) {
-        // v1: verification is UI-local state (the contact row carries the
-        // fingerprint for side-by-side comparison). Re-emit the contact list.
+        // Persist the manual-verification flag so the UI's ✓ mark survives
+        // restarts (previously UI-local state, lost on every reopen).
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) = store.set_verified(&identity_pub, true) {
+                let _ = event_tx.send(Event::Error(humanize(&e))).await;
+                return;
+            }
+        }
         let _ = event_tx
             .send(Event::FingerprintVerified { identity_pub })
             .await;
@@ -722,8 +728,10 @@ impl Bridge {
     // ---- Settings ------------------------------------------------------
 
     async fn handle_rotate_signed_prekey(&mut self, event_tx: &mpsc::Sender<Event>) {
-        // v1: rotation re-registers the current bundle (idempotent refresh).
-        // A full signed-prekey rotation spec is future work.
+        // Rotate the signed prekey (new id, retired old one retained for
+        // stale-bundle initiations), then re-register the refreshed bundle.
+        self.session.rotate_signed_prekey();
+        self.persist_session();
         if let Err(reason) = self.re_register().await {
             let _ = event_tx.send(Event::Error(reason)).await;
             return;
@@ -731,9 +739,11 @@ impl Bridge {
         let _ = event_tx.send(Event::Connected).await;
     }
 
-    async fn handle_replenish_one_time(&mut self, _count: u32, event_tx: &mpsc::Sender<Event>) {
-        // v1: re-register the current bundle. A real replenish that adds new
-        // one-time prekey ids is deferred.
+    async fn handle_replenish_one_time(&mut self, count: u32, event_tx: &mpsc::Sender<Event>) {
+        // Generate `count` fresh one-time prekeys (new ids past the current
+        // max), then re-register so the server advertises them.
+        self.session.replenish_one_time_prekeys(count);
+        self.persist_session();
         if let Err(reason) = self.re_register().await {
             let _ = event_tx.send(Event::Error(reason)).await;
             return;
@@ -1093,7 +1103,7 @@ impl Bridge {
                 identity_pub: c.identity_pub,
                 nickname: c.nickname,
                 fingerprint: c.fingerprint,
-                verified: false,
+                verified: c.verified,
             })
             .collect())
     }

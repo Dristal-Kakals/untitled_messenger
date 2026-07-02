@@ -180,7 +180,10 @@ impl Store {
         }
     }
 
-    /// Persist a contact (plaintext metadata; pub keys are public).
+    /// Persist a contact (plaintext metadata; pub keys are public). Upserts:
+    /// re-adding an existing contact updates nickname + fingerprint but
+    /// preserves the `verified` flag (so re-adding does not silently un-verify
+    /// a contact the user already confirmed).
     pub fn put_contact(
         &self,
         identity_pub: &[u8; 32],
@@ -189,10 +192,23 @@ impl Store {
     ) -> Result<(), ClientError> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO contacts (identity_pub, nickname, fingerprint) VALUES (?1, ?2, ?3)",
+                "INSERT INTO contacts (identity_pub, nickname, fingerprint) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(identity_pub) DO UPDATE SET nickname = excluded.nickname, fingerprint = excluded.fingerprint",
                 rusqlite::params![identity_pub.as_slice(), nickname, fingerprint.as_slice()],
             )
             .map_err(|e| ClientError::Store(format!("put_contact: {e}")))?;
+        Ok(())
+    }
+
+    /// Set the manual-verification flag for a contact. Persisted so the UI's
+    /// ✓ mark survives restarts.
+    pub fn set_verified(&self, identity_pub: &[u8; 32], verified: bool) -> Result<(), ClientError> {
+        self.conn
+            .execute(
+                "UPDATE contacts SET verified = ?2 WHERE identity_pub = ?1",
+                rusqlite::params![identity_pub.as_slice(), verified as i64],
+            )
+            .map_err(|e| ClientError::Store(format!("set_verified: {e}")))?;
         Ok(())
     }
 
@@ -200,19 +216,20 @@ impl Store {
     pub fn contacts(&self) -> Result<Vec<Contact>, ClientError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT identity_pub, nickname, fingerprint FROM contacts")
+            .prepare("SELECT identity_pub, nickname, fingerprint, verified FROM contacts")
             .map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
         let rows = stmt
             .query_map([], |r| {
                 let pub_bytes: Vec<u8> = r.get(0)?;
                 let nick: String = r.get(1)?;
                 let fp: Vec<u8> = r.get(2)?;
-                Ok((pub_bytes, nick, fp))
+                let verified: i64 = r.get(3)?;
+                Ok((pub_bytes, nick, fp, verified))
             })
             .map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (pub_bytes, nick, fp) =
+            let (pub_bytes, nick, fp, verified) =
                 row.map_err(|e| ClientError::Store(format!("contacts: {e}")))?;
             let mut p = [0u8; 32];
             let mut f = [0u8; 32];
@@ -225,6 +242,7 @@ impl Store {
                 identity_pub: p,
                 nickname: nick,
                 fingerprint: f,
+                verified: verified != 0,
             });
         }
         Ok(out)
@@ -325,20 +343,29 @@ pub struct StoredMessageRow {
     pub msg: StoredMessage,
 }
 
-/// A stored contact: identity pub, display nickname, and fingerprint.
+/// A stored contact: identity pub, display nickname, fingerprint, and whether
+/// the fingerprint has been manually verified (persists across restarts).
 pub struct Contact {
     pub identity_pub: [u8; 32],
     pub nickname: String,
     pub fingerprint: [u8; 32],
+    pub verified: bool,
 }
 
 fn init_schema(conn: &Connection) -> Result<(), ClientError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, blob BLOB);
-         CREATE TABLE IF NOT EXISTS contacts (identity_pub BLOB PRIMARY KEY, nickname TEXT, fingerprint BLOB);
+         CREATE TABLE IF NOT EXISTS contacts (identity_pub BLOB PRIMARY KEY, nickname TEXT, fingerprint BLOB, verified INT NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB, timestamp INT);",
     )
     .map_err(|e| ClientError::Store(format!("init_schema: {e}")))?;
+    // Backfill the `verified` column on pre-existing stores created before
+    // the column existed (ALTER TABLE ADD COLUMN with a default is a no-op if
+    // the column is already present, so this is idempotent across reopen).
+    let _ = conn.execute(
+        "ALTER TABLE contacts ADD COLUMN verified INT NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -457,6 +484,81 @@ mod tests {
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].nickname, "alice");
         assert_eq!(contacts[1].nickname, "bob");
+        // New contacts default to unverified.
+        assert!(!contacts[0].verified);
+        assert!(!contacts[1].verified);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_verified_persists_across_reopen() {
+        let path = tmp();
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .put_contact(&[0x11; 32], "alice", &[0x22; 32])
+                .unwrap();
+            store.set_verified(&[0x11; 32], true).unwrap();
+            // Re-adding the same contact must NOT clear the verified flag.
+            store
+                .put_contact(&[0x11; 32], "alice2", &[0x22; 32])
+                .unwrap();
+            let contacts = store.contacts().unwrap();
+            let alice = contacts
+                .iter()
+                .find(|c| c.identity_pub == [0x11; 32])
+                .unwrap();
+            assert!(alice.verified, "verified preserved across re-add");
+            assert_eq!(alice.nickname, "alice2");
+        }
+        // Verified flag survives close/reopen.
+        let store = Store::open(&path, "pw").unwrap();
+        let contacts = store.contacts().unwrap();
+        let alice = contacts
+            .iter()
+            .find(|c| c.identity_pub == [0x11; 32])
+            .unwrap();
+        assert!(alice.verified, "verified flag persisted to disk");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_store_without_verified_column_is_backfilled() {
+        // Simulate a store created before the `verified` column existed:
+        // create the store, then drop the column and recreate it without the
+        // default, then reopen — the migration must add the column back.
+        let path = tmp();
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .put_contact(&[0x11; 32], "alice", &[0x22; 32])
+                .unwrap();
+            // Wipe the column to force the ALTER TABLE migration path.
+            store
+                .conn
+                .execute("ALTER TABLE contacts RENAME TO contacts_old", [])
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "CREATE TABLE contacts (identity_pub BLOB PRIMARY KEY, nickname TEXT, fingerprint BLOB)",
+                    [],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO contacts SELECT identity_pub, nickname, fingerprint FROM contacts_old",
+                    [],
+                )
+                .unwrap();
+            store.conn.execute("DROP TABLE contacts_old", []).unwrap();
+        }
+        // Reopen: init_schema runs the ALTER TABLE ADD COLUMN, backfilling 0.
+        let store = Store::open(&path, "pw").unwrap();
+        let contacts = store.contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert!(!contacts[0].verified, "backfilled default is unverified");
         let _ = fs::remove_file(&path);
     }
 

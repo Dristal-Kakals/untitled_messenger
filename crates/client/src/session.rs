@@ -22,6 +22,13 @@ use crate::ClientError;
 /// signed prekey, the one-time prekeys, a ratchet session per peer (keyed by
 /// the peer's identity pub), and a Sender Keys `GroupSession` per group id.
 ///
+/// Previous signed prekeys are retained after rotation so that an X3DH
+/// initiation made against a stale (cached) bundle — carrying an old signed
+/// prekey id — can still be completed: the receiver looks up the matching
+/// signed prekey by `init.bob_signed_prekey_id` instead of always using the
+/// current one. Without this, rotating the signed prekey would break any
+/// in-flight initiation that had not yet re-fetched the bundle.
+///
 /// `Serialize`/`Deserialize` so the GUI bridge can persist the whole session
 /// (encrypted) to the local store under a single key and restore it on unlock.
 /// All fields are serde-capable crypto types; the derived impl round-trips
@@ -30,6 +37,12 @@ use crate::ClientError;
 pub struct ClientSession {
     identity: IdentityKey,
     signed_prekey: SignedPreKey,
+    /// Signed prekeys superseded by [`rotate_signed_prekey`], keyed by id.
+    /// Retained so stale X3DH initiations against an old bundle still decrypt.
+    ///
+    /// [`rotate_signed_prekey`]: ClientSession::rotate_signed_prekey
+    #[serde(default)]
+    previous_signed_prekeys: HashMap<u32, SignedPreKey>,
     one_time_prekeys: HashMap<u32, OneTimePreKey>,
     ratchets: HashMap<[u8; 32], RatchetSession>,
     groups: HashMap<[u8; 32], GroupSession>,
@@ -50,6 +63,7 @@ impl ClientSession {
         Self {
             identity,
             signed_prekey,
+            previous_signed_prekeys: HashMap::new(),
             one_time_prekeys,
             ratchets: HashMap::new(),
             groups: HashMap::new(),
@@ -88,6 +102,49 @@ impl ClientSession {
                 .map(|(k, v)| (*k, v.to_bytes()))
                 .collect(),
         }
+    }
+
+    /// Rotate the signed prekey: generate a fresh signed prekey with a new
+    /// id (one greater than the current), retiring the old one into
+    /// `previous_signed_prekeys` so an in-flight X3DH initiation against the
+    /// old bundle still decrypts. Existing Double-Ratchet sessions are
+    /// unaffected — their root key is already established; only future X3DH
+    /// initiations use the new prekey. The caller re-registers the resulting
+    /// bundle with the server. Returns the new signed-prekey id.
+    pub fn rotate_signed_prekey(&mut self) -> u32 {
+        let new_id = self.signed_prekey.id + 1;
+        let old = std::mem::replace(
+            &mut self.signed_prekey,
+            SignedPreKey::generate(new_id, &self.identity),
+        );
+        self.previous_signed_prekeys.insert(old.id, old);
+        new_id
+    }
+
+    /// Generate + add `count` fresh one-time prekeys with new ids (continuing
+    /// past the highest existing id). Existing one-time prekeys are kept
+    /// (the server bundle advertises all of them). The caller re-registers.
+    /// Returns the ids of the newly added prekeys.
+    pub fn replenish_one_time_prekeys(&mut self, count: u32) -> Vec<u32> {
+        let next_id = self.one_time_prekeys.keys().copied().max().unwrap_or(0) + 1;
+        let mut new_ids = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let id = next_id + i;
+            let k = OneTimePreKey::generate(id);
+            self.one_time_prekeys.insert(id, k);
+            new_ids.push(id);
+        }
+        new_ids
+    }
+
+    /// The number of one-time prekeys currently held (for tests/UI).
+    pub fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.len()
+    }
+
+    /// The current signed-prekey id (for tests/UI).
+    pub fn signed_prekey_id(&self) -> u32 {
+        self.signed_prekey.id
     }
 
     /// Start a new 1:1 session with `peer` by running X3DH against their
@@ -220,6 +277,15 @@ impl ClientSession {
         // No session yet: must be an initial message carrying an init.
         if !self.ratchets.contains_key(&sender) {
             let init = init_from_envelope(envelope)?.ok_or(ClientError::NoSession)?;
+            // Select the signed prekey the sender used. An initiation against
+            // a stale bundle carries the old id; we look it up in
+            // `previous_signed_prekeys` so the DH matches. Falls back to the
+            // current signed prekey when ids match (the common case) or when
+            // the init predates rotation tracking.
+            let spk = self
+                .previous_signed_prekeys
+                .get(&init.bob_signed_prekey_id)
+                .unwrap_or(&self.signed_prekey);
             // Find the one-time prekey the sender used.
             let otpk = match init.bob_one_time_prekey_id {
                 Some(id) => Some(
@@ -229,9 +295,8 @@ impl ClientSession {
                 ),
                 None => None,
             };
-            let session_init = x3dh::receive(&self.identity, &self.signed_prekey, otpk, &init)?;
-            let mut ratchet =
-                RatchetSession::init_bob(&session_init, &self.signed_prekey.priv_key)?;
+            let session_init = x3dh::receive(&self.identity, spk, otpk, &init)?;
+            let mut ratchet = RatchetSession::init_bob(&session_init, &spk.priv_key)?;
             let encrypted = encrypted_from_envelope(envelope)?;
             let plaintext = ratchet.decrypt(&encrypted)?;
             self.ratchets.insert(sender, ratchet);
@@ -481,5 +546,114 @@ mod tests {
         let mut alice = ClientSession::generate(1);
         let err = alice.send_group(&[0x99; 32], b"hi").unwrap_err();
         assert!(matches!(err, ClientError::NoGroupSession(_)));
+    }
+
+    // ---- Signed-prekey rotation + one-time replenishment --------------------
+
+    /// Rotating the signed prekey bumps the id and changes the pub key; the
+    /// new bundle verifies against the (unchanged) identity.
+    #[test]
+    fn rotate_signed_prekey_bumps_id_and_keeps_signature_valid() {
+        let mut alice = ClientSession::generate(1);
+        let old_id = alice.signed_prekey_id();
+        let old_bundle = alice.registration_bundle();
+        let new_id = alice.rotate_signed_prekey();
+        assert_eq!(new_id, old_id + 1);
+        assert_eq!(alice.signed_prekey_id(), new_id);
+        let new_bundle = alice.registration_bundle();
+        // The signed prekey pub changed.
+        assert_ne!(old_bundle.signed_prekey_pub, new_bundle.signed_prekey_pub);
+        // The new signature still verifies against the identity pub.
+        use um_crypto::{Signature, VerifyingKey};
+        let vk = VerifyingKey::from_bytes(&new_bundle.identity_pub).unwrap();
+        let sig = Signature::from_slice(&new_bundle.signed_prekey_sig).unwrap();
+        use ed25519_dalek::Verifier;
+        assert!(vk.verify(&new_bundle.signed_prekey_pub, &sig).is_ok());
+    }
+
+    /// Replenishing one-time prekeys adds new ids past the current max and
+    /// keeps the old ones (the bundle advertises all of them).
+    #[test]
+    fn replenish_one_time_prekeys_adds_past_max_and_keeps_old() {
+        let mut alice = ClientSession::generate(3);
+        assert_eq!(alice.one_time_prekey_count(), 3);
+        let added = alice.replenish_one_time_prekeys(2);
+        assert_eq!(added, vec![4, 5]);
+        assert_eq!(alice.one_time_prekey_count(), 5);
+        // Old ids still present.
+        let bundle = alice.registration_bundle();
+        let ids: Vec<u32> = bundle.one_time_prekeys.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1) && ids.contains(&4) && ids.contains(&5));
+    }
+
+    /// An X3DH initiation made against a STALE bundle (old signed prekey id)
+    /// still decrypts after rotation, because the retired signed prekey is
+    /// retained and selected by id. This is the core correctness guarantee of
+    /// rotation.
+    #[test]
+    fn stale_bundle_initiation_decrypts_after_rotation() {
+        let mut alice = ClientSession::generate(2);
+        let mut bob = ClientSession::generate(2);
+        // Alice caches bob's CURRENT bundle, then bob rotates his signed
+        // prekey (simulating a re-register alice has not seen yet).
+        let stale_bundle = bob.registration_bundle();
+        bob.rotate_signed_prekey();
+        // Alice initiates against the STALE bundle.
+        let env = alice
+            .start_session(&stale_bundle, b"hi after rotation")
+            .expect("alice start against stale bundle");
+        // Bob decrypts: the init carries the old signed-prekey id, which bob
+        // looks up in previous_signed_prekeys.
+        let (pt, sender) = bob.receive(&env).expect("bob decrypt stale initiation");
+        assert_eq!(pt, b"hi after rotation");
+        assert_eq!(sender, alice.identity_pub());
+    }
+
+    /// A fresh initiation against the CURRENT (post-rotation) bundle also
+    /// decrypts, so rotation does not break new sessions either.
+    #[test]
+    fn fresh_bundle_initiation_decrypts_after_rotation() {
+        let mut alice = ClientSession::generate(2);
+        let mut bob = ClientSession::generate(2);
+        bob.rotate_signed_prekey();
+        let fresh_bundle = bob.registration_bundle();
+        let env = alice
+            .start_session(&fresh_bundle, b"hi fresh")
+            .expect("alice start against fresh bundle");
+        let (pt, _) = bob.receive(&env).expect("bob decrypt fresh initiation");
+        assert_eq!(pt, b"hi fresh");
+    }
+
+    /// An existing ratchet session survives signed-prekey rotation (the root
+    /// key is already established and independent of the signed prekey).
+    #[test]
+    fn existing_ratchet_survives_signed_prekey_rotation() {
+        let mut alice = ClientSession::generate(2);
+        let mut bob = ClientSession::generate(2);
+        let bob_bundle = bob.registration_bundle();
+        // Establish a session.
+        let env1 = alice.start_session(&bob_bundle, b"first").unwrap();
+        let _ = bob.receive(&env1).unwrap();
+        // Bob rotates; alice has not seen it. Alice sends a follow-up on the
+        // existing ratchet (no X3DH) — bob must still decrypt it.
+        bob.rotate_signed_prekey();
+        let env2 = alice.send(&bob.identity_pub(), b"second").unwrap();
+        let (pt, _) = bob.receive(&env2).unwrap();
+        assert_eq!(pt, b"second");
+    }
+
+    /// A session round-trips through postcard after rotation, so the
+    /// `previous_signed_prekeys` map persists to the encrypted store.
+    #[test]
+    fn session_with_rotated_prekey_serializes() {
+        let mut alice = ClientSession::generate(1);
+        alice.rotate_signed_prekey();
+        alice.replenish_one_time_prekeys(2);
+        let bytes = postcard::to_allocvec(&alice).expect("serialize");
+        let back: ClientSession = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(back.signed_prekey_id(), alice.signed_prekey_id());
+        assert_eq!(back.one_time_prekey_count(), alice.one_time_prekey_count());
+        // previous_signed_prekeys survived (serde default made it backward-safe).
+        assert!(back.previous_signed_prekeys.contains_key(&1));
     }
 }
