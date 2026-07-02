@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 
+use crate::CryptoError;
 use crate::aead::{kdf_chain, open, random_nonce, seal};
 use crate::identity::IdentityKey;
-use crate::CryptoError;
 
 pub type MemberId = [u8; 32];
 

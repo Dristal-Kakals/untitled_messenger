@@ -1,10 +1,10 @@
 //! Settings view: identity pub + fingerprint + server addr + key rotation +
 //! logout.
 
-use iced::widget::{button, column, row, text, text_input};
 use iced::Element;
+use iced::widget::{button, column, row, text, text_input};
 
-use super::{hex32, Message, UmApp};
+use super::{Message, UmApp, hex32};
 
 pub fn settings(app: &UmApp) -> Element<'_, Message> {
     let identity = app

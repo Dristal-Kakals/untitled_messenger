@@ -3,6 +3,10 @@ name = "um_gui"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "um_gui"
@@ -24,7 +28,7 @@ dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
-thiserror = "1"
+thiserror = "2"
 sha2 = "0.10"
 postcard = { version = "1", features = ["alloc"] }
 

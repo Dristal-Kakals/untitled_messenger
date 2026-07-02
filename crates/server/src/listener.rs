@@ -140,7 +140,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
 
             // First frame must be Register; it binds the connection.
             let id = match (&msg, self_id) {
-                (ClientMessage::Register { ref bundle }, _) => {
+                (ClientMessage::Register { bundle }, _) => {
                     let id = bundle.identity_pub;
                     self_id = Some(id);
                     id

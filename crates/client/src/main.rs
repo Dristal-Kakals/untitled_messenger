@@ -33,9 +33,9 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use um_client::ClientError;
 use um_client::net::Client;
 use um_client::session::ClientSession;
-use um_client::ClientError;
 use um_protocol::{ClientMessage, EncryptedEnvelope, ServerMessage};
 
 #[tokio::main]

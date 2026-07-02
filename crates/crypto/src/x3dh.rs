@@ -4,9 +4,9 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::aead::{hkdf_extract, X3DH_SALT};
-use crate::identity::{IdentityKey, OneTimePreKey, PreKeyBundle, SignedPreKey};
 use crate::CryptoError;
+use crate::aead::{X3DH_SALT, hkdf_extract};
+use crate::identity::{IdentityKey, OneTimePreKey, PreKeyBundle, SignedPreKey};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct SessionInit {

@@ -12,11 +12,11 @@ use um_crypto::sender_keys::{GroupEncrypted, GroupSession, SenderKeyState};
 use um_crypto::x3dh;
 use um_protocol::{EncryptedEnvelope, MessageKind, PreKeyBundle};
 
+use crate::ClientError;
 use crate::crypto_bridge::{
     encrypted_from_envelope, envelope_from_encrypted, envelope_from_group_encrypted,
     group_encrypted_from_envelope, init_from_envelope,
 };
-use crate::ClientError;
 
 /// A client's cryptographic session state. Owns the identity key, the
 /// signed prekey, the one-time prekeys, a ratchet session per peer (keyed by
@@ -444,7 +444,7 @@ mod tests {
         let env = EncryptedEnvelope {
             id: 1,
             sender: [0x77; 32],
-            kind: um_protocol::MessageKind::Direct,
+            kind: MessageKind::Direct,
             header: vec![1, 2, 3],
             init: None,
             ciphertext: vec![0xAA; 8],

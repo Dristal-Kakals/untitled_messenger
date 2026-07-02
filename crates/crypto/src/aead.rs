@@ -1,6 +1,6 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305,
+    aead::{Aead, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};

@@ -1,9 +1,9 @@
 //! Contact list view: contacts + add-contact form + open/new-group/settings.
 
-use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::Element;
+use iced::widget::{button, column, row, scrollable, text, text_input};
 
-use super::{hex32, short_hex, Message, UmApp};
+use super::{Message, UmApp, hex32, short_hex};
 use crate::ChatId;
 
 pub fn contact_list(app: &UmApp) -> Element<'_, Message> {

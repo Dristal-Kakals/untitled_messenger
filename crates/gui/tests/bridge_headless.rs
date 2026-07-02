@@ -22,11 +22,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
-use um_client::session::ClientSession;
 use um_client::Store;
+use um_client::session::ClientSession;
 use um_gui::config::Config;
 use um_gui::{Bridge, Command, Event};
-use um_server::{listener::serve, Store as ServerStore, Subscribers};
+use um_server::{Store as ServerStore, Subscribers, listener::serve};
 
 /// A unique temp dir per test run: `um-bridge-test-<unix_nanos>-<pid>`.
 fn test_dir() -> std::path::PathBuf {

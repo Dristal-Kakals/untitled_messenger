@@ -8,7 +8,7 @@ pub mod framing;
 pub mod message;
 
 pub use error::ProtocolError;
-pub use framing::{decode, encode, MAX_FRAME_SIZE};
+pub use framing::{MAX_FRAME_SIZE, decode, encode};
 pub use message::{
     ClientMessage, EncryptedEnvelope, MessageKind, PreKeyBundle, ServerError, ServerMessage,
 };

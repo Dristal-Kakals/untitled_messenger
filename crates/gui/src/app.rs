@@ -711,11 +711,12 @@ mod tests {
         let mut app = test_app();
         app.server_input = "not an addr".into();
         let _ = update(&mut app, Message::ChangeServer);
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("invalid server"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("invalid server")
+        );
     }
 
     #[test]
@@ -771,19 +772,21 @@ mod tests {
         let mut app = test_app();
         app.replenish_count = "0".into();
         let _ = update(&mut app, Message::ReplenishOneTimePrekeys);
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("positive number"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("positive number")
+        );
         // Non-numeric is also rejected.
         app.replenish_count = "lots".into();
         let _ = update(&mut app, Message::ReplenishOneTimePrekeys);
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("positive number"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("positive number")
+        );
     }
 
     #[test]

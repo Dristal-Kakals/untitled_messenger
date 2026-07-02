@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use um_server::{listener::serve, Store, Subscribers};
+use um_server::{Store, Subscribers, listener::serve};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

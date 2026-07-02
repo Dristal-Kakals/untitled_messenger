@@ -3,9 +3,13 @@ name = "um_protocol"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 um_crypto = { path = "../crypto" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
-thiserror = "1"
+thiserror = "2"

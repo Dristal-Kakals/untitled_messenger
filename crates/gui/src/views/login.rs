@@ -1,7 +1,7 @@
 //! Login view (existing store file): passphrase + "Unlock" button.
 
-use iced::widget::{button, column, text, text_input};
 use iced::Element;
+use iced::widget::{button, column, text, text_input};
 
 use super::{Message, UmApp};
 

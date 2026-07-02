@@ -1,10 +1,10 @@
 //! 1:1 chat thread view: message list + compose + send + back.
 
+use iced::Element;
 use iced::alignment;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::Element;
 
-use super::{hex32, Message, UmApp};
+use super::{Message, UmApp, hex32};
 use crate::ChatId;
 
 pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {

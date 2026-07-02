@@ -100,9 +100,10 @@ mod tests {
         // The first connection cleans up with its own (now-evicted) tx1.
         subs.unregister_if_match(&[0x11; 32], &tx1_clone);
         // The registry still holds tx2 (the current subscriber).
-        assert!(subs
-            .get(&[0x11; 32])
-            .is_some_and(|s| s.same_channel(&tx2_clone)));
+        assert!(
+            subs.get(&[0x11; 32])
+                .is_some_and(|s| s.same_channel(&tx2_clone))
+        );
     }
 
     #[test]

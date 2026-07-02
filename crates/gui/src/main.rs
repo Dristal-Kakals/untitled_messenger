@@ -23,7 +23,7 @@
 mod app;
 mod views;
 
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{Arc, mpsc as std_mpsc};
 
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
@@ -34,7 +34,7 @@ use um_client::session::ClientSession;
 // are only touched by the view tests, hence `unused_imports` is allowed.
 #[allow(unused_imports)]
 use um_gui::types::{ChatId, Direction, MessageView, Status};
-use um_gui::{Bridge, Config, Event};
+use um_gui::{Bridge, Command, Config, Event};
 
 fn main() -> iced::Result {
     // tracing for the bridge's diagnostic output (decrypt failures, etc.).
@@ -75,9 +75,8 @@ fn main() -> iced::Result {
 /// Returns the bridge's command sender and event receiver. The thread lives for
 /// the lifetime of the process: the `LocalSet` is driven by a pending future so
 /// the `spawn_local` bridge task keeps running in the background.
-fn spawn_bridge(config: Config) -> (mpsc::Sender<um_gui::Command>, mpsc::Receiver<um_gui::Event>) {
-    let (tx, rx) =
-        std_mpsc::channel::<(mpsc::Sender<um_gui::Command>, mpsc::Receiver<um_gui::Event>)>();
+fn spawn_bridge(config: Config) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
+    let (tx, rx) = std_mpsc::channel::<(mpsc::Sender<Command>, mpsc::Receiver<Event>)>();
 
     std::thread::Builder::new()
         .name("um-bridge".into())

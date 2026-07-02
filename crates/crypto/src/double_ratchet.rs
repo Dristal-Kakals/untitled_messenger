@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::CryptoError;
 use crate::aead::{kdf_chain, kdf_root_dh, open, random_nonce, seal};
 use crate::x3dh::SessionInit;
-use crate::CryptoError;
 
 const MAX_SKIPPED: usize = 2000;
 

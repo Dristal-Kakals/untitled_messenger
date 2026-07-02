@@ -1,8 +1,8 @@
 //! Setup view (first run, no store file): passphrase + confirm + server addr
 //! + "Create identity" button.
 
-use iced::widget::{button, column, text, text_input};
 use iced::Element;
+use iced::widget::{button, column, text, text_input};
 
 use super::{Message, UmApp};
 

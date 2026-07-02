@@ -3,6 +3,10 @@ name = "um_client"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 um_protocol = { path = "../protocol" }
@@ -19,7 +23,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["alloc"] }
 rand = "0.8"
 tracing = "0.1"
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "test-util"] }

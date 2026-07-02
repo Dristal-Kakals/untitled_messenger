@@ -7,10 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use um_crypto::identity::{IdentityKey, OneTimePreKey, SignedPreKey};
 use um_protocol::{
-    framing::{decode, encode},
     ClientMessage, EncryptedEnvelope, PreKeyBundle, ServerMessage,
+    framing::{decode, encode},
 };
-use um_server::{listener::serve, Store, Subscribers};
+use um_server::{Store, Subscribers, listener::serve};
 
 /// A minimal framed TCP client for tests.
 struct TestClient {

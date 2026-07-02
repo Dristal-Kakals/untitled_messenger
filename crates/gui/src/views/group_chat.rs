@@ -1,10 +1,10 @@
 //! Group chat thread view: same layout as 1:1, keyed by group id.
 
+use iced::Element;
 use iced::alignment;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::Element;
 
-use super::{hex32, Message, UmApp};
+use super::{Message, UmApp, hex32};
 use crate::ChatId;
 
 pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {

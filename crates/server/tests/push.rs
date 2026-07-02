@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use um_crypto::identity::{IdentityKey, OneTimePreKey, SignedPreKey};
 use um_protocol::framing::{decode, encode};
 use um_protocol::{ClientMessage, EncryptedEnvelope, PreKeyBundle, ServerMessage};
-use um_server::{listener::serve, Store, Subscribers};
+use um_server::{Store, Subscribers, listener::serve};
 
 /// A framed client over a raw TcpStream (test helper).
 struct TestClient {

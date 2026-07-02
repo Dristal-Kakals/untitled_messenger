@@ -9,7 +9,7 @@ use std::sync::Arc;
 use um_client::net::Client;
 use um_client::session::ClientSession;
 use um_protocol::{ClientMessage, ServerMessage};
-use um_server::{listener::serve, Store, Subscribers};
+use um_server::{Store, Subscribers, listener::serve};
 
 /// Register a session's prekey bundle over a fresh TCP connection and wait
 /// for the server's `AckOk`. The relay requires `Register` as the first frame
