@@ -9,15 +9,13 @@ use super::{Message, UmApp, hex32};
 pub fn settings(app: &UmApp) -> Element<'_, Message> {
     let identity = app
         .identity_pub
-        .map(|bytes| hex32(&bytes))
-        .unwrap_or_else(|| "(not unlocked)".to_string());
+        .map_or_else(|| "(not unlocked)".to_string(), |bytes| hex32(&bytes));
     // The identity fingerprint (SHA-256 of the identity pub) — surfaced by
     // `Event::Ready` so the user can read/compare it here without the display
     // layer re-deriving it. Falls back to a placeholder before Ready.
     let fingerprint = app
         .identity_fingerprint
-        .map(|bytes| hex32(&bytes))
-        .unwrap_or_else(|| "(not unlocked)".to_string());
+        .map_or_else(|| "(not unlocked)".to_string(), |bytes| hex32(&bytes));
 
     column![
         text("Settings").size(24),

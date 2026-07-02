@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum CryptoError {
     #[error("invalid signature")]
     InvalidSignature,
@@ -15,19 +15,6 @@ pub enum CryptoError {
     #[error("invalid ratchet state")]
     InvalidState,
 }
-
-impl Clone for CryptoError {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for CryptoError {}
-impl PartialEq for CryptoError {
-    fn eq(&self, other: &Self) -> bool {
-        core::mem::discriminant(self) == core::mem::discriminant(other)
-    }
-}
-impl Eq for CryptoError {}
 
 #[cfg(test)]
 mod tests {

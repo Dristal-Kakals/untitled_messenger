@@ -219,7 +219,7 @@ impl UmApp {
 
     /// Mark a contact's fingerprint as verified in the cached contact list.
     fn mark_verified(&mut self, identity_pub: [u8; 32]) {
-        for c in self.contacts.iter_mut() {
+        for c in &mut self.contacts {
             if c.identity_pub == identity_pub {
                 c.verified = true;
             }
@@ -574,8 +574,8 @@ mod tests {
     /// A minimal app for state-logic tests: no bridge channels needed since the
     /// tests only touch pure helpers + `handle_event`, never `send_cmd`.
     fn test_app() -> UmApp {
-        let (_tx, _rx) = mpsc::channel::<Command>(1);
-        let bridge_cmd = Arc::new(_tx);
+        let (tx, _rx) = mpsc::channel::<Command>(1);
+        let bridge_cmd = Arc::new(tx);
         UmApp::new(bridge_cmd, View::ContactList, Config::default())
     }
 

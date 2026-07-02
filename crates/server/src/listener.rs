@@ -28,9 +28,8 @@ pub async fn serve(
     let local = listener.local_addr()?;
     tokio::spawn(async move {
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(p) => p,
-                Err(_) => continue,
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
             };
             let store = store.clone();
             let subs = subs.clone();
@@ -73,9 +72,8 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                 msg = rx.recv() => {
                     match msg {
                         Some(server_msg) => {
-                            let frame = match encode(&server_msg) {
-                                Ok(f) => f,
-                                Err(_) => break,
+                            let Ok(frame) = encode(&server_msg) else {
+                                break;
                             };
                             if writer.write_all(&frame).await.is_err() {
                                 break;
@@ -86,7 +84,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                         None => break, // sender dropped -> close
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                     // Eviction check: if the registry no longer holds our
                     // channel, a newer Subscribe evicted us. Drop our sender
                     // clone and close.
@@ -168,18 +166,16 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                 // Flush unacked outbox (poll since 0) as Delivered frames.
                 let pending = store.poll(&id, 0);
                 for chunk in pending.chunks(64) {
-                    let frame = match encode(&ServerMessage::Delivered(chunk.to_vec())) {
-                        Ok(f) => f,
-                        Err(_) => return,
+                    let Ok(frame) = encode(&ServerMessage::Delivered(chunk.to_vec())) else {
+                        return;
                     };
                     if writer.write_all(&frame).await.is_err() {
                         return;
                     }
                 }
                 // Reply AckOk (mode accepted).
-                let ack = match encode(&ServerMessage::AckOk) {
-                    Ok(f) => f,
-                    Err(_) => return,
+                let Ok(ack) = encode(&ServerMessage::AckOk) else {
+                    return;
                 };
                 if writer.write_all(&ack).await.is_err() {
                     return;

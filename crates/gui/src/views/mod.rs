@@ -12,6 +12,8 @@ pub mod login;
 pub mod settings;
 pub mod setup;
 
+use std::fmt::Write as _;
+
 // Re-export the app types so each view submodule can write
 // `use super::{Message, UmApp}` without importing from `crate::app` directly.
 pub use crate::app::{Message, UmApp, View};
@@ -59,7 +61,7 @@ pub fn route_after_event(ev: &crate::Event, _current: &View) -> Option<View> {
 pub fn short_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(11);
     for b in &bytes[..4] {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s.push('…');
     s

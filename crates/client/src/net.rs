@@ -155,7 +155,7 @@ mod tests {
         let reply = client.recv_msg().await.expect("recv");
         match reply {
             Some(ServerMessage::Bundle(Some(b))) => {
-                assert_eq!(b.identity_pub, id.verifying.to_bytes())
+                assert_eq!(b.identity_pub, id.verifying.to_bytes());
             }
             other => panic!("expected Bundle(Some), got {other:?}"),
         }

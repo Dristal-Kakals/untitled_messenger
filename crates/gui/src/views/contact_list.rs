@@ -20,8 +20,10 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
             .get(&ChatId::Peer(c.identity_pub))
             .copied()
             .filter(|n| *n > 0)
-            .map(|n| text(format!("({n})")).color([0.2, 0.5, 0.9]))
-            .unwrap_or_else(|| text(""));
+            .map_or_else(
+                || text(""),
+                |n| text(format!("({n})")).color([0.2, 0.5, 0.9]),
+            );
         let mut line = row![
             text(c.nickname.clone()),
             text(short_hex(&c.identity_pub)),
@@ -56,8 +58,10 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
             .get(&ChatId::Group(g.id))
             .copied()
             .filter(|n| *n > 0)
-            .map(|n| text(format!("({n})")).color([0.2, 0.5, 0.9]))
-            .unwrap_or_else(|| text(""));
+            .map_or_else(
+                || text(""),
+                |n| text(format!("({n})")).color([0.2, 0.5, 0.9]),
+            );
         groups = groups.push(
             row![
                 text(g.name.clone()),

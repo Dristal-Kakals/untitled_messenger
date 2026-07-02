@@ -32,8 +32,7 @@ use um_server::{Store as ServerStore, Subscribers, listener::serve};
 fn test_dir() -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let pid = std::process::id();
     std::env::temp_dir().join(format!("um-bridge-test-{nanos}-{pid}"))
 }
@@ -76,7 +75,7 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = &mut deadline => panic!("timed out waiting for an accepted event"),
+            () = &mut deadline => panic!("timed out waiting for an accepted event"),
             ev = rx.recv() => match ev {
                 Some(ev) if accept(&ev) => return ev,
                 Some(Event::Error(e)) => panic!("bridge emitted error: {e}"),
@@ -448,7 +447,7 @@ async fn bridge_reconnect_recovers_offline_mail() {
             let store = Store::open(&path, "test-pass").expect("reopen bob store");
             let session: ClientSession = store.get("session").expect("load session").unwrap();
             let config = Config {
-                server_addr: server_addr.to_string(),
+                server_addr: server_addr.clone(),
                 ..Default::default()
             };
             let bob_bridge2 = Bridge::new(session, Some(store), config);
@@ -472,7 +471,7 @@ async fn bridge_reconnect_recovers_offline_mail() {
                 }
                 tokio::select! {
                     biased;
-                    _ = &mut deadline => break,
+                    () = &mut deadline => break,
                     ev = bob_ev2.recv() => match ev {
                         Some(Event::Decrypted { chat, msg }) => {
                             if chat == um_gui::types::ChatId::Peer(alice_pub) {
@@ -832,7 +831,7 @@ async fn bridge_group_roster_survives_restart() {
             );
 
             let config = Config {
-                server_addr: server_addr.to_string(),
+                server_addr: server_addr.clone(),
                 ..Default::default()
             };
             let alice_bridge2 = Bridge::new(session, Some(store), config);

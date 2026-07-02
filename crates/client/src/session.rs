@@ -159,7 +159,7 @@ impl ClientSession {
         // Reconstruct a crypto bundle from the protocol bundle (opaque bytes
         // -> typed). The signed-prekey signature is verified inside
         // `x3dh::initiate` via `bundle.verify()`.
-        let crypto_bundle = self.reconstruct_peer_bundle(peer_bundle)?;
+        let crypto_bundle = Self::reconstruct_peer_bundle(peer_bundle)?;
         let one_time_id = peer_bundle.one_time_prekeys.first().map(|(id, _)| *id);
 
         let (session_init, init_msg) = x3dh::initiate(&self.identity, &crypto_bundle, one_time_id)?;
@@ -348,18 +348,18 @@ impl ClientSession {
     }
 
     /// Reconstruct a typed crypto `PreKeyBundle` from a protocol bundle.
-    fn reconstruct_peer_bundle(&self, bundle: &PreKeyBundle) -> Result<CryptoBundle, ClientError> {
+    fn reconstruct_peer_bundle(bundle: &PreKeyBundle) -> Result<CryptoBundle, ClientError> {
         use um_crypto::{Signature, VerifyingKey};
         let identity_pub = VerifyingKey::from_bytes(&bundle.identity_pub)
             .map_err(|_| ClientError::Store("bad peer identity pub".into()))?;
-        let signed_prekey_pub = x25519_pub(&bundle.signed_prekey_pub)?;
+        let signed_prekey_pub = x25519_pub(&bundle.signed_prekey_pub);
         let signed_prekey_sig = Signature::from_slice(&bundle.signed_prekey_sig)
             .map_err(|_| ClientError::Store("bad peer signature".into()))?;
         let one_time_prekeys = bundle
             .one_time_prekeys
             .iter()
-            .map(|(id, pub_bytes)| Ok((*id, x25519_pub(pub_bytes)?)))
-            .collect::<Result<Vec<_>, ClientError>>()?;
+            .map(|(id, pub_bytes)| (*id, x25519_pub(pub_bytes)))
+            .collect::<Vec<_>>();
         Ok(CryptoBundle {
             identity_pub,
             signed_prekey_id: bundle.signed_prekey_id,
@@ -371,15 +371,16 @@ impl ClientSession {
 }
 
 /// Decode 32 bytes into an X25519 `PublicKey`.
-fn x25519_pub(bytes: &[u8; 32]) -> Result<x25519_dalek::PublicKey, ClientError> {
-    Ok(x25519_dalek::PublicKey::from(*bytes))
+fn x25519_pub(bytes: &[u8; 32]) -> x25519_dalek::PublicKey {
+    x25519_dalek::PublicKey::from(*bytes)
 }
 
 /// Render a 32-byte id as a short hex string for error messages.
 fn hex_id(id: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
     let mut s = String::with_capacity(8);
     for b in &id[..4] {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

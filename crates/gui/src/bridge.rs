@@ -208,7 +208,7 @@ impl Bridge {
                 one_time_count,
             } => {
                 self.handle_setup(passphrase, one_time_count, event_tx)
-                    .await
+                    .await;
             }
             Command::Unlock { passphrase } => self.handle_unlock(passphrase, event_tx).await,
             Command::Connect { addr } => self.handle_connect(addr, event_tx).await,
@@ -217,10 +217,10 @@ impl Bridge {
                 nickname,
             } => {
                 self.handle_add_contact(identity_pub, nickname, event_tx)
-                    .await
+                    .await;
             }
             Command::VerifyFingerprint { identity_pub } => {
-                self.handle_verify_fingerprint(identity_pub, event_tx).await
+                self.handle_verify_fingerprint(identity_pub, event_tx).await;
             }
             Command::StartSession {
                 peer,
@@ -228,7 +228,7 @@ impl Bridge {
                 local_id,
             } => {
                 self.handle_start_session(peer, first_message, local_id, event_tx)
-                    .await
+                    .await;
             }
             Command::SendMessage {
                 peer,
@@ -236,11 +236,11 @@ impl Bridge {
                 local_id,
             } => {
                 self.handle_send_message(peer, text, local_id, event_tx)
-                    .await
+                    .await;
             }
             Command::LoadThread { peer } => self.handle_load_thread(peer, event_tx).await,
             Command::CreateGroup { name, members } => {
-                self.handle_create_group(name, members, event_tx).await
+                self.handle_create_group(name, members, event_tx).await;
             }
             Command::SendGroupMessage {
                 group,
@@ -248,14 +248,14 @@ impl Bridge {
                 local_id,
             } => {
                 self.handle_send_group(group, text, local_id, event_tx)
-                    .await
+                    .await;
             }
             Command::LoadGroupThread { group } => {
-                self.handle_load_group_thread(group, event_tx).await
+                self.handle_load_group_thread(group, event_tx).await;
             }
             Command::RotateSignedPrekey => self.handle_rotate_signed_prekey(event_tx).await,
             Command::ReplenishOneTimePrekeys { count } => {
-                self.handle_replenish_one_time(count, event_tx).await
+                self.handle_replenish_one_time(count, event_tx).await;
             }
             Command::ChangeServer { addr } => self.handle_change_server(addr, event_tx).await,
             Command::Logout => self.handle_logout(event_tx).await,
@@ -275,14 +275,11 @@ impl Bridge {
         // time by the caller; here we only persist.)
         let _ = one_time_count;
         let pub_hex = hex::encode(self.session.identity_pub());
-        let path = match crate::config::store_path(&pub_hex) {
-            Some(p) => p,
-            None => {
-                let _ = event_tx
-                    .send(Event::Error("no data directory (XDG unavailable)".into()))
-                    .await;
-                return;
-            }
+        let Some(path) = crate::config::store_path(&pub_hex) else {
+            let _ = event_tx
+                .send(Event::Error("no data directory (XDG unavailable)".into()))
+                .await;
+            return;
         };
         let store = match Store::create(&path, &passphrase) {
             Ok(s) => s,
@@ -317,14 +314,11 @@ impl Bridge {
                 .await;
             return;
         }
-        let path = match crate::config::store_path(&pub_hex) {
-            Some(p) => p,
-            None => {
-                let _ = event_tx
-                    .send(Event::Error("no data directory (XDG unavailable)".into()))
-                    .await;
-                return;
-            }
+        let Some(path) = crate::config::store_path(&pub_hex) else {
+            let _ = event_tx
+                .send(Event::Error("no data directory (XDG unavailable)".into()))
+                .await;
+            return;
         };
         let store = match Store::open(&path, &passphrase) {
             Ok(s) => s,
@@ -1103,11 +1097,7 @@ impl Bridge {
         // Roster size the bridge knows so far: the peers we have exchanged
         // distributions with (the roster map) plus ourselves. At minimum this
         // is the inviter + us = 2.
-        let roster_len = self
-            .group_rosters
-            .get(&group)
-            .map(|r| r.len() as u32)
-            .unwrap_or(0);
+        let roster_len = self.group_rosters.get(&group).map_or(0, |r| r.len() as u32);
         let member_count = roster_len.saturating_add(1);
         let _ = event_tx
             .send(Event::GroupInvited {
@@ -1180,9 +1170,8 @@ impl Bridge {
             return Vec::new();
         };
         let key = chat.key();
-        let rows = match store.messages(&key) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
+        let Ok(rows) = store.messages(&key) else {
+            return Vec::new();
         };
         rows.into_iter()
             .map(|r| MessageView {
@@ -1355,8 +1344,7 @@ fn group_id(name: &str, members: &[[u8; 32]], founder: &[u8; 32]) -> [u8; 32] {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

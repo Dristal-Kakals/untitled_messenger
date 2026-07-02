@@ -267,15 +267,17 @@ async fn last_subscribe_wins_evicts_old() {
     // polls for eviction every 100ms, so allow generous headroom under load.
     let mut buf = [0u8; 64];
     let res = tokio::time::timeout(
-        std::time::Duration::from_millis(3000),
+        std::time::Duration::from_secs(3),
         bob1.stream.read(&mut buf),
     )
     .await;
     match res {
         Ok(Ok(0)) => {} // EOF — expected
         Ok(Ok(_)) => panic!("conn1 should have been closed, got data"),
-        Ok(Err(_)) => {} // connection error — also acceptable
-        Err(_) => panic!("conn1 read did not resolve (no eviction)"),
+        Ok(Err(e)) => {
+            let _ = e;
+        } // connection error — also acceptable
+        Err(e) => panic!("conn1 read did not resolve (no eviction): {e}"),
     }
 
     // conn2 still works: alice sends, conn2 gets the push.

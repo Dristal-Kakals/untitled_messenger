@@ -101,10 +101,7 @@ impl RatchetSession {
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Encrypted, CryptoError> {
-        let cks = match self.cks {
-            Some(c) => c,
-            None => return Err(CryptoError::InvalidState),
-        };
+        let cks = self.cks.ok_or(CryptoError::InvalidState)?;
         let (new_cks, msg_key) = kdf_chain(&cks);
         self.cks = Some(new_cks);
 
@@ -189,10 +186,7 @@ impl RatchetSession {
         }
 
         // 4. Decrypt current message.
-        let ckr = match self.ckr {
-            Some(c) => c,
-            None => return Err(CryptoError::InvalidState),
-        };
+        let ckr = self.ckr.ok_or(CryptoError::InvalidState)?;
         let (new_ckr, msg_key) = kdf_chain(&ckr);
         self.ckr = Some(new_ckr);
         self.nr += 1;

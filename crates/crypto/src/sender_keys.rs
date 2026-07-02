@@ -114,11 +114,10 @@ impl GroupSession {
     }
 
     pub fn decrypt(&mut self, message: &GroupEncrypted) -> Result<Vec<u8>, CryptoError> {
-        let (chain_key, peer_gen, signing_pub) =
-            match self.peer_states.get_mut(&message.header.sender_id) {
-                Some(v) => v,
-                None => return Err(CryptoError::MissingPreKey),
-            };
+        let (chain_key, peer_gen, signing_pub) = self
+            .peer_states
+            .get_mut(&message.header.sender_id)
+            .ok_or(CryptoError::MissingPreKey)?;
 
         let aad = group_header_aad(&message.header);
         let mut signed = aad.clone();

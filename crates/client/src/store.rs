@@ -217,7 +217,7 @@ impl Store {
         self.conn
             .execute(
                 "UPDATE contacts SET verified = ?2 WHERE identity_pub = ?1",
-                rusqlite::params![identity_pub.as_slice(), verified as i64],
+                rusqlite::params![identity_pub.as_slice(), i64::from(verified)],
             )
             .map_err(|e| ClientError::Store(format!("set_verified: {e}")))?;
         Ok(())
@@ -317,9 +317,8 @@ impl Store {
             aad.extend_from_slice(peer);
             aad.push(direction as u8);
             aad.extend_from_slice(&timestamp.to_be_bytes());
-            let bytes = match open(&self.key, &aad, &sealed) {
-                Ok(b) => b,
-                Err(_) => continue, // corrupt/tampered row: skip, keep loading
+            let Ok(bytes) = open(&self.key, &aad, &sealed) else {
+                continue; // corrupt/tampered row: skip, keep loading
             };
             let msg: StoredMessage = postcard::from_bytes(&bytes)?;
             out.push(StoredMessageRow {
@@ -768,9 +767,10 @@ mod tests {
 
     /// Minimal hex encoder for test temp-file names (avoids an extra dep).
     fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
         let mut s = String::with_capacity(bytes.len() * 2);
         for b in bytes {
-            s.push_str(&format!("{b:02x}"));
+            let _ = write!(s, "{b:02x}");
         }
         s
     }
