@@ -2,13 +2,23 @@
 //! with a `ServerMessage`. Stateless except for the shared `Store`; one
 //! `handle` call per inbound frame.
 
+use um_crypto::kem::EK_768_LEN;
 use um_crypto::{Signature, VerifyingKey};
 use um_protocol::{ClientMessage, ServerMessage};
 
 use crate::{Store, Subscribers};
 
 /// Verify a registered prekey bundle's signed-prekey signature against its
-/// identity pub. Returns `true` if the signature is valid.
+/// identity pub, and — when a post-quantum encapsulation key is present — its
+/// PQ-ek signature too. Returns `true` only if every present signature is
+/// valid and the PQ fields are not in a half-present state.
+///
+/// This mirrors `um_crypto::identity::PreKeyBundle::verify` so the relay
+/// rejects malformed/tampered bundles at `Register` time (defense-in-depth)
+/// rather than storing them for a fetcher to fail on later with a confusing
+/// `MalformedBundle` during X3DH initiation. The relay is not a crypto
+/// authority, but it is the natural choke point to keep garbage out of the
+/// registry.
 pub fn verify_bundle_signature(bundle: &um_protocol::PreKeyBundle) -> bool {
     // The signed prekey pub is an X25519 pub (32 bytes). The signature is an
     // Ed25519 signature over those 32 bytes by the identity key. Reconstruct
@@ -16,11 +26,35 @@ pub fn verify_bundle_signature(bundle: &um_protocol::PreKeyBundle) -> bool {
     let Ok(vk) = VerifyingKey::from_bytes(&bundle.identity_pub) else {
         return false;
     };
-    let Ok(sig) = Signature::from_slice(&bundle.signed_prekey_sig) else {
+    let Ok(spk_sig) = Signature::from_slice(&bundle.signed_prekey_sig) else {
         return false;
     };
     use ed25519_dalek::Verifier;
-    vk.verify(&bundle.signed_prekey_pub, &sig).is_ok()
+    if vk.verify(&bundle.signed_prekey_pub, &spk_sig).is_err() {
+        return false;
+    }
+
+    // Post-quantum encapsulation key + its identity signature. Both present
+    // → verify the signature over the ek bytes (and reject a wrong-length ek,
+    // which can never be a real ML-KEM-768 key). Half-present (key without
+    // sig or vice versa) → malformed, reject. Both absent → classical-only
+    // bundle, accept.
+    match (
+        bundle.pq_encapsulation_key.as_ref(),
+        bundle.pq_encapsulation_key_sig.as_ref(),
+    ) {
+        (Some(ek), Some(pq_sig)) => {
+            if ek.len() != EK_768_LEN {
+                return false;
+            }
+            let Ok(sig) = Signature::from_slice(pq_sig) else {
+                return false;
+            };
+            vk.verify(ek, &sig).is_ok()
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
+    }
 }
 
 /// Process one client message against the shared store and subscriber
@@ -109,11 +143,12 @@ mod tests {
     use super::*;
     use crate::Subscribers;
     use um_crypto::identity::{IdentityKey, OneTimePreKey, SignedPreKey};
+    use um_crypto::kem::PqEncapsulationKey;
     use um_protocol::{EncryptedEnvelope, PreKeyBundle, ServerError};
 
     /// Build a real, correctly-signed protocol PreKeyBundle from a fresh
-    /// identity. `valid_sig` = false corrupts the signature so verification
-    /// must fail.
+    /// identity. `valid_sig` = false corrupts the signed-prekey signature so
+    /// verification must fail.
     fn real_bundle(valid_sig: bool) -> ([u8; 32], PreKeyBundle) {
         let id = IdentityKey::generate();
         let spk = SignedPreKey::generate(1, &id);
@@ -135,6 +170,50 @@ mod tests {
         if !valid_sig {
             // Flip one byte of the signature.
             bundle.signed_prekey_sig[0] ^= 0xFF;
+        }
+        (id.verifying.to_bytes(), bundle)
+    }
+
+    /// Like [`real_bundle`](Self::real_bundle) but attaches a real ML-KEM-768
+    /// encapsulation key signed by the identity (hybrid PQXDH bundle).
+    /// `valid_pq_sig` = false corrupts the PQ-ek signature; `half_present` =
+    /// `Some("key")`/`Some("sig")` drops one PQ field to test the half-present
+    /// rejection.
+    fn real_pq_bundle(valid_pq_sig: bool, half_present: Option<&str>) -> ([u8; 32], PreKeyBundle) {
+        let id = IdentityKey::generate();
+        let spk = SignedPreKey::generate(1, &id);
+        let otpk = OneTimePreKey::generate(10);
+        let (_pq_dk, pq_ek) = PqEncapsulationKey::generate_keypair();
+        let crypto_bundle =
+            um_crypto::identity::PreKeyBundle::from_identity_with_pq(&id, &spk, &[&otpk], &pq_ek);
+        let mut bundle = PreKeyBundle {
+            identity_pub: id.verifying.to_bytes(),
+            signed_prekey_id: crypto_bundle.signed_prekey_id,
+            signed_prekey_pub: crypto_bundle.signed_prekey_pub.to_bytes(),
+            signed_prekey_sig: crypto_bundle.signed_prekey_sig.to_bytes().to_vec(),
+            one_time_prekeys: crypto_bundle
+                .one_time_prekeys
+                .iter()
+                .map(|(k, v)| (*k, v.to_bytes()))
+                .collect(),
+            pq_encapsulation_key: Some(pq_ek.0.clone()),
+            pq_encapsulation_key_sig: Some(
+                crypto_bundle
+                    .pq_encapsulation_key_sig
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            ),
+        };
+        if !valid_pq_sig {
+            // Corrupt the PQ-ek signature, not the signed-prekey signature,
+            // so the test isolates the PQ check (the SPK check still passes).
+            bundle.pq_encapsulation_key_sig.as_mut().unwrap()[0] ^= 0xFF;
+        }
+        match half_present {
+            Some("key") => bundle.pq_encapsulation_key_sig = None,
+            Some("sig") => bundle.pq_encapsulation_key = None,
+            _ => {}
         }
         (id.verifying.to_bytes(), bundle)
     }
@@ -164,6 +243,73 @@ mod tests {
     fn verify_rejects_corrupt_signature() {
         let (_, bundle) = real_bundle(false);
         assert!(!verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn verify_accepts_valid_pq_bundle() {
+        let (_, bundle) = real_pq_bundle(true, None);
+        assert!(verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn verify_rejects_corrupt_pq_signature() {
+        // SPK signature is valid; only the PQ-ek signature is corrupted. The
+        // PQ check must fail the whole bundle.
+        let (_, bundle) = real_pq_bundle(false, None);
+        assert!(!verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn verify_rejects_pq_key_without_sig() {
+        let (_, bundle) = real_pq_bundle(true, Some("key"));
+        assert!(!verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn verify_rejects_pq_sig_without_key() {
+        let (_, bundle) = real_pq_bundle(true, Some("sig"));
+        assert!(!verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_length_pq_ek() {
+        let (_, mut bundle) = real_pq_bundle(true, None);
+        // A real ML-KEM-768 ek is 1184 bytes; shrink to break the length check
+        // while keeping the (now mismatched) signature intact.
+        bundle.pq_encapsulation_key = Some(vec![0u8; 32]);
+        assert!(!verify_bundle_signature(&bundle));
+    }
+
+    #[test]
+    fn register_with_valid_pq_bundle_stores_bundle() {
+        let store = Store::new();
+        let (id, bundle) = real_pq_bundle(true, None);
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &id,
+            ClientMessage::Register { bundle },
+        );
+        assert_eq!(reply, ServerMessage::AckOk);
+        assert!(store.is_registered(&id));
+        // The PQ ek survives the round-trip through the store.
+        let stored = store.fetch_bundle(&id).unwrap();
+        assert!(stored.pq_encapsulation_key.is_some());
+        assert!(stored.pq_encapsulation_key_sig.is_some());
+    }
+
+    #[test]
+    fn register_with_corrupt_pq_sig_rejected_and_not_stored() {
+        let store = Store::new();
+        let (id, bundle) = real_pq_bundle(false, None);
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &id,
+            ClientMessage::Register { bundle },
+        );
+        assert_eq!(reply, ServerMessage::Error(ServerError::InvalidSignature));
+        assert!(!store.is_registered(&id));
     }
 
     #[test]
