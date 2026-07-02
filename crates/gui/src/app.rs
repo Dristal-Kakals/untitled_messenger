@@ -68,6 +68,11 @@ pub struct UmApp {
     pub add_contact_nick: String,
     pub compose_input: String,
     pub new_group_name: String,
+    /// Sidebar search/filter query. Empty = show all contacts + groups; any
+    /// non-empty substring (case-insensitive) filters both lists by nickname /
+    /// group name / lowercase hex of the identity pub or group id. Drives the
+    /// search box at the top of [`views::sidebar`].
+    pub search_query: String,
     /// Settings: how many one-time prekeys to replenish (spec: count input).
     pub replenish_count: String,
     /// A single banner error string.
@@ -94,6 +99,8 @@ pub enum Message {
     AddContactNickChanged(String),
     ComposeChanged(String),
     NewGroupNameChanged(String),
+    /// Sidebar search/filter box input.
+    SearchChanged(String),
     /// Settings: edit the one-time-prekey replenish count.
     ReplenishCountChanged(String),
     // Setup / Login.
@@ -152,6 +159,7 @@ impl UmApp {
             add_contact_nick: String::new(),
             compose_input: String::new(),
             new_group_name: String::new(),
+            search_query: String::new(),
             replenish_count: "10".to_string(),
             error: None,
             connected: false,
@@ -240,6 +248,7 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::AddContactNickChanged(s) => app.add_contact_nick = s,
         Message::ComposeChanged(s) => app.compose_input = s,
         Message::NewGroupNameChanged(s) => app.new_group_name = s,
+        Message::SearchChanged(s) => app.search_query = s,
         Message::ReplenishCountChanged(s) => app.replenish_count = s,
 
         Message::SetupSubmit => {
@@ -398,6 +407,7 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             app.threads.clear();
             app.groups.clear();
             app.unread.clear();
+            app.search_query.clear();
             app.view = View::Login;
             app.passphrase_input.clear();
             app.connected = false;
@@ -858,12 +868,24 @@ mod tests {
             members: 2,
         });
         app.unread.insert(ChatId::Peer([0x11; 32]), 2);
+        app.search_query = "bob".into();
         let _ = update(&mut app, Message::Logout);
         assert!(app.groups.is_empty());
         assert!(app.unread.is_empty());
+        assert!(
+            app.search_query.is_empty(),
+            "search query cleared on logout"
+        );
         assert_eq!(app.view, View::Login);
         assert!(app.identity_pub.is_none());
         assert!(app.identity_fingerprint.is_none());
+    }
+
+    #[test]
+    fn search_changed_updates_query() {
+        let mut app = test_app();
+        let _ = update(&mut app, Message::SearchChanged("alice".into()));
+        assert_eq!(app.search_query, "alice");
     }
 
     #[test]

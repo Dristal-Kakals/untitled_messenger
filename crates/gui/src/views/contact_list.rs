@@ -12,7 +12,7 @@ use iced::alignment;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, hex32, short_hex};
+use super::{Message, UmApp, hex32, matches_query, short_hex};
 use crate::ChatId;
 use crate::theme;
 
@@ -62,6 +62,7 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
 
     // ---- Contacts list (scrollable).
     let mut list = column![text("Contacts").size(20),].spacing(4);
+    let mut shown_contacts = 0u32;
     if app.contacts.is_empty() {
         list = list.push(
             text("No contacts yet — add one by pasting their identity pub below.")
@@ -70,6 +71,14 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
         );
     }
     for c in &app.contacts {
+        let id_hex = hex32(&c.identity_pub);
+        if !matches_query(
+            &app.search_query,
+            &[&c.nickname, &id_hex, &short_hex(&c.identity_pub)],
+        ) {
+            continue;
+        }
+        shown_contacts += 1;
         let chat = ChatId::Peer(c.identity_pub);
         let is_open = app.open_chat == Some(chat);
         let badge = app
@@ -105,6 +114,13 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
         };
         list = list.push(entry);
     }
+    if !app.contacts.is_empty() && shown_contacts == 0 {
+        list = list.push(
+            text("No contacts match your search.")
+                .color(theme::MUTED)
+                .size(13),
+        );
+    }
 
     // ---- Add-contact form.
     let add_form = column![
@@ -123,10 +139,16 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
 
     // ---- Groups section.
     let mut groups = column![section("Groups"),].spacing(4);
+    let mut shown_groups = 0u32;
     if app.groups.is_empty() {
         groups = groups.push(text("(no groups yet)").color(theme::MUTED).size(13));
     }
     for g in &app.groups {
+        let id_hex = hex32(&g.id);
+        if !matches_query(&app.search_query, &[&g.name, &id_hex, &short_hex(&g.id)]) {
+            continue;
+        }
+        shown_groups += 1;
         let chat = ChatId::Group(g.id);
         let is_open = app.open_chat == Some(chat);
         let badge = app
@@ -155,6 +177,13 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
         };
         groups = groups.push(row);
     }
+    if !app.groups.is_empty() && shown_groups == 0 {
+        groups = groups.push(
+            text("No groups match your search.")
+                .color(theme::MUTED)
+                .size(13),
+        );
+    }
 
     // ---- New-group form.
     let new_group_form = column![
@@ -172,9 +201,16 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
     ]
     .spacing(6);
 
+    // ---- Search / filter box. Filters both contacts and groups by nickname /
+    // group name / lowercase hex id. Empty query shows everything.
+    let search = text_input("search contacts & groups…", &app.search_query)
+        .on_input(Message::SearchChanged)
+        .padding(6);
+
     // ---- Assemble. The contacts list grows to fill; the forms sit below it.
     let body = column![
         header,
+        search,
         scrollable(list).height(Fill).spacing(4),
         add_form,
         new_group_form,

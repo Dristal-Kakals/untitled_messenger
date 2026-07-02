@@ -72,6 +72,21 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
     hex::encode(bytes)
 }
 
+/// Case-insensitive substring filter for the sidebar search box. A query
+/// matches a contact or group when (a) the query is empty/whitespace (show
+/// all), or (b) the trimmed, lowercased query is a substring of any of the
+/// provided haystack strings — typically the nickname / group name and the
+/// lowercase hex of the identity pub or group id. Pure, testable.
+///
+/// Whitespace in the query is ignored so a stray space never hides everything.
+pub fn matches_query(query: &str, haystacks: &[&str]) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    haystacks.iter().any(|h| h.to_lowercase().contains(&q))
+}
+
 /// Format a unix-seconds timestamp as `HH:MM` (UTC). Returns `""` for `0`
 /// (the optimistic-send placeholder timestamp, which is not a real time).
 /// Pure, testable.
@@ -195,5 +210,37 @@ mod tests {
         // Re-render — deterministic.
         assert_eq!(a, format_time(1_782_961_800));
         assert!(a.starts_with("2026-07-02"));
+    }
+
+    #[test]
+    fn matches_query_empty_shows_all() {
+        assert!(matches_query("", &["bob"]));
+        assert!(matches_query("   ", &["bob"]));
+    }
+
+    #[test]
+    fn matches_query_substring_case_insensitive() {
+        assert!(matches_query("BO", &["bob", "deadbeef…"]));
+        assert!(matches_query("bob", &["Bob", "deadbeef…"]));
+        assert!(matches_query("dead", &["Bob", "deadbeef…"]));
+    }
+
+    #[test]
+    fn matches_query_no_match() {
+        assert!(!matches_query("zzz", &["bob", "deadbeef…"]));
+    }
+
+    #[test]
+    fn matches_query_matches_hex_id() {
+        // A contact's lowercase hex pub is a haystack, so pasting part of it
+        // filters down to that contact.
+        let id_hex = hex32(&[0xAB; 32]);
+        assert!(matches_query("ababab", &[&id_hex]));
+        assert!(!matches_query("cdcdcd", &[&id_hex]));
+    }
+
+    #[test]
+    fn matches_query_ignores_surrounding_whitespace() {
+        assert!(matches_query("  bob  ", &["bob"]));
     }
 }
