@@ -172,9 +172,7 @@ mod tests {
             &store,
             &Subscribers::new(),
             &id,
-            ClientMessage::Register {
-                bundle: bundle.clone(),
-            },
+            ClientMessage::Register { bundle },
         );
         assert_eq!(reply, ServerMessage::AckOk);
         assert!(store.is_registered(&id));

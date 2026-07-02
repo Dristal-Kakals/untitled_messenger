@@ -13,7 +13,7 @@ pub type MemberId = [u8; 32];
 pub struct SenderChainKey(pub [u8; 32]);
 
 impl SenderChainKey {
-    pub fn new(seed: [u8; 32]) -> Self {
+    pub const fn new(seed: [u8; 32]) -> Self {
         Self(seed)
     }
     pub fn ratchet(&mut self) -> [u8; 32] {
@@ -102,7 +102,7 @@ impl GroupSession {
         };
         let aad = group_header_aad(&header);
         let ciphertext = seal(&msg_key, &nonce, &aad, plaintext);
-        let mut signed = aad.clone();
+        let mut signed = aad;
         signed.extend_from_slice(&ciphertext);
         let signature = self.self_state.signing_priv.sign(&signed);
 

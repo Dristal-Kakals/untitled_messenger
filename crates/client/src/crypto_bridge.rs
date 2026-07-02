@@ -12,6 +12,7 @@ use um_protocol::{EncryptedEnvelope, MessageKind};
 use crate::ClientError;
 
 /// Build a wire `EncryptedEnvelope` from a 1:1 ratchet `Encrypted` payload.
+///
 /// `sender` is the sender's identity pub. `init` is the X3DH init message,
 /// present only on the first message of a 1:1 session. The `kind` is set to
 /// `Direct` and `signature` is empty (1:1 auth is via the ratchet AEAD + DH).
@@ -38,6 +39,7 @@ pub fn envelope_from_encrypted(
 }
 
 /// Build a wire `EncryptedEnvelope` from a group `GroupEncrypted` payload.
+///
 /// `sender` is the sender's identity pub (the group-oblivious outer sender).
 /// The group header, ciphertext, and the sender's group signing signature are
 /// carried opaquely; `kind` is `Group` and `init` is `None`.

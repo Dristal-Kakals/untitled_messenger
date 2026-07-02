@@ -214,7 +214,7 @@ mod tests {
 
         let alice_r = RatchetSession::init_alice(&init).unwrap();
         let bob_r = RatchetSession::init_bob(&bob_session_init, &spk.priv_key).unwrap();
-        (alice_r, bob_r, spk.priv_key.clone())
+        (alice_r, bob_r, spk.priv_key)
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! In-memory server state: prekey registry, per-recipient outbox, presence.
+//!
 //! Lost on restart (per the locked design decision). All access goes through
 //! `Store`, which is `Send + Sync` via an internal mutex.
 

@@ -50,7 +50,7 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 /// `handle_event` is the real authority; this mirrors its routing for the
 /// cases where the view changes, so the logic is unit-testable.
 #[allow(dead_code)]
-pub fn route_after_event(ev: &crate::Event, _current: &View) -> Option<View> {
+pub const fn route_after_event(ev: &crate::Event, _current: &View) -> Option<View> {
     match ev {
         crate::Event::Ready { .. } => Some(View::ContactList),
         crate::Event::GroupCreated { group, .. } => Some(View::GroupChat(*group)),

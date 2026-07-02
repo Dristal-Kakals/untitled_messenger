@@ -72,7 +72,7 @@ impl StoreKey {
         Ok(Self { key, salt: *salt })
     }
 
-    pub fn salt(&self) -> [u8; 16] {
+    pub const fn salt(&self) -> [u8; 16] {
         self.salt
     }
 }
@@ -690,7 +690,7 @@ mod tests {
         let key = [0xAB; 32];
         let sealed = seal(&key, b"aad", b"plaintext").unwrap();
         // Flip a ciphertext byte.
-        let mut tampered = sealed.clone();
+        let mut tampered = sealed;
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
         assert!(open(&key, b"aad", &tampered).is_err());

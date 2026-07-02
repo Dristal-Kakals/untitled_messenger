@@ -158,7 +158,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
             // channel, register it (evicting any prior subscriber for this
             // identity), flush the unacked outbox in batches of 64, then
             // reply AckOk.
-            if let ClientMessage::Subscribe = msg {
+            if msg == ClientMessage::Subscribe {
                 let (tx, rx) = mpsc::channel(256);
                 let _evicted = subs.register(id, tx.clone());
                 push_tx = Some(tx);

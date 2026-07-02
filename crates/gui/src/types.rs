@@ -13,16 +13,16 @@ pub enum ChatId {
 
 impl ChatId {
     /// The 32-byte key backing this chat id (peer pub or group id).
-    pub fn key(&self) -> [u8; 32] {
+    pub const fn key(&self) -> [u8; 32] {
         match self {
-            ChatId::Peer(k) => *k,
-            ChatId::Group(k) => *k,
+            Self::Peer(k) => *k,
+            Self::Group(k) => *k,
         }
     }
 
     /// True if this is a 1:1 peer chat.
-    pub fn is_peer(&self) -> bool {
-        matches!(self, ChatId::Peer(_))
+    pub const fn is_peer(&self) -> bool {
+        matches!(self, Self::Peer(_))
     }
 }
 
@@ -89,22 +89,22 @@ pub enum Status {
 
 impl Status {
     /// Encode to the small integer stored in `StoredMessage::status`.
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         match self {
-            Status::Sending => 0,
-            Status::Sent => 1,
-            Status::Delivered => 2,
-            Status::Failed => 3,
+            Self::Sending => 0,
+            Self::Sent => 1,
+            Self::Delivered => 2,
+            Self::Failed => 3,
         }
     }
 
     /// Decode from the small integer stored in `StoredMessage::status`.
-    pub fn from_u8(v: u8) -> Status {
+    pub const fn from_u8(v: u8) -> Self {
         match v {
-            1 => Status::Sent,
-            2 => Status::Delivered,
-            3 => Status::Failed,
-            _ => Status::Sending,
+            1 => Self::Sent,
+            2 => Self::Delivered,
+            3 => Self::Failed,
+            _ => Self::Sending,
         }
     }
 }

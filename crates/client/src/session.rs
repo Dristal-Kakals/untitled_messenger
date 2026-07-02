@@ -143,7 +143,7 @@ impl ClientSession {
     }
 
     /// The current signed-prekey id (for tests/UI).
-    pub fn signed_prekey_id(&self) -> u32 {
+    pub const fn signed_prekey_id(&self) -> u32 {
         self.signed_prekey.id
     }
 

@@ -173,7 +173,7 @@ impl UmApp {
     }
 
     /// The next optimistic-send local id.
-    fn next_local_id(&mut self) -> u64 {
+    const fn next_local_id(&mut self) -> u64 {
         let id = self.next_local_id;
         self.next_local_id += 1;
         id
@@ -476,7 +476,7 @@ fn handle_event(app: &mut UmApp, ev: Event) {
             name,
             members,
         } => {
-            app.upsert_group(group, name.clone(), members);
+            app.upsert_group(group, name, members);
             let chat = ChatId::Group(group);
             app.open_chat = Some(chat);
             app.unread.remove(&chat);

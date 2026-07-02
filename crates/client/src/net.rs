@@ -1,4 +1,5 @@
 //! Async TCP client for the UM relay. Framed reader/writer over tokio.
+//!
 //! One `Client` per connection. The caller drives send/recv; no background
 //! task here (the headless client polls or subscribes explicitly).
 
@@ -56,7 +57,7 @@ impl Client {
     /// concurrently). The reader owns the read half + framing buffer; the
     /// writer owns the write half. Both are `Send`.
     pub fn into_split(self) -> (ClientReader, ClientWriter) {
-        let Client {
+        let Self {
             reader,
             writer,
             buf,
