@@ -89,7 +89,11 @@ async fn run(addr: SocketAddr) -> Result<(), Box<dyn Error>> {
         .await?;
     drain_until_ack(&mut client).await?;
     client.send_msg(&ClientMessage::Subscribe).await?;
-    drain_until_ack(&mut client).await?;
+    // The Subscribe handshake does NOT discard `Delivered`: the server flushes
+    // the unacked outbox as `Delivered` *before* the Subscribe `AckOk`, so
+    // those frames are mail that arrived while we were offline. Decrypt + ack
+    // them inline so a reconnect recovers them instead of dropping them.
+    subscribe_until_ack(&mut client, &mut session).await?;
     eprintln!("registered + subscribed. type /help for commands.");
 
     let mut contacts: HashMap<[u8; 32], String> = HashMap::new();
@@ -115,8 +119,22 @@ async fn run(addr: SocketAddr) -> Result<(), Box<dyn Error>> {
             msg = client.recv_msg() => {
                 match msg? {
                     Some(ServerMessage::Delivered(envs)) => {
+                        let mut ack_ids = Vec::new();
                         for env in envs {
-                            handle_incoming(&env, &mut session);
+                            if handle_incoming(&env, &mut session) {
+                                ack_ids.push(env.id);
+                            }
+                        }
+                        // Ack decrypted envelopes so the server drops them
+                        // from the outbox and does not re-flush them as
+                        // duplicates on the next reconnect (a repeated
+                        // ratchet message number fails to decrypt).
+                        if !ack_ids.is_empty() {
+                            let _ = client
+                                .send_msg(&ClientMessage::Ack {
+                                    envelope_ids: ack_ids,
+                                })
+                                .await;
                         }
                     }
                     Some(ServerMessage::AckOk) => {}
@@ -214,8 +232,18 @@ async fn send_message(
                 match client.recv_msg().await? {
                     Some(ServerMessage::Bundle(b)) => break b,
                     Some(ServerMessage::Delivered(envs)) => {
+                        let mut ack_ids = Vec::new();
                         for env in envs {
-                            handle_incoming(&env, session);
+                            if handle_incoming(&env, session) {
+                                ack_ids.push(env.id);
+                            }
+                        }
+                        if !ack_ids.is_empty() {
+                            let _ = client
+                                .send_msg(&ClientMessage::Ack {
+                                    envelope_ids: ack_ids,
+                                })
+                                .await;
                         }
                     }
                     Some(ServerMessage::AckOk) => {}
@@ -240,31 +268,75 @@ async fn send_message(
     Ok(())
 }
 
-/// Decrypt and print one incoming envelope. A decrypt failure is logged and
-/// dropped (the relay may forward malformed traffic); it never panics.
-fn handle_incoming(env: &EncryptedEnvelope, session: &mut ClientSession) {
+/// Decrypt and print one incoming envelope. Returns `true` if it decrypted
+/// successfully (so the caller can ack it to the server). A decrypt failure
+/// is logged and dropped (the relay may forward malformed or duplicate
+/// traffic); it never panics and returns `false` so the envelope is not
+/// acked (it stays in the outbox and may be re-flushed, which is harmless
+/// because it will keep failing to decrypt).
+fn handle_incoming(env: &EncryptedEnvelope, session: &mut ClientSession) -> bool {
     match session.receive(env) {
         Ok((plaintext, sender)) => {
             let text = String::from_utf8_lossy(&plaintext);
             eprintln!("<- {}: {}", hex_encode(&sender), text);
+            true
         }
-        Err(e) => eprintln!("<- failed to decrypt from {}: {e}", hex_encode(&env.sender)),
+        Err(e) => {
+            eprintln!("<- failed to decrypt from {}: {e}", hex_encode(&env.sender));
+            false
+        }
     }
 }
 
-/// Consume server frames until an `AckOk` arrives. Used during the register +
-/// subscribe handshake. Any `Delivered` pushed before the ack is discarded
-/// with a note (at handshake time no sessions exist to decrypt with, and a
-/// freshly generated identity has no correspondents yet).
+/// Consume server frames until an `AckOk` arrives. Used for the Register
+/// handshake only — the server does not flush the outbox on Register, so
+/// only the `AckOk` is expected. Any stray `Delivered` (none in practice)
+/// is discarded.
 async fn drain_until_ack(client: &mut Client) -> Result<(), ClientError> {
     loop {
         match client.recv_msg().await? {
             Some(ServerMessage::AckOk) => return Ok(()),
             Some(ServerMessage::Delivered(envs)) => {
                 eprintln!(
-                    "(discarded {} early envelope(s) during handshake)",
+                    "(discarded {} early envelope(s) during register)",
                     envs.len()
                 );
+            }
+            Some(ServerMessage::Error(e)) => {
+                return Err(ClientError::Store(format!("server: {e:?}")));
+            }
+            Some(_) => {}
+            None => return Err(ClientError::NotConnected),
+        }
+    }
+}
+
+/// Subscribe handshake: read frames until the Subscribe `AckOk`, decrypting
+/// and acking every `Delivered` batch inline. The server flushes the unacked
+/// outbox as `Delivered` *before* the `AckOk`, so this recovers mail that
+/// arrived while we were offline instead of dropping it. Each recovered
+/// envelope is acked so it is not re-flushed on the next reconnect.
+async fn subscribe_until_ack(
+    client: &mut Client,
+    session: &mut ClientSession,
+) -> Result<(), ClientError> {
+    loop {
+        match client.recv_msg().await? {
+            Some(ServerMessage::AckOk) => return Ok(()),
+            Some(ServerMessage::Delivered(envs)) => {
+                let mut ack_ids = Vec::new();
+                for env in envs {
+                    if handle_incoming(&env, session) {
+                        ack_ids.push(env.id);
+                    }
+                }
+                if !ack_ids.is_empty() {
+                    client
+                        .send_msg(&ClientMessage::Ack {
+                            envelope_ids: ack_ids,
+                        })
+                        .await?;
+                }
             }
             Some(ServerMessage::Error(e)) => {
                 return Err(ClientError::Store(format!("server: {e:?}")));

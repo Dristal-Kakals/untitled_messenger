@@ -345,3 +345,141 @@ async fn bridge_group_exchange_over_real_server() {
         })
         .await;
 }
+
+/// Regression test for offline-mail recovery on reconnect.
+///
+/// The server flushes the unacked outbox as `Delivered` frames *before* the
+/// Subscribe `AckOk`. The bridge must decrypt + persist those frames during
+/// the Subscribe handshake (not discard them), so mail that arrived while the
+/// recipient was offline is recovered when it reconnects. Before the fix,
+/// `drain_until_ack` discarded the flush → silent data loss on every
+/// reconnect.
+///
+/// Flow: bob connects + registers + subscribes (so the server knows his
+/// bundle), then disconnects. Alice starts a 1:1 session (X3DH against bob's
+/// registered bundle) and sends the first message while bob is OFFLINE — the
+/// server holds it in bob's outbox (no live subscriber). Bob reconnects with
+/// his persisted session: the Subscribe flush delivers the offline envelope,
+/// the bridge decrypts it during the handshake, and emits `Event::Decrypted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_reconnect_recovers_offline_mail() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    let store = Arc::new(ServerStore::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs)
+        .await
+        .expect("serve relay");
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (alice_bridge, alice_pub) = make_bridge(&dir, &server_addr);
+            let (bob_bridge, bob_pub) = make_bridge(&dir, &server_addr);
+
+            let (alice_cmd, mut alice_ev) = spawn_bridge(alice_bridge);
+            let (bob_cmd, mut bob_ev) = spawn_bridge(bob_bridge);
+
+            // Both connect + register + subscribe so the server has both
+            // bundles and can route.
+            alice_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("alice connect");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+            bob_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob connect");
+            expect_event(&mut bob_ev, |e| matches!(e, Event::Connected)).await;
+
+            // Bob goes OFFLINE now: drop his bridge so the server loses his
+            // live subscriber (the bundle stays registered). Any pending
+            // events are discarded — we have not sent him anything yet.
+            drop(bob_cmd);
+            drop(bob_ev);
+            // Let the old bridge task wind down + the server observe the
+            // closed connection (subscriber unregistered on EOF).
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+            // Alice starts a 1:1 session with bob (X3DH against his registered
+            // bundle) and sends the first message — while bob is offline. The
+            // server has no live subscriber for bob, so the envelope sits in
+            // bob's outbox.
+            alice_cmd
+                .send(Command::StartSession {
+                    peer: bob_pub,
+                    first_message: "offline-mail".to_string(),
+                    local_id: 1,
+                })
+                .await
+                .expect("alice offline send");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Sent { local_id: 1, .. })).await;
+
+            // Bob reconnects with a fresh bridge built from the SAME persisted
+            // session (the session was persisted at Setup time by make_bridge,
+            //so the ratchet state is the pre-receive state and the offline
+            // envelope — bob's first received message — decrypts via X3DH).
+            let bob_pub_hex = hex::encode(bob_pub);
+            let path = dir.join(format!("{bob_pub_hex}.db"));
+            let store = Store::open(&path, "test-pass").expect("reopen bob store");
+            let session: ClientSession = store.get("session").expect("load session").unwrap();
+            let config = Config {
+                server_addr: server_addr.to_string(),
+                ..Default::default()
+            };
+            let bob_bridge2 = Bridge::new(session, Some(store), config);
+            let (bob_cmd2, mut bob_ev2) = spawn_bridge(bob_bridge2);
+            bob_cmd2
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob reconnect");
+
+            // Collect every event from the reconnect. The Subscribe flush
+            // emits `Event::Decrypted` for the offline envelope BEFORE
+            // `Event::Connected`, so we must not drain-and-discard while
+            // waiting for Connected — collect them all in one pass.
+            let mut recovered = Vec::new();
+            let mut saw_connected = false;
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+            tokio::pin!(deadline);
+            loop {
+                if saw_connected && recovered.iter().any(|t| t == "offline-mail") {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline => break,
+                    ev = bob_ev2.recv() => match ev {
+                        Some(Event::Decrypted { chat, msg }) => {
+                            if chat == um_gui::types::ChatId::Peer(alice_pub) {
+                                recovered.push(msg.text);
+                            }
+                        }
+                        Some(Event::Connected) => { saw_connected = true; }
+                        Some(Event::Error(e)) => panic!("reconnect bridge error: {e}"),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            assert!(saw_connected, "reconnect never reported Connected");
+            assert!(
+                recovered.iter().any(|t| t == "offline-mail"),
+                "offline mail not recovered; got {recovered:?} — outbox flush was dropped on reconnect"
+            );
+
+            drop(alice_cmd);
+            drop(bob_cmd2);
+        })
+        .await;
+}

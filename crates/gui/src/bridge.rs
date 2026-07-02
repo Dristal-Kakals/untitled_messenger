@@ -339,7 +339,7 @@ impl Bridge {
     // ---- Connect / reconnect -------------------------------------------
 
     async fn handle_connect(&mut self, addr: SocketAddr, event_tx: &mpsc::Sender<Event>) {
-        if let Err(reason) = self.connect_and_subscribe().await {
+        if let Err(reason) = self.connect_and_subscribe(event_tx).await {
             let _ = event_tx.send(Event::Error(reason)).await;
             return;
         }
@@ -350,7 +350,16 @@ impl Bridge {
 
     /// Connect, register the bundle, subscribe for push. On success `self.net`
     /// is set. Returns `Err(reason_string)` on any failure.
-    async fn connect_and_subscribe(&mut self) -> Result<(), String> {
+    ///
+    /// The Subscribe drain does NOT discard `Delivered` frames: the server
+    /// flushes the unacked outbox as `Delivered` *before* the Subscribe
+    /// `AckOk`, so those frames are exactly the mail that arrived while we
+    /// were offline. They are decrypted + persisted + emitted here so a
+    /// reconnect recovers them instead of silently dropping them.
+    async fn connect_and_subscribe(
+        &mut self,
+        event_tx: &mpsc::Sender<Event>,
+    ) -> Result<(), String> {
         let addr = self.config.server_socket_addr();
         let mut client = Client::connect(addr).await.map_err(|e| humanize(&e))?;
         client
@@ -359,8 +368,8 @@ impl Bridge {
             })
             .await
             .map_err(|e| humanize(&e))?;
-        // Drain until the Register AckOk (discarding any early Delivered —
-        // at handshake time no sessions exist to decrypt with).
+        // Drain until the Register AckOk. The server does not flush the outbox
+        // on Register (only on Subscribe), so only AckOk is expected here.
         drain_until_ack(&mut client)
             .await
             .map_err(|e| humanize(&e))?;
@@ -368,9 +377,23 @@ impl Bridge {
             .send_msg(&ClientMessage::Subscribe)
             .await
             .map_err(|e| humanize(&e))?;
-        drain_until_ack(&mut client)
-            .await
-            .map_err(|e| humanize(&e))?;
+        // Process the outbox flush: keep reading until the Subscribe AckOk,
+        // decrypting every `Delivered` batch inline so offline mail is
+        // recovered, not lost.
+        loop {
+            let frame = client.recv_msg().await.map_err(|e| humanize(&e))?;
+            match frame {
+                Some(ServerMessage::AckOk) => break,
+                Some(ServerMessage::Delivered(envs)) => {
+                    self.handle_delivered(&envs, event_tx).await;
+                }
+                Some(ServerMessage::Error(e)) => {
+                    return Err(format!("server: {e:?}"));
+                }
+                Some(_) => {}
+                None => return Err("connection closed during subscribe".into()),
+            }
+        }
         self.net = Some(client);
         Ok(())
     }
@@ -390,7 +413,7 @@ impl Bridge {
                 // A concurrent ChangeServer/Connect already reconnected.
                 break;
             }
-            match self.connect_and_subscribe().await {
+            match self.connect_and_subscribe(event_tx).await {
                 Ok(()) => {
                     let _ = event_tx.send(Event::Connected).await;
                     break;
@@ -406,7 +429,7 @@ impl Bridge {
         // Drop the old connection.
         self.net = None;
         self.config.server_addr = addr.to_string();
-        if let Err(reason) = self.connect_and_subscribe().await {
+        if let Err(reason) = self.connect_and_subscribe(event_tx).await {
             let _ = event_tx.send(Event::Error(reason)).await;
             return;
         }
@@ -802,11 +825,22 @@ impl Bridge {
     /// Decrypt + persist a batch of delivered envelopes, emitting
     /// `Event::Decrypted` per message. A decrypt failure on one envelope is
     /// surfaced as `Event::Error` and dropped; the rest still process.
+    ///
+    /// Successfully decrypted envelopes are acked to the server so the outbox
+    /// drops them and they are not re-flushed on the next Subscribe. Without
+    /// acks, every reconnect re-delivers the whole unacked outbox as
+    /// duplicates, which breaks the Double-Ratchet (a repeated message number
+    /// is not in the skipped cache and decrypt fails). Acks are best-effort:
+    /// a send failure just leaves the envelope in the outbox for the next
+    /// flush, which is harmless because the receiver's ratchet already
+    /// advanced past it (a re-delivery decrypts-fails and is dropped, not
+    /// fatal).
     async fn handle_delivered(
         &mut self,
         envs: &[EncryptedEnvelope],
         event_tx: &mpsc::Sender<Event>,
     ) {
+        let mut acked_ids: Vec<u64> = Vec::new();
         for env in envs {
             self.last_delivered_id = self.last_delivered_id.max(env.id);
             let (plaintext, _sender) = match self.session.receive(env) {
@@ -854,8 +888,35 @@ impl Bridge {
                     self.deliver_chat(chat, env.id, text, event_tx).await;
                 }
             }
+            // Decrypted + persisted successfully → ack so the server drops it
+            // from the outbox and does not re-flush it on reconnect.
+            acked_ids.push(env.id);
         }
         self.persist_session();
+        // Best-effort ack of everything we processed this batch. A failure
+        // leaves the envelopes in the outbox; the next flush re-delivers them
+        // as (decrypt-failing) duplicates, which `handle_delivered` drops.
+        if !acked_ids.is_empty() {
+            self.ack_envelopes(&acked_ids).await;
+        }
+    }
+
+    /// Send an `Ack` for our own identity with the given envelope ids.
+    /// Best-effort: errors are logged via tracing and swallowed (the outbox
+    /// keeps the envelopes, recoverable on the next Subscribe flush).
+    async fn ack_envelopes(&mut self, envelope_ids: &[u64]) {
+        let Some(net) = self.net.as_mut() else {
+            return;
+        };
+        if net
+            .send_msg(&ClientMessage::Ack {
+                envelope_ids: envelope_ids.to_vec(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("failed to ack {} delivered envelope(s)", envelope_ids.len());
+        }
     }
 
     /// Persist + emit an incoming chat message (1:1 or group text).
@@ -1082,15 +1143,16 @@ impl Bridge {
 
 // ---- free functions -----------------------------------------------------
 
-/// Consume server frames until an `AckOk` arrives (register + subscribe
-/// handshake). Any `Delivered` pushed before the ack is discarded with a note
-/// (at handshake time no sessions exist to decrypt with).
+/// Consume server frames until an `AckOk` arrives (the Register handshake).
+/// Used only for `Register`, which does not flush the outbox; the Subscribe
+/// handshake is handled inline in `connect_and_subscribe` so its outbox
+/// flush is recovered, not discarded.
 async fn drain_until_ack(client: &mut Client) -> Result<(), ClientError> {
     loop {
         match client.recv_msg().await? {
             Some(ServerMessage::AckOk) => return Ok(()),
             Some(ServerMessage::Delivered(_envs)) => {
-                // Discard early envelopes during the handshake.
+                // Discard early envelopes during the Register handshake.
             }
             Some(ServerMessage::Error(e)) => {
                 return Err(ClientError::Store(format!("server: {e:?}")));
