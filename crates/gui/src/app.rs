@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-use iced::widget::{button, column, row, text};
-use iced::{Element, Subscription, Task};
+use iced::widget::{Space, button, column, container, row, text};
+use iced::{Element, Fill, Subscription, Task};
 use tokio::sync::mpsc;
 
 use um_gui::config::Config;
+use um_gui::theme;
 use um_gui::types::{ChatId, ContactView, GroupView, MessageView, Status};
 use um_gui::{Command, Event};
 
@@ -187,6 +188,7 @@ impl UmApp {
             dir: um_gui::types::Direction::Out,
             timestamp: 0,
             status: Status::Sending,
+            sender: None,
         };
         self.threads.entry(chat).or_default().push(mv);
     }
@@ -306,9 +308,13 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
                 return Task::none();
             }
             let local_id = app.next_local_id();
+            let mut snap: Option<Task<Message>> = None;
             match app.open_chat {
                 Some(ChatId::Peer(peer)) => {
                     app.optimistic_send(ChatId::Peer(peer), text.clone(), local_id);
+                    snap = Some(iced::widget::operation::snap_to_end(
+                        views::chat_thread::thread_scroll_id(),
+                    ));
                     // First send to this peer → StartSession (X3DH); else SendMessage.
                     let has_session = app.threads.get(&ChatId::Peer(peer)).is_some_and(|ms| {
                         ms.iter().any(|m| m.dir == um_gui::types::Direction::Out)
@@ -330,6 +336,9 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
                 }
                 Some(ChatId::Group(group)) => {
                     app.optimistic_send(ChatId::Group(group), text.clone(), local_id);
+                    snap = Some(iced::widget::operation::snap_to_end(
+                        views::group_chat::group_scroll_id(),
+                    ));
                     app.send_cmd(Command::SendGroupMessage {
                         group,
                         text,
@@ -339,6 +348,7 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
                 }
                 None => {}
             }
+            return snap.unwrap_or_else(Task::none);
         }
 
         Message::CreateGroupPressed => {
@@ -396,13 +406,14 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::DismissError => app.error = None,
         Message::Quit => return iced::exit(),
 
-        Message::Event(ev) => handle_event(app, ev),
+        Message::Event(ev) => return handle_event(app, ev),
     }
     Task::none()
 }
 
-/// Apply a bridge `Event` to the app state.
-fn handle_event(app: &mut UmApp, ev: Event) {
+/// Apply a bridge `Event` to the app state. Returns a `Task` so it can snap the
+/// open thread's scrollable to the latest message when new content arrives.
+fn handle_event(app: &mut UmApp, ev: Event) -> Task<Message> {
     match ev {
         Event::Ready {
             identity_pub,
@@ -442,12 +453,14 @@ fn handle_event(app: &mut UmApp, ev: Event) {
         }
         Event::HistoryLoaded(chat, msgs) => {
             app.threads.insert(chat, msgs);
+            return snap_for_chat(app, &chat);
         }
         Event::Decrypted { chat, msg } => {
             // If this chat is open, append to the visible thread. Otherwise
             // bump the unread count so the ContactList shows a badge.
             if app.open_chat == Some(chat) {
                 app.threads.entry(chat).or_default().push(msg);
+                return snap_for_chat(app, &chat);
             } else {
                 *app.unread.entry(chat).or_insert(0) += 1;
             }
@@ -491,6 +504,24 @@ fn handle_event(app: &mut UmApp, ev: Event) {
             // section, then surface a notification banner.
             app.upsert_group(group, name, members);
             app.error = Some("you were added to a group".into());
+        }
+    }
+    Task::none()
+}
+
+/// A `snap_to_end` task for the scrollable of the given chat, or `Task::none`
+/// if the chat is not currently open. Used after a message is appended so the
+/// latest message is in view.
+fn snap_for_chat(app: &UmApp, chat: &ChatId) -> Task<Message> {
+    if app.open_chat.as_ref() != Some(chat) {
+        return Task::none();
+    }
+    match chat {
+        ChatId::Peer(_) => {
+            iced::widget::operation::snap_to_end(views::chat_thread::thread_scroll_id())
+        }
+        ChatId::Group(_) => {
+            iced::widget::operation::snap_to_end(views::group_chat::group_scroll_id())
         }
     }
 }
@@ -556,11 +587,20 @@ pub fn view(app: &UmApp) -> Element<'_, Message> {
 
     // Error banner on top of any view.
     if let Some(err) = &app.error {
-        let banner = row![
-            text(err).color([0.8, 0.2, 0.2]),
-            button("dismiss").on_press(Message::DismissError),
-        ];
-        column![banner, content].into()
+        let banner = container(
+            row![
+                text(err).color(theme::ERROR).size(13),
+                Space::new().width(Fill),
+                button(text("dismiss"))
+                    .style(theme::secondary_button_style)
+                    .on_press(Message::DismissError),
+            ]
+            .spacing(10)
+            .align_y(iced::alignment::Vertical::Center),
+        )
+        .style(|_| theme::panel_style())
+        .padding(8);
+        column![banner, content].spacing(8).into()
     } else {
         content
     }
@@ -586,6 +626,7 @@ mod tests {
             dir: Direction::In,
             timestamp: 0,
             status: Status::Delivered,
+            sender: None,
         }
     }
 
@@ -594,7 +635,7 @@ mod tests {
         let mut app = test_app();
         let chat = ChatId::Peer([0x11; 32]);
         app.open_chat = Some(chat);
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::Decrypted {
                 chat,
@@ -612,14 +653,14 @@ mod tests {
         let mut app = test_app();
         let chat = ChatId::Peer([0x11; 32]);
         // Chat not open → unread bumps, thread cache stays empty.
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::Decrypted {
                 chat,
                 msg: incoming("a"),
             },
         );
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::Decrypted {
                 chat,
@@ -646,7 +687,7 @@ mod tests {
     fn group_events_upsert_without_duplicate() {
         let mut app = test_app();
         let gid = [0x22; 32];
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::GroupCreated {
                 group: gid,
@@ -659,7 +700,7 @@ mod tests {
         assert_eq!(app.groups[0].members, 2);
         assert_eq!(app.view, View::GroupChat(gid));
         // A re-invite with the same id refreshes the name + count, no dup row.
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::GroupInvited {
                 group: gid,
@@ -678,7 +719,7 @@ mod tests {
         // The app must populate `groups` so the ContactList "Groups" section
         // lists them before any runtime GroupCreated/GroupInvited.
         let mut app = test_app();
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::GroupsLoaded(vec![
                 GroupView {
@@ -696,7 +737,7 @@ mod tests {
         assert_eq!(app.groups.len(), 2);
         // A later runtime GroupInvited for an already-loaded group refreshes,
         // it does not duplicate.
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::GroupInvited {
                 group: [0x22; 32],
@@ -770,7 +811,7 @@ mod tests {
         let chat = ChatId::Peer(peer);
         app.optimistic_send(chat, "hi".into(), 7);
         assert_eq!(app.threads.get(&chat).unwrap()[0].status, Status::Sending);
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::Sent {
                 chat,
@@ -781,6 +822,7 @@ mod tests {
                     dir: Direction::Out,
                     timestamp: 0,
                     status: Status::Sent,
+                    sender: None,
                 },
             },
         );
@@ -821,7 +863,7 @@ mod tests {
         let mut app = test_app();
         let pub_ = [0x11; 32];
         let fp = [0xAB; 32];
-        handle_event(
+        let _ = handle_event(
             &mut app,
             Event::Ready {
                 identity_pub: pub_,

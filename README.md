@@ -11,8 +11,18 @@ acknowledged and **out of scope for v1**.
 ## Crypto primitives
 
 - **X3DH** (`um_crypto::x3dh`) — session establishment. `RK = HKDF(DH1 ‖ DH2 ‖ DH3 ‖ DH4, salt="UM-X3DH-v1")`.
+- **Hybrid PQXDH** (`um_crypto::kem` + `x3dh`) — post-quantum hybrid on top of
+  X3DH. Bob publishes an ML-KEM-768 (FIPS 203) encapsulation key alongside his
+  X25519 signed prekey. Alice runs classical X3DH *and* encapsulates a fresh
+  32-byte secret to Bob's PQ key; Bob decapsulates it. Both secrets feed the
+  X3DH HKDF as additional IKM, so the root key is bound to **both** the
+  classical DH outputs and the lattice secret. An attacker must break X25519
+  (or Ed25519→X25519) **and** ML-KEM-768 to recover the session key — the
+  hybrid property. The PQ layer is byte-sized behind `um_crypto::kem`, so the
+  wire protocol stays crypto-free and the KEM can be swapped (e.g. ML-KEM-1024)
+  without touching anything outside that module.
 - **Double Ratchet** (`um_crypto::double_ratchet`) — per-message forward secrecy for 1:1 chats. A bad AEAD tag drops the message without poisoning the ratchet (skipped-key cache handles gaps).
-- **Sender Keys** (`um_crypto::sender_keys`) — group messaging with per-sender chains.
+- **Sender Keys** (`um_crypto::sender_keys`) — group messaging with per-sender chains. Group distribution state rides the hybrid 1:1 ratchet, so groups inherit PQ protection indirectly.
 - **Identity keys** (`um_crypto::identity`) — Ed25519 signing + X25519 DH.
 - **AEAD** (`um_crypto::aead`) — XChaCha20-Poly1305 + HKDF helpers.
 
@@ -86,11 +96,13 @@ registers its prekey bundle, and subscribes for push.
 
 ## GUI features
 
-- **Contact list** — add contacts by 32-byte identity pub (hex) + nickname, per-contact unread badges, fingerprint display, manual fingerprint verification (✓).
-- **1:1 chat** — full Double-Ratchet sessions, optimistic send with `…/✓/✗` status, fingerprint-verify button.
-- **Groups** — Sender Keys group sessions; founder distributes sender-key state to each member over their 1:1 ratchet; group list with unread badges; member count in the group header.
-- **Settings** — identity pub + fingerprint, editable server address (disconnect + reconnect), signed-prekey rotation, one-time-prekey replenish with editable count, logout.
+- **Theming** — Dracula dark palette via a single `um_gui::theme` module (colors, bubble/panel/button styles), so the six views stay visually consistent and the look is decoupled from layout.
+- **Contact list** — add contacts by 32-byte identity pub (hex) + nickname, per-contact unread badges, fingerprint display, manual fingerprint verification (✓), connection status header.
+- **1:1 chat** — full Double-Ratchet sessions, optimistic send with `…/✓/✗` status, per-message UTC timestamps, fingerprint-verify button, auto-scroll that snaps to the latest message on send/receive.
+- **Groups** — Sender Keys group sessions; founder distributes sender-key state to each member over their 1:1 ratchet; group list with unread badges; member count in the group header; incoming rows are prefixed with the author's nickname (or short hex for unknown senders).
+- **Settings** — identity pub + fingerprint, editable server address (disconnect + reconnect), signed-prekey rotation, one-time-prekey replenish with editable count, logout, quit.
 - **Push** — live `Delivered` push via `Subscribe`; offline mail recovered on reconnect; unacked outbox flushed on re-subscribe; exponential-backoff reconnect.
+- **Headless-safe startup** — a pre-flight display check exits cleanly with guidance when no Wayland/X11 session is reachable, instead of panicking inside winit.
 
 ## Local store
 

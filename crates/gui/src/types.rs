@@ -56,6 +56,13 @@ pub struct GroupView {
 /// A single chat message as the GUI displays it. `local_id` is the app's
 /// monotonic id used to match optimistic-send rows to later `Event::Sent` /
 /// `Event::SendFailed`.
+///
+/// `sender` is the identity pub of the *author* of an incoming group message
+/// (so the group view can prefix "alice: …"). It is `None` for outgoing
+/// messages, for 1:1 messages (where the author is implied by the thread), and
+/// for rows reloaded from history (the persisted store does not record the
+/// sender — see `um_client::store`). It is view-only data; it is never
+/// persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
     pub local_id: u64,
@@ -63,6 +70,8 @@ pub struct MessageView {
     pub dir: Direction,
     pub timestamp: u64,
     pub status: Status,
+    /// Author identity pub for an incoming group message, else `None`.
+    pub sender: Option<[u8; 32]>,
 }
 
 /// Message direction relative to this client.

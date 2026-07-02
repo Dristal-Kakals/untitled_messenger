@@ -1,16 +1,75 @@
-//! Group chat thread view: same layout as 1:1, keyed by group id.
+//! Group chat thread view: same layout as 1:1, keyed by group id. Header
+//! shows the group name + member count.
 
-use iced::Element;
 use iced::alignment;
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
+use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, hex32};
+use super::{Message, UmApp, format_time, hex32, short_hex};
 use crate::ChatId;
+use crate::ContactView;
+use crate::theme;
+
+/// The scrollable id for the group thread.
+pub fn group_scroll_id() -> Id {
+    Id::new("um-group-thread")
+}
+
+/// Resolve a sender identity pub to a display label: the contact's nickname if
+/// known, else the first 4 bytes of the pub as short hex. Pure (takes the
+/// contact slice so it is unit-testable without a full `UmApp`).
+fn sender_label(contacts: &[ContactView], sender: &[u8; 32]) -> String {
+    match contacts.iter().find(|c| &c.identity_pub == sender) {
+        Some(c) => c.nickname.clone(),
+        None => short_hex(sender),
+    }
+}
+
+fn message_row<'a>(
+    app: &UmApp,
+    text_str: &'a str,
+    dir: crate::Direction,
+    ts: u64,
+    status: crate::Status,
+    sender: Option<[u8; 32]>,
+) -> Element<'a, Message> {
+    let (bubble_style, align) = if dir == crate::Direction::Out {
+        (theme::bubble_out_style(), alignment::Horizontal::Right)
+    } else {
+        (theme::bubble_in_style(), alignment::Horizontal::Left)
+    };
+    let suffix = match (dir, status) {
+        (crate::Direction::Out, crate::Status::Sending) => " …",
+        (crate::Direction::Out, crate::Status::Failed) => " ✗",
+        (crate::Direction::Out, _) => " ✓",
+        _ => "",
+    };
+    // For an incoming group message with a known author, prefix "nick: ".
+    let prefix = match (dir, sender) {
+        (crate::Direction::In, Some(s)) => format!("{}: ", sender_label(&app.contacts, &s)),
+        _ => String::new(),
+    };
+    let body = text(format!("{prefix}{text_str}{suffix}")).size(14);
+    let time = format_time(ts);
+    let bubble = container(body)
+        .style(move |_| bubble_style)
+        .padding(theme::BUBBLE_PAD)
+        .width(Length::Shrink);
+    let col = if time.is_empty() {
+        column![bubble]
+    } else {
+        column![bubble, text(time).color(theme::MUTED).size(9)]
+    }
+    .spacing(2)
+    .align_x(align);
+    container(col)
+        .align_x(align)
+        .width(Fill)
+        .padding([0, 4])
+        .into()
+}
 
 pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
-    // Header: group name + member count, per the spec ("Header shows group
-    // name + member count"). Falls back to the raw group-id hex for an
-    // unknown group.
     let title = match app.groups.iter().find(|g| g.id == group) {
         Some(g) => {
             let noun = if g.members == 1 { "member" } else { "members" };
@@ -19,39 +78,99 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
         None => format!("group {}", hex32(&group)),
     };
     let header = row![
-        button("← back").on_press(Message::Back),
-        text(title).size(12),
+        button(text("← back"))
+            .style(theme::secondary_button_style)
+            .on_press(Message::Back),
+        text(title).size(13).color(theme::MUTED),
     ]
-    .spacing(10);
+    .spacing(10)
+    .align_y(alignment::Vertical::Center);
 
-    let mut msgs = column![].spacing(4);
+    let mut msgs = column![].spacing(6);
     if let Some(thread) = app.threads.get(&ChatId::Group(group)) {
         for m in thread {
-            let label = match (m.dir, m.status) {
-                (crate::Direction::Out, crate::Status::Sending) => format!("{} …", m.text),
-                (crate::Direction::Out, crate::Status::Failed) => format!("{} ✗", m.text),
-                (crate::Direction::Out, _) => format!("{} ✓", m.text),
-                (crate::Direction::In, _) => format!("< {}", m.text),
-            };
-            let aligned = if m.dir == crate::Direction::Out {
-                container(text(label)).align_x(alignment::Horizontal::Right)
-            } else {
-                container(text(label)).align_x(alignment::Horizontal::Left)
-            };
-            msgs = msgs.push(aligned);
+            msgs = msgs.push(message_row(
+                app,
+                &m.text,
+                m.dir,
+                m.timestamp,
+                m.status,
+                m.sender,
+            ));
         }
+    }
+    if app
+        .threads
+        .get(&ChatId::Group(group))
+        .is_none_or(|t| t.is_empty())
+    {
+        msgs = msgs.push(
+            container(text("no group messages yet").color(theme::MUTED).size(13))
+                .align_x(alignment::Horizontal::Center)
+                .width(Fill),
+        );
     }
 
     let compose = row![
         text_input("type a group message…", &app.compose_input)
             .on_input(Message::ComposeChanged)
-            .on_submit(Message::SendPressed),
-        button("send").on_press(Message::SendPressed),
+            .on_submit(Message::SendPressed)
+            .padding(8),
+        button(text("send"))
+            .style(theme::primary_button_style)
+            .on_press(Message::SendPressed),
     ]
-    .spacing(10);
+    .spacing(8)
+    .align_y(alignment::Vertical::Center);
 
-    column![header, scrollable(msgs).height(iced::Fill), compose,]
-        .spacing(10)
-        .padding(20)
-        .into()
+    column![
+        header,
+        scrollable(msgs)
+            .id(group_scroll_id())
+            .height(Fill)
+            .anchor_bottom()
+            .auto_scroll(true)
+            .spacing(4),
+        compose,
+    ]
+    .spacing(10)
+    .padding(20)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact(pub_: [u8; 32], nick: &str) -> ContactView {
+        ContactView {
+            identity_pub: pub_,
+            nickname: nick.into(),
+            fingerprint: [0; 32],
+            verified: false,
+        }
+    }
+
+    #[test]
+    fn sender_label_uses_known_nickname() {
+        let pub_ = [0x11; 32];
+        let contacts = vec![contact(pub_, "alice")];
+        assert_eq!(sender_label(&contacts, &pub_), "alice");
+    }
+
+    #[test]
+    fn sender_label_falls_back_to_short_hex() {
+        let pub_ = [0xAB; 32];
+        // No contact matches → short hex of the first 4 bytes.
+        assert_eq!(sender_label(&[], &pub_), "abababab…");
+    }
+
+    #[test]
+    fn sender_label_ignores_non_matching_contacts() {
+        let known = [0x11; 32];
+        let unknown = [0x22; 32];
+        let contacts = vec![contact(known, "alice")];
+        // A different pub is not "alice" — it falls back to short hex.
+        assert_eq!(sender_label(&contacts, &unknown), "22222222…");
+    }
 }

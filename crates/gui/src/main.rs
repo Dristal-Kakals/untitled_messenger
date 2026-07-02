@@ -33,7 +33,11 @@ use um_client::session::ClientSession;
 // lib; re-binding them at the binary crate root makes them crate-local. Some
 // are only touched by the view tests, hence `unused_imports` is allowed.
 #[allow(unused_imports)]
-use um_gui::types::{ChatId, Direction, MessageView, Status};
+use um_gui::types::{ChatId, ContactView, Direction, MessageView, Status};
+// `theme` is re-exported so the view submodules can write `crate::theme::…`
+// (the bin crate root re-exports it, matching how `ChatId` etc. are exposed).
+#[allow(unused_imports)]
+use um_gui::theme;
 use um_gui::{Bridge, Command, Config, Event};
 
 fn main() -> iced::Result {
@@ -41,6 +45,19 @@ fn main() -> iced::Result {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+
+    // Pre-flight display check: iced's winit backend panics (via `.expect`)
+    // when no display server is reachable, which on a headless box prints a
+    // raw panic backtrace instead of an actionable message. Detect that case
+    // ourselves and exit cleanly with guidance.
+    if !display_available() {
+        eprintln!(
+            "um-gui: no display server found (set WAYLAND_DISPLAY/WAYLAND_SOCKET \
+             or DISPLAY, or run under a Wayland/X11 session). The GUI cannot \
+             start headless; use `um_client` for a terminal REPL."
+        );
+        std::process::exit(1);
+    }
 
     let config = um_gui::config::load();
 
@@ -64,7 +81,15 @@ fn main() -> iced::Result {
     um_app.set_event_rx(event_rx);
 
     iced::application(move || um_app.clone(), app::update, app::view)
-        .title("UM")
+        .title("untitled_messenger")
+        .theme(um_gui::THEME)
+        .window(iced::window::Settings {
+            size: iced::Size::new(900.0, 640.0),
+            min_size: Some(iced::Size::new(480.0, 360.0)),
+            ..Default::default()
+        })
+        .centered()
+        .resizable(true)
         .subscription(app::subscription)
         .run()
 }
@@ -108,4 +133,14 @@ fn spawn_bridge(config: Config) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>
         .expect("spawn bridge thread");
 
     rx.recv().expect("bridge thread failed to initialize")
+}
+
+/// True if a display server appears reachable. Mirrors winit's own check:
+/// Wayland (`WAYLAND_DISPLAY` or `WAYLAND_SOCKET`) or X11 (`DISPLAY`). On a
+/// headless box none are set, so we bail out before iced's winit backend
+/// panics inside `EventLoop::build`.
+fn display_available() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_SOCKET").is_some()
+        || std::env::var_os("DISPLAY").is_some()
 }

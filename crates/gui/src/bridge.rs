@@ -914,8 +914,14 @@ impl Bridge {
                     // a plain chat message so 1:1 interop still works.
                     match decode_payload(&plaintext) {
                         Some(P2pPayload::Chat(text)) => {
-                            self.deliver_chat(ChatId::Peer(env.sender), env.id, text, event_tx)
-                                .await;
+                            self.deliver_chat(
+                                ChatId::Peer(env.sender),
+                                env.id,
+                                text,
+                                None,
+                                event_tx,
+                            )
+                            .await;
                         }
                         Some(P2pPayload::GroupDist { group, name, state }) => {
                             self.handle_group_dist(env.sender, group, name, *state, event_tx)
@@ -924,8 +930,14 @@ impl Bridge {
                         None => {
                             // Raw bytes from a non-bridge peer: treat as text.
                             let text = String::from_utf8_lossy(&plaintext).into_owned();
-                            self.deliver_chat(ChatId::Peer(env.sender), env.id, text, event_tx)
-                                .await;
+                            self.deliver_chat(
+                                ChatId::Peer(env.sender),
+                                env.id,
+                                text,
+                                None,
+                                event_tx,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -935,7 +947,11 @@ impl Bridge {
                         Err(_) => ChatId::Peer(env.sender),
                     };
                     let text = String::from_utf8_lossy(&plaintext).into_owned();
-                    self.deliver_chat(chat, env.id, text, event_tx).await;
+                    // For a group message the author is the envelope sender;
+                    // surface it so the group view can prefix "sender: …".
+                    let sender = matches!(chat, ChatId::Group(_)).then_some(env.sender);
+                    self.deliver_chat(chat, env.id, text, sender, event_tx)
+                        .await;
                 }
             }
             // Decrypted + persisted successfully → ack so the server drops it
@@ -969,12 +985,15 @@ impl Bridge {
         }
     }
 
-    /// Persist + emit an incoming chat message (1:1 or group text).
+    /// Persist + emit an incoming chat message (1:1 or group text). `sender`
+    /// is the author identity pub for a group message (so the view can prefix
+    /// the sender); `None` for 1:1 (the peer is implied by the thread).
     async fn deliver_chat(
         &self,
         chat: ChatId,
         env_id: u64,
         text: String,
+        sender: Option<[u8; 32]>,
         event_tx: &mpsc::Sender<Event>,
     ) {
         let timestamp = now_secs();
@@ -996,6 +1015,7 @@ impl Bridge {
             dir: Direction::In,
             timestamp,
             status: Status::Delivered,
+            sender,
         };
         let _ = event_tx.send(Event::Decrypted { chat, msg }).await;
     }
@@ -1135,6 +1155,7 @@ impl Bridge {
             dir: Direction::Out,
             timestamp,
             status,
+            sender: None,
         }
     }
 
@@ -1184,6 +1205,9 @@ impl Bridge {
                 },
                 timestamp: r.timestamp as u64,
                 status: Status::from_u8(r.msg.status),
+                // The persisted store does not record the per-message sender
+                // (see `um_client::store`), so reloaded rows carry no author.
+                sender: None,
             })
             .collect()
     }

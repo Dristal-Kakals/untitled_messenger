@@ -22,10 +22,12 @@ pub mod bridge;
 pub mod command;
 pub mod config;
 pub mod event;
+pub mod theme;
 pub mod types;
 
 pub use bridge::Bridge;
 pub use command::Command;
 pub use config::Config;
 pub use event::Event;
+pub use theme::THEME;
 pub use types::{ChatId, ContactView, Direction, GroupView, MessageView, Status};
