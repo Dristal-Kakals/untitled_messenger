@@ -4,6 +4,7 @@
 //! view; `update` also emits a `snap_to_end` task on send/receive.
 
 use iced::alignment;
+use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
@@ -16,6 +17,13 @@ use crate::theme;
 pub fn thread_scroll_id() -> Id {
     Id::new("um-chat-thread")
 }
+
+/// Viewport-relative threshold (px) under which the thread is considered
+/// pinned to the top, triggering a keyset `LoadOlder` fetch. `absolute_offset`
+/// is clamped to `[0, content-bounds]`, so `y ≈ 0` means the top of the
+/// content is flush with the top of the viewport. A small epsilon absorbs
+/// sub-pixel rounding from the layout engine.
+pub(crate) const SCROLL_AT_TOP_EPS: f32 = 1.0;
 
 /// A single message row: a bubble (in/out styled) + a small timestamp under
 /// it, aligned to the bubble's side.
@@ -112,6 +120,10 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
             .height(Fill)
             .anchor_bottom()
             .auto_scroll(true)
+            .on_scroll(move |vp: Viewport| Message::ChatScrolled {
+                chat: ChatId::Peer(peer),
+                at_top: vp.absolute_offset().y <= SCROLL_AT_TOP_EPS,
+            })
             .spacing(4),
         compose,
     ]

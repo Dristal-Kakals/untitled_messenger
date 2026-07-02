@@ -2,10 +2,12 @@
 //! shows the group name + member count.
 
 use iced::alignment;
+use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
 use super::{Message, UmApp, format_time, hex32, short_hex};
+use super::chat_thread::SCROLL_AT_TOP_EPS;
 use crate::ChatId;
 use crate::ContactView;
 use crate::theme;
@@ -130,6 +132,10 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
             .height(Fill)
             .anchor_bottom()
             .auto_scroll(true)
+            .on_scroll(move |vp: Viewport| Message::ChatScrolled {
+                chat: ChatId::Group(group),
+                at_top: vp.absolute_offset().y <= SCROLL_AT_TOP_EPS,
+            })
             .spacing(4),
         compose,
     ]

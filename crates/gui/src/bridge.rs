@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use um_client::session::ClientSession;
-use um_client::store::{StoredGroup, StoredMessage};
+use um_client::store::{StoredGroup, StoredMessage, StoredMessageRow};
 use um_client::{Client, ClientError, Store};
 use um_crypto::sender_keys::SenderKeyState;
 use um_protocol::{ClientMessage, EncryptedEnvelope, MessageKind, ServerMessage};
@@ -68,6 +68,14 @@ const CHAN_CAP: usize = 256;
 
 /// Reconnect backoff ceiling (seconds). The loop retries 1→2→4→…→30 forever.
 const BACKOFF_CAP_SECS: u64 = 30;
+
+/// Keyset page size for history loading. `LoadThread`/`LoadGroupThread` fetch
+/// the newest `HISTORY_PAGE_SIZE` rows; `LoadOlder`/`LoadOlderGroup` fetch the
+/// next older page of the same size on scroll-to-top. Tuned for a chat view:
+/// enough to fill the pane and give a comfortable scroll-back buffer without
+/// pulling a long thread's whole table. The `(peer, id)` index serves each
+/// page as a single range scan, so the cost is constant in history length.
+const HISTORY_PAGE_SIZE: usize = 50;
 
 /// The async bridge state. Constructed with [`Bridge::new`] and run via
 /// [`Bridge::spawn`], which spawns the loop on the caller's runtime.
@@ -239,6 +247,10 @@ impl Bridge {
                     .await;
             }
             Command::LoadThread { peer } => self.handle_load_thread(peer, event_tx).await,
+            Command::LoadOlder { peer, before_id } => {
+                self.handle_load_older(ChatId::Peer(peer), before_id, event_tx)
+                    .await;
+            }
             Command::CreateGroup { name, members } => {
                 self.handle_create_group(name, members, event_tx).await;
             }
@@ -252,6 +264,10 @@ impl Bridge {
             }
             Command::LoadGroupThread { group } => {
                 self.handle_load_group_thread(group, event_tx).await;
+            }
+            Command::LoadOlderGroup { group, before_id } => {
+                self.handle_load_older(ChatId::Group(group), before_id, event_tx)
+                    .await;
             }
             Command::RotateSignedPrekey => self.handle_rotate_signed_prekey(event_tx).await,
             Command::ReplenishOneTimePrekeys { count } => {
@@ -604,9 +620,13 @@ impl Bridge {
     }
 
     async fn handle_load_thread(&self, peer: [u8; 32], event_tx: &mpsc::Sender<Event>) {
-        let msgs = self.load_history(&ChatId::Peer(peer));
+        let (msgs, has_more) = self.load_history(&ChatId::Peer(peer));
         let _ = event_tx
-            .send(Event::HistoryLoaded(ChatId::Peer(peer), msgs))
+            .send(Event::HistoryLoaded {
+                chat: ChatId::Peer(peer),
+                msgs,
+                has_more,
+            })
             .await;
     }
 
@@ -753,9 +773,33 @@ impl Bridge {
     }
 
     async fn handle_load_group_thread(&self, group: [u8; 32], event_tx: &mpsc::Sender<Event>) {
-        let msgs = self.load_history(&ChatId::Group(group));
+        let (msgs, has_more) = self.load_history(&ChatId::Group(group));
         let _ = event_tx
-            .send(Event::HistoryLoaded(ChatId::Group(group), msgs))
+            .send(Event::HistoryLoaded {
+                chat: ChatId::Group(group),
+                msgs,
+                has_more,
+            })
+            .await;
+    }
+
+    /// Fetch the next older keyset page for `chat` (1:1 or group) and emit
+    /// `OlderHistoryLoaded` so the app prepends it to the cached thread. The
+    /// `has_more` flag tells the app whether further paging is possible, so it
+    /// can stop requesting pages once the oldest row is reached.
+    async fn handle_load_older(
+        &self,
+        chat: ChatId,
+        before_id: i64,
+        event_tx: &mpsc::Sender<Event>,
+    ) {
+        let (msgs, has_more) = self.load_older_history(&chat, before_id);
+        let _ = event_tx
+            .send(Event::OlderHistoryLoaded {
+                chat,
+                msgs,
+                has_more,
+            })
             .await;
     }
 
@@ -1187,34 +1231,39 @@ impl Bridge {
             .collect())
     }
 
-    /// Load a chat's history from the store into view models, oldest first.
-    fn load_history(&self, chat: &ChatId) -> Vec<MessageView> {
+    /// Load a chat's **newest** history page from the store into view models,
+    /// oldest-first within the page, plus `has_more` (older history exists
+    /// beyond this page). This is the initial page shown when a thread opens
+    /// (`LoadThread` / `LoadGroupThread`); older pages are fetched on demand
+    /// by [`Self::load_older_history`] on scroll-to-top. Returns an empty page
+    /// with `has_more = false` if the store is absent or the read fails, so
+    /// the view still renders an empty thread rather than crashing.
+    fn load_history(&self, chat: &ChatId) -> (Vec<MessageView>, bool) {
         let Some(store) = self.store.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         let key = chat.key();
-        let Ok(rows) = store.messages(&key) else {
-            return Vec::new();
+        match store.messages_page(&key, None, HISTORY_PAGE_SIZE) {
+            Ok(page) => (rows_to_views(page.rows), page.has_more),
+            Err(_) => (Vec::new(), false),
+        }
+    }
+
+    /// Load the next older keyset page for `chat`, strictly older than
+    /// `before_id` (the smallest store row id currently in the cache). Returns
+    /// the page as view models (oldest-first within the page, ready to
+    /// prepend) plus `has_more` so the app knows whether to keep paging.
+    /// Returns an empty page with `has_more = false` if the store is absent or
+    /// the read fails — the app treats that as "no more history" and stops.
+    fn load_older_history(&self, chat: &ChatId, before_id: i64) -> (Vec<MessageView>, bool) {
+        let Some(store) = self.store.as_ref() else {
+            return (Vec::new(), false);
         };
-        rows.into_iter()
-            .map(|r| MessageView {
-                local_id: r.id as u64,
-                text: r.msg.text,
-                dir: if r.direction == 0 {
-                    Direction::Out
-                } else {
-                    Direction::In
-                },
-                timestamp: r.timestamp as u64,
-                status: Status::from_u8(r.msg.status),
-                // The author pub is persisted in the `sender` column for
-                // incoming group messages, so reloaded group history keeps its
-                // "author: …" label after a restart. 1:1 and outgoing rows
-                // have `sender = None` (the peer is implied by the thread /
-                // the author is us).
-                sender: r.sender,
-            })
-            .collect()
+        let key = chat.key();
+        match store.messages_page(&key, Some(before_id), HISTORY_PAGE_SIZE) {
+            Ok(page) => (rows_to_views(page.rows), page.has_more),
+            Err(_) => (Vec::new(), false),
+        }
     }
 
     /// Persist a group's name + full roster to the store. Write-through on
@@ -1326,6 +1375,32 @@ pub fn humanize(e: &ClientError) -> String {
         ClientError::Postcard(_) => "encoding error".to_string(),
         ClientError::Sqlite(_) => "local store error".to_string(),
     }
+}
+
+/// Map decoded store rows to view models. The store row `id` becomes the
+/// `MessageView::local_id` — for history-loaded rows this is the SQLite row
+/// id (stable across reloads, monotonic with arrival order), which the app
+/// uses as the keyset cursor for `LoadOlder`. (Optimistic-send rows use a
+/// separate app-local monotonic id; the two id spaces can overlap in value but
+/// are never compared — optimistic rows are matched by `local_id` against
+/// `Event::Sent`/`SendFailed`, history rows by their position in the cache.)
+/// The `sender` column (author pub for incoming group messages) is carried
+/// through so reloaded group history keeps its "author: …" label.
+fn rows_to_views(rows: Vec<StoredMessageRow>) -> Vec<MessageView> {
+    rows.into_iter()
+        .map(|r| MessageView {
+            local_id: r.id as u64,
+            text: r.msg.text,
+            dir: if r.direction == 0 {
+                Direction::Out
+            } else {
+                Direction::In
+            },
+            timestamp: r.timestamp as u64,
+            status: Status::from_u8(r.msg.status),
+            sender: r.sender,
+        })
+        .collect()
 }
 
 /// Encode a `P2pPayload` to the byte slice handed to the 1:1 ratchet.

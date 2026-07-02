@@ -42,8 +42,15 @@ pub enum Command {
         text: String,
         local_id: u64,
     },
-    /// Hydrate the thread cache for `peer` from the store history.
+    /// Hydrate the thread cache for `peer` from the store history. Loads the
+    /// newest keyset page (page size chosen by the bridge); older pages are
+    /// fetched on demand via [`Command::LoadOlder`].
     LoadThread { peer: [u8; 32] },
+    /// Fetch the next older keyset page for a 1:1 thread, strictly older than
+    /// `before_id` (the smallest store row id currently in the cache). Fired
+    /// by the app when the thread's scrollable nears the top. The bridge
+    /// answers with [`crate::Event::OlderHistoryLoaded`].
+    LoadOlder { peer: [u8; 32], before_id: i64 },
 
     // ---- Group chat (Sender Keys) --------------------------------------
     /// Create a new group `name` with `members`; the founder distributes their
@@ -58,8 +65,15 @@ pub enum Command {
         text: String,
         local_id: u64,
     },
-    /// Hydrate the group thread cache from the store history.
+    /// Hydrate the group thread cache from the store history. Loads the
+    /// newest keyset page; older pages are fetched on demand via
+    /// [`Command::LoadOlderGroup`].
     LoadGroupThread { group: [u8; 32] },
+    /// Fetch the next older keyset page for a group thread, strictly older
+    /// than `before_id` (the smallest store row id currently in the cache).
+    /// Fired by the app when the group thread's scrollable nears the top. The
+    /// bridge answers with [`crate::Event::OlderHistoryLoaded`].
+    LoadOlderGroup { group: [u8; 32], before_id: i64 },
 
     // ---- Settings ------------------------------------------------------
     /// Rotate the signed prekey and re-register the bundle.

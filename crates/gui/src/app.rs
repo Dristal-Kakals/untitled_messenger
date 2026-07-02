@@ -2,7 +2,7 @@
 //! `subscription()`, and `view()`. Views never touch `um_client` or async
 //! directly — they emit `Message`s, which `update` maps to bridge `Command`s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +49,22 @@ pub struct UmApp {
     pub open_chat: Option<ChatId>,
     /// In-memory message cache per open chat. The store is source of truth.
     pub threads: HashMap<ChatId, Vec<MessageView>>,
+    /// Keyset-pagination cursor per chat: the smallest store row id currently
+    /// held in the cache for that chat. `LoadOlder`/`LoadOlderGroup` pass this
+    /// as `before_id` so the next page is strictly older than what is cached.
+    /// Set on `HistoryLoaded`/`OlderHistoryLoaded` and cleared on `Logout`.
+    /// Chats with no cached history have no entry (lookups default to "no
+    /// older page to fetch").
+    pub oldest_loaded: HashMap<ChatId, i64>,
+    /// Whether older history exists beyond the cached page for each chat.
+    /// `false` once the oldest row has been reached, so scroll-to-top stops
+    /// issuing `LoadOlder` commands (and no "loading older…" indicator is
+    /// shown). Driven by the `has_more` flag the bridge returns with each page.
+    pub has_more_history: HashMap<ChatId, bool>,
+    /// Chats with an in-flight `LoadOlder` request, so scroll-to-top does not
+    /// fire a second fetch before the first `OlderHistoryLoaded` arrives
+    /// (which would duplicate the page). Cleared on the event.
+    pub loading_older: HashSet<ChatId>,
     /// Group threads the app knows about. Hydrated from `Event::GroupsLoaded`
     /// on Unlock (the persisted `groups` table) and updated by
     /// `Event::GroupCreated` / `Event::GroupInvited` at runtime. Drives the
@@ -122,6 +138,11 @@ pub enum Message {
     VerifyFingerprint([u8; 32]),
     // Chat.
     SendPressed,
+    /// A chat thread's scrollable moved. `at_top` is true when the viewport is
+    /// pinned to the top (relative offset y ≈ 0), which the app uses to fire
+    /// `LoadOlder`/`LoadOlderGroup` for keyset history pagination — but only
+    /// if more history exists and no older page is already loading.
+    ChatScrolled { chat: ChatId, at_top: bool },
     // Group.
     CreateGroupPressed,
     // Settings.
@@ -149,6 +170,9 @@ impl UmApp {
             contacts: Vec::new(),
             open_chat: None,
             threads: HashMap::new(),
+            oldest_loaded: HashMap::new(),
+            has_more_history: HashMap::new(),
+            loading_older: HashSet::new(),
             groups: Vec::new(),
             unread: HashMap::new(),
             next_local_id: 1,
@@ -243,6 +267,42 @@ impl UmApp {
                 c.verified = true;
             }
         }
+    }
+
+    /// The smallest store row id cached for `chat`, or `None` if the cache is
+    /// empty (no cursor to page back from). Used to decide whether
+    /// scroll-to-top can fire `LoadOlder`.
+    fn oldest_loaded(&self, chat: &ChatId) -> Option<i64> {
+        self.oldest_loaded.get(chat).copied()
+    }
+
+    /// True if an older page may be fetchable for `chat`: more history is
+    /// known to exist (`has_more_history`) and no page is already in flight
+    /// (`loading_older`). Scroll-to-top checks this before sending
+    /// `LoadOlder`/`LoadOlderGroup`.
+    fn can_load_older(&self, chat: &ChatId) -> bool {
+        self.has_more_history.get(chat).copied().unwrap_or(false)
+            && !self.loading_older.contains(chat)
+    }
+
+    /// Record the keyset cursor + `has_more` for `chat` from a freshly loaded
+    /// page (initial or older). The cursor is the smallest `local_id` in the
+    /// page — which, for history-loaded rows, is the store row id (stable,
+    /// monotonic). `has_more` is stored so `can_load_older` knows when the
+    /// oldest row has been reached.
+    fn note_page(&mut self, chat: ChatId, msgs: &[MessageView], has_more: bool) {
+        if let Some(min) = msgs.iter().map(|m| m.local_id as i64).min() {
+            // `min` becomes the new cursor only if it is older than any
+            // already-cached row (older pages prepend smaller ids). For the
+            // initial page the cache was empty, so this just sets it. For an
+            // older page, the prepended rows are all older, so their min is
+            // smaller — take it.
+            let prev = self.oldest_loaded.get(&chat).copied();
+            if prev.is_none_or(|p| min < p) {
+                self.oldest_loaded.insert(chat, min);
+            }
+        }
+        self.has_more_history.insert(chat, has_more);
     }
 }
 
@@ -369,6 +429,28 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             return snap.unwrap_or_else(Task::none);
         }
 
+        Message::ChatScrolled { chat, at_top } => {
+            // Scroll-to-top fires a keyset `LoadOlder` request — but only if
+            // more history exists, no page is already loading, and we have a
+            // cursor to page back from. The bridge answers with
+            // `OlderHistoryLoaded`, which prepends the page and clears the
+            // in-flight marker.
+            if at_top
+                && app.can_load_older(&chat)
+                && let Some(before_id) = app.oldest_loaded(&chat)
+            {
+                app.loading_older.insert(chat);
+                match chat {
+                    ChatId::Peer(peer) => {
+                        app.send_cmd(Command::LoadOlder { peer, before_id });
+                    }
+                    ChatId::Group(group) => {
+                        app.send_cmd(Command::LoadOlderGroup { group, before_id });
+                    }
+                }
+            }
+        }
+
         Message::CreateGroupPressed => {
             let name = app.new_group_name.trim().to_string();
             if name.is_empty() {
@@ -417,6 +499,12 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             app.groups.clear();
             app.unread.clear();
             app.search_query.clear();
+            // Drop keyset-pagination cursors so a re-login starts each thread
+            // at its newest page (not a stale `before_id` from the prior
+            // session) and does not think an older page is in flight.
+            app.oldest_loaded.clear();
+            app.has_more_history.clear();
+            app.loading_older.clear();
             app.view = View::Login;
             app.passphrase_input.clear();
             app.connected = false;
@@ -470,9 +558,28 @@ fn handle_event(app: &mut UmApp, ev: Event) -> Task<Message> {
                 app.upsert_group(g.id, g.name, g.members);
             }
         }
-        Event::HistoryLoaded(chat, msgs) => {
-            app.threads.insert(chat, msgs);
+        Event::HistoryLoaded { chat, msgs, has_more } => {
+            // Initial page: replace the cache, then record the keyset cursor
+            // (smallest id in the page) + `has_more` so scroll-to-top knows
+            // whether older history is fetchable.
+            app.threads.insert(chat, msgs.clone());
+            app.note_page(chat, &msgs, has_more);
             return snap_for_chat(app, &chat);
+        }
+        Event::OlderHistoryLoaded { chat, msgs, has_more } => {
+            // Older page: prepend to the cached thread (the page arrives
+            // oldest-first within the slice, so it goes before the cache).
+            // The in-flight marker is cleared regardless of whether the page
+            // was empty — an empty older page with `has_more = false` means we
+            // reached the oldest row and must stop paging; an empty page with
+            // `has_more = true` (e.g. all rows on this page were corrupt and
+            // skipped) still lets a future scroll retry.
+            app.loading_older.remove(&chat);
+            let entry = app.threads.entry(chat).or_default();
+            let mut combined = msgs.clone();
+            combined.append(entry);
+            *entry = combined;
+            app.note_page(chat, &msgs, has_more);
         }
         Event::Decrypted { chat, msg } => {
             // If this chat is open, append to the visible thread. Otherwise
@@ -997,5 +1104,222 @@ mod tests {
         assert_eq!(app.total_unread(), 7);
         let _ = update(&mut app, Message::Logout);
         assert_eq!(app.total_unread(), 0, "logout clears unread → total 0");
+    }
+
+    /// Build a view-model row with an explicit store `id` (becomes
+    /// `local_id`), so pagination-cursor tests can control the keyset order.
+    fn row_with_id(id: u64, text: &str) -> MessageView {
+        MessageView {
+            local_id: id,
+            text: text.into(),
+            dir: Direction::In,
+            timestamp: 0,
+            status: Status::Delivered,
+            sender: None,
+        }
+    }
+
+    #[test]
+    fn history_loaded_records_cursor_and_has_more() {
+        // An initial page of 3 rows (ids 5,6,7) with `has_more = true` must
+        // set the cursor to the smallest id (5) and remember that older
+        // history exists, so `can_load_older` returns true.
+        let mut app = test_app();
+        let chat = ChatId::Peer([0x11; 32]);
+        let msgs = vec![
+            row_with_id(5, "m5"),
+            row_with_id(6, "m6"),
+            row_with_id(7, "m7"),
+        ];
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: msgs.clone(),
+                has_more: true,
+            },
+        );
+        assert_eq!(app.oldest_loaded(&chat), Some(5), "cursor = smallest id");
+        assert!(app.can_load_older(&chat), "has_more + not loading → can fetch");
+        assert_eq!(
+            app.threads.get(&chat).map(|t| t.len()),
+            Some(3),
+            "page cached",
+        );
+    }
+
+    #[test]
+    fn history_loaded_has_more_false_blocks_load_older() {
+        // When the initial page is the whole thread (`has_more = false`),
+        // `can_load_older` must be false even though a cursor exists.
+        let mut app = test_app();
+        let chat = ChatId::Group([0x22; 32]);
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: vec![row_with_id(1, "only")],
+                has_more: false,
+            },
+        );
+        assert_eq!(app.oldest_loaded(&chat), Some(1));
+        assert!(
+            !app.can_load_older(&chat),
+            "no older history → cannot load older",
+        );
+    }
+
+    #[test]
+    fn chat_scrolled_at_top_fires_load_older_only_when_able() {
+        // Scroll-to-top with `has_more = true` + a cursor must insert the
+        // in-flight marker (so a second scroll does not double-fire) and send
+        // a `LoadOlder` command. With `has_more = false` it must do nothing.
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        let bridge_cmd = Arc::new(tx);
+        let mut app =
+            UmApp::new(bridge_cmd, View::ContactList, Config::default());
+        let chat = ChatId::Peer([0x44; 32]);
+        app.open_chat = Some(chat);
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: vec![row_with_id(10, "m10"), row_with_id(11, "m11")],
+                has_more: true,
+            },
+        );
+
+        // at_top = true, able → fires LoadOlder with before_id = cursor (10).
+        let _ = update(
+            &mut app,
+            Message::ChatScrolled { chat, at_top: true },
+        );
+        let cmd = rx.try_recv().expect("LoadOlder command sent");
+        match cmd {
+            Command::LoadOlder { peer, before_id } => {
+                assert_eq!(peer, [0x44; 32]);
+                assert_eq!(before_id, 10, "before_id = current cursor");
+            }
+            other => panic!("expected LoadOlder, got {other:?}"),
+        }
+        assert!(
+            app.loading_older.contains(&chat),
+            "in-flight marker set",
+        );
+
+        // A second scroll-to-top while loading must NOT fire another command.
+        let _ = update(
+            &mut app,
+            Message::ChatScrolled { chat, at_top: true },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no second LoadOlder while one is in flight",
+        );
+
+        // at_top = false must never fire.
+        let _ = update(
+            &mut app,
+            Message::ChatScrolled { chat, at_top: false },
+        );
+        assert!(rx.try_recv().is_err(), "not-at-top fires nothing");
+    }
+
+    #[test]
+    fn older_history_loaded_prepends_and_clears_inflight() {
+        // An older page (ids 1,2, older than the cached 5,6,7) must be
+        // prepended to the cache, advance the cursor to the new min (1), and
+        // clear the in-flight marker. With `has_more = false` the cursor
+        // still updates and `can_load_older` becomes false.
+        let mut app = test_app();
+        let chat = ChatId::Peer([0x55; 32]);
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: vec![row_with_id(5, "m5"), row_with_id(7, "m7")],
+                has_more: true,
+            },
+        );
+        app.loading_older.insert(chat); // simulate an in-flight fetch
+
+        let older = vec![row_with_id(1, "m1"), row_with_id(2, "m2")];
+        let _ = handle_event(
+            &mut app,
+            Event::OlderHistoryLoaded {
+                chat,
+                msgs: older,
+                has_more: false,
+            },
+        );
+        let thread = app.threads.get(&chat).expect("thread cached");
+        assert_eq!(
+            thread.iter().map(|m| m.local_id).collect::<Vec<_>>(),
+            vec![1, 2, 5, 7],
+            "older page prepended before cached rows",
+        );
+        assert_eq!(app.oldest_loaded(&chat), Some(1), "cursor advanced to new min");
+        assert!(
+            !app.loading_older.contains(&chat),
+            "in-flight marker cleared",
+        );
+        assert!(!app.can_load_older(&chat), "has_more false → stop paging");
+    }
+
+    #[test]
+    fn older_history_loaded_empty_still_clears_inflight() {
+        // An empty older page (e.g. all rows corrupt and skipped) must still
+        // clear the in-flight marker so scroll-to-top can retry on a later
+        // `has_more = true`. The cursor is unchanged (no new min to take).
+        let mut app = test_app();
+        let chat = ChatId::Group([0x66; 32]);
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: vec![row_with_id(3, "m3")],
+                has_more: true,
+            },
+        );
+        app.loading_older.insert(chat);
+        let _ = handle_event(
+            &mut app,
+            Event::OlderHistoryLoaded {
+                chat,
+                msgs: Vec::new(),
+                has_more: true,
+            },
+        );
+        assert!(
+            !app.loading_older.contains(&chat),
+            "empty page still clears in-flight marker",
+        );
+        assert_eq!(app.oldest_loaded(&chat), Some(3), "cursor unchanged");
+        assert!(app.can_load_older(&chat), "still able to retry");
+    }
+
+    #[test]
+    fn logout_clears_pagination_state() {
+        // Logout must drop the keyset cursors + has_more + in-flight markers
+        // so a re-login does not carry stale pagination state forward.
+        let mut app = test_app();
+        let chat = ChatId::Peer([0x77; 32]);
+        let _ = handle_event(
+            &mut app,
+            Event::HistoryLoaded {
+                chat,
+                msgs: vec![row_with_id(9, "m9")],
+                has_more: true,
+            },
+        );
+        app.loading_older.insert(chat);
+        assert_eq!(app.oldest_loaded(&chat), Some(9));
+        let _ = update(&mut app, Message::Logout);
+        assert!(
+            app.oldest_loaded.is_empty()
+                && app.has_more_history.is_empty()
+                && app.loading_older.is_empty(),
+            "logout clears all pagination state",
+        );
     }
 }

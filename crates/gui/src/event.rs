@@ -30,8 +30,27 @@ pub enum Event {
     /// fresh distribution arrives. Each entry is id + display name.
     GroupsLoaded(Vec<GroupView>),
     /// Thread history loaded from the store (response to `LoadThread` /
-    /// `LoadGroupThread`). Replaces the cache for that chat.
-    HistoryLoaded(ChatId, Vec<MessageView>),
+    /// `LoadGroupThread`). Replaces the cache for that chat with the newest
+    /// keyset page (see `Command::LoadThread`). `has_more` is `true` when
+    /// older history exists beyond this page, so the app knows it can fetch
+    /// more on scroll-to-top. Older pages arrive as
+    /// [`Event::OlderHistoryLoaded`] and are prepended.
+    HistoryLoaded {
+        chat: ChatId,
+        msgs: Vec<MessageView>,
+        has_more: bool,
+    },
+    /// An older keyset page was loaded from the store (response to
+    /// `LoadOlder` / `LoadOlderGroup`, fired on scroll-to-top). `msgs` is
+    /// oldest-first within the page and is prepended to the cached thread.
+    /// `has_more` is `false` once the oldest row has been reached, so the app
+    /// stops requesting further pages (and can hide the "loading older…"
+    /// indicator).
+    OlderHistoryLoaded {
+        chat: ChatId,
+        msgs: Vec<MessageView>,
+        has_more: bool,
+    },
     /// An incoming message was decrypted + persisted.
     Decrypted { chat: ChatId, msg: MessageView },
     /// Our outgoing message was encrypted + sent to the relay.

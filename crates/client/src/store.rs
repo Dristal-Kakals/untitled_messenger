@@ -322,6 +322,11 @@ impl Store {
     /// (author pub for incoming group messages) is read back as plaintext
     /// metadata; rows written before the column existed have `NULL` and load
     /// as `sender = None`.
+    ///
+    /// Loads the *entire* thread in one query — fine for short histories, but
+    /// for long threads prefer [`Store::messages_page`], which fetches a
+    /// keyset page (newest N, then older pages on demand) over the same
+    /// `(peer, id)` index without pulling the whole table.
     pub fn messages(&self, peer: &[u8; 32]) -> Result<Vec<StoredMessageRow>, ClientError> {
         let mut stmt = self
             .conn
@@ -330,47 +335,86 @@ impl Store {
             )
             .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![peer.as_slice()], |r| {
-                let id: i64 = r.get(0)?;
-                let direction: i64 = r.get(1)?;
-                let sealed: Vec<u8> = r.get(2)?;
-                let timestamp: i64 = r.get(3)?;
-                let sender: Option<Vec<u8>> = r.get(4)?;
-                Ok((id, direction, sealed, timestamp, sender))
-            })
+            .query_map(rusqlite::params![peer.as_slice()], map_message_row)
             .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, direction, sealed, timestamp, sender_bytes) =
-                row.map_err(|e| ClientError::Store(format!("messages: {e}")))?;
-            let mut aad = Vec::with_capacity(32 + 1 + 8);
-            aad.extend_from_slice(peer);
-            aad.push(direction as u8);
-            aad.extend_from_slice(&timestamp.to_be_bytes());
-            let Ok(bytes) = open(&self.key, &aad, &sealed) else {
-                continue; // corrupt/tampered row: skip, keep loading
-            };
-            let msg: StoredMessage = postcard::from_bytes(&bytes)?;
-            // A present-but-wrong-length sender is corruption, not a 1:1 row:
-            // surface it rather than silently dropping the author.
-            let sender = match sender_bytes {
-                None => None,
-                Some(s) if s.len() == 32 => {
-                    let mut p = [0u8; 32];
-                    p.copy_from_slice(&s);
-                    Some(p)
-                }
-                Some(_) => return Err(ClientError::Store("corrupt sender in message row".into())),
-            };
-            out.push(StoredMessageRow {
-                id,
-                direction,
-                timestamp,
-                sender,
-                msg,
-            });
+        decode_message_rows(&self.key, peer, rows)
+    }
+
+    /// Load one keyset page of messages for `peer`, oldest-first within the
+    /// returned slice. Pagination is by row `id` (monotonic with arrival
+    /// order), walking the `(peer, id)` index in reverse so each page is a
+    /// single index range scan — no full table scan, no sort.
+    ///
+    /// `before_id = None` returns the **newest** `limit` rows (the initial
+    /// page shown when a thread opens). `before_id = Some(id)` returns up to
+    /// `limit` rows strictly older than `id` (the next page up, fetched on
+    /// scroll-to-top). The caller passes the smallest loaded `id` as
+    /// `before_id` to page further back.
+    ///
+    /// To distinguish "no more history" from "an empty page happened to load",
+    /// the query fetches `limit + 1` rows; the extra row (if any) is dropped
+    /// before returning and signals `has_more = true`. A returned `has_more =
+    /// false` means the caller has reached the oldest row and should stop
+    /// requesting older pages.
+    ///
+    /// Rows are unsealed + decoded exactly as in [`Store::messages`]; corrupt
+    /// rows are skipped (the rest of the page still loads), and the `sender`
+    /// column is read as plaintext metadata. The slice is returned oldest-first
+    /// so the caller can prepend it to the cached thread directly.
+    pub fn messages_page(
+        &self,
+        peer: &[u8; 32],
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<MessagePage, ClientError> {
+        // Fetch limit + 1 so a present (limit+1)th row proves there is more
+        // history without a second count query. The extra row is dropped below.
+        let fetch = limit.saturating_add(1) as i64;
+        // Keyset by row `id`: `before_id = None` → newest page; `Some(id)` →
+        // the page strictly older than `id`. Both walk the `(peer, id)` index
+        // in reverse (DESC), so each is a single index range scan, no sort.
+        // `decode_message_rows` fully consumes the `MappedRows` iterator (which
+        // borrows the prepared statement) and returns an owned `Vec`, so the
+        // statement is released before we leave each arm.
+        let mut rows = match before_id {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, direction, sealed, timestamp, sender FROM messages \
+                         WHERE peer = ?1 ORDER BY id DESC LIMIT ?2",
+                    )
+                    .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+                let raw = stmt
+                    .query_map(rusqlite::params![peer.as_slice(), fetch], map_message_row)
+                    .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+                decode_message_rows(&self.key, peer, raw)?
+            }
+            Some(id) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, direction, sealed, timestamp, sender FROM messages \
+                         WHERE peer = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
+                    )
+                    .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+                let raw = stmt
+                    .query_map(
+                        rusqlite::params![peer.as_slice(), id, fetch],
+                        map_message_row,
+                    )
+                    .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+                decode_message_rows(&self.key, peer, raw)?
+            }
+        };
+        // `decode_message_rows` preserves query order (DESC here). The probe
+        // row at index `limit` (if present) proves older history exists.
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit); // drop the probe row
         }
-        Ok(out)
+        rows.reverse(); // DESC → oldest-first for display
+        Ok(MessagePage { rows, has_more })
     }
 
     // ---- Groups --------------------------------------------------------
@@ -502,6 +546,90 @@ pub struct StoredMessageRow {
     /// messages (the peer is the thread key) and for all outgoing messages.
     pub sender: Option<[u8; 32]>,
     pub msg: StoredMessage,
+}
+
+/// One keyset page of message rows from [`Store::messages_page`]. `rows` is
+/// oldest-first within the page (ready to prepend to a cached thread), and
+/// `has_more` is `true` when older history exists beyond this page — the
+/// caller uses it to decide whether to fetch another page on scroll-up.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    pub rows: Vec<StoredMessageRow>,
+    pub has_more: bool,
+}
+
+/// Unseal + decode a stream of raw `messages`-table rows for `peer`. Shared by
+/// [`Store::messages`] (full thread, ASC) and [`Store::messages_page`] (keyset
+/// page, DESC) so the AAD/sender/skip-corrupt logic lives in one place. The
+/// rows are returned in the order the iterator yields them — callers that want
+/// oldest-first from a DESC query reverse the result themselves.
+///
+/// Corrupt/tampered rows are skipped (the rest still load), so a single bad
+/// blob never hides the whole thread or page. A present-but-wrong-length
+/// `sender` is corruption, not a 1:1 row, and is surfaced rather than silently
+/// dropping the author label.
+fn decode_message_rows<I>(
+    key: &[u8; 32],
+    peer: &[u8; 32],
+    rows: I,
+) -> Result<Vec<StoredMessageRow>, ClientError>
+where
+    I: Iterator<Item = rusqlite::Result<RawMessageRow>>,
+{
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, direction, sealed, timestamp, sender_bytes) =
+            row.map_err(|e| ClientError::Store(format!("messages: {e}")))?;
+        // Re-derive the per-row AAD exactly as `put_message` built it: peer +
+        // direction + timestamp. The peer is the same for every row in this
+        // thread (the WHERE pins it); direction + timestamp vary per row and
+        // must match what was sealed.
+        let mut aad = Vec::with_capacity(32 + 1 + 8);
+        aad.extend_from_slice(peer);
+        aad.push(direction as u8);
+        aad.extend_from_slice(&timestamp.to_be_bytes());
+        let Ok(bytes) = open(key, &aad, &sealed) else {
+            continue; // corrupt/tampered row: skip, keep loading
+        };
+        let msg: StoredMessage = postcard::from_bytes(&bytes)?;
+        let sender = match sender_bytes {
+            None => None,
+            Some(s) if s.len() == 32 => {
+                let mut p = [0u8; 32];
+                p.copy_from_slice(&s);
+                Some(p)
+            }
+            Some(_) => return Err(ClientError::Store("corrupt sender in message row".into())),
+        };
+        out.push(StoredMessageRow {
+            id,
+            direction,
+            timestamp,
+            sender,
+            msg,
+        });
+    }
+    Ok(out)
+}
+
+/// The raw five-column tuple read off a `messages`-table row by
+/// [`map_message_row`]: `(id, direction, sealed, timestamp, sender)`. A type
+/// alias (rather than an inline tuple) keeps `map_message_row`'s signature and
+/// `decode_message_rows`'s bound readable and shared.
+type RawMessageRow = (i64, i64, Vec<u8>, i64, Option<Vec<u8>>);
+
+/// `query_map` row mapper for the `messages` table: reads the five columns
+/// (`id, direction, sealed, timestamp, sender`) into a tuple. A free function
+/// (not a closure) so both `messages` and `messages_page` can pass it without
+/// each spawning a distinct closure type (which would make the two `query_map`
+/// calls' `MappedRows` types incompatible).
+fn map_message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> {
+    let id: i64 = r.get(0)?;
+    let direction: i64 = r.get(1)?;
+    let sealed: Vec<u8> = r.get(2)?;
+    let timestamp: i64 = r.get(3)?;
+    let sender: Option<Vec<u8>> = r.get(4)?;
+    Ok((id, direction, sealed, timestamp, sender))
 }
 
 /// A stored contact: identity pub, display nickname, fingerprint, and whether
@@ -1015,6 +1143,222 @@ mod tests {
             )
             .unwrap();
         assert!(still, "idx_messages_peer_id lost after reopen");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Insert `n` numbered messages for `peer` ("m0".."m{n-1}") with ascending
+    /// timestamps, returning the assigned row ids in insertion order. Other
+    /// peers get a single message each so cross-peer isolation can be checked.
+    fn seed_thread(store: &Store, peer: &[u8; 32], n: u32) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let id = store
+                .put_message(
+                    peer,
+                    (i % 2) as i64,
+                    &StoredMessage {
+                        text: format!("m{i}"),
+                        status: 2,
+                    },
+                    1_700_000_000 + i as i64,
+                    if i % 2 == 1 { Some(peer) } else { None },
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn messages_page_newest_returns_last_n_oldest_first() {
+        // Seed 5 messages; ask for the newest 3. The page must be the last 3
+        // in oldest-first order (m2, m3, m4), and `has_more` must be true
+        // because older rows exist beyond the page.
+        let path = tmp();
+        let peer = [0x44; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &peer, 5);
+        let page = store.messages_page(&peer, None, 3).unwrap();
+        assert!(page.has_more, "older rows exist → has_more true");
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(
+            page.rows.iter().map(|r| r.msg.text.clone()).collect::<Vec<_>>(),
+            vec!["m2", "m3", "m4"],
+            "newest page is oldest-first within the slice"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_before_id_pages_older() {
+        // Seed 5; take newest 3 (m2,m3,m4), then page older with before_id =
+        // the smallest id in that page. The next page must be the remaining
+        // oldest rows (m0,m1) with has_more = false (no rows older than m0).
+        let path = tmp();
+        let peer = [0x55; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &peer, 5);
+        let first = store.messages_page(&peer, None, 3).unwrap();
+        let oldest_in_page = first.rows.first().unwrap().id;
+        let second = store
+            .messages_page(&peer, Some(oldest_in_page), 3)
+            .unwrap();
+        assert!(
+            !second.has_more,
+            "no rows older than the oldest in the first page → has_more false"
+        );
+        assert_eq!(second.rows.len(), 2, "only 2 rows remain older than the page");
+        assert_eq!(
+            second.rows.iter().map(|r| r.msg.text.clone()).collect::<Vec<_>>(),
+            vec!["m0", "m1"],
+            "older page is oldest-first"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_union_equals_full_thread() {
+        // The union of all pages (newest-first walk) must cover exactly the
+        // full `messages()` result — no gaps, no duplicates. The pages
+        // themselves arrive newest-page-first (so the walk yields rows in
+        // reverse-arrival order); compare by id set + per-id content, not by
+        // sequence, since the walk order differs from oldest-first display.
+        let path = tmp();
+        let peer = [0x66; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &peer, 7);
+        let full = store.messages(&peer).unwrap();
+        let mut collected: Vec<StoredMessageRow> = Vec::new();
+        let mut before: Option<i64> = None;
+        loop {
+            let page = store.messages_page(&peer, before, 3).unwrap();
+            collected.extend_from_slice(&page.rows);
+            if !page.has_more {
+                break;
+            }
+            // The oldest id in this page is the keyset cursor for the next.
+            before = Some(page.rows.first().unwrap().id);
+        }
+        assert_eq!(collected.len(), full.len(), "no rows lost or duplicated");
+        // Same set of ids, same text per id — order-independent.
+        let mut col_by_id: Vec<(i64, String)> =
+            collected.iter().map(|r| (r.id, r.msg.text.clone())).collect();
+        let mut full_by_id: Vec<(i64, String)> =
+            full.iter().map(|r| (r.id, r.msg.text.clone())).collect();
+        col_by_id.sort_by_key(|(id, _)| *id);
+        full_by_id.sort_by_key(|(id, _)| *id);
+        assert_eq!(col_by_id, full_by_id, "paged walk covers full thread");
+        // No id appears twice across pages.
+        let mut ids: Vec<i64> = collected.iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len(),
+            "no duplicate ids across pages");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_isolates_peer() {
+        // Rows for a different peer must never leak into another peer's page.
+        let path = tmp();
+        let a = [0x77; 32];
+        let b = [0x88; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &a, 3);
+        seed_thread(&store, &b, 3);
+        let page = store.messages_page(&a, None, 10).unwrap();
+        assert_eq!(page.rows.len(), 3, "only peer a's rows");
+        assert!(
+            page.rows.iter().all(|r| r.msg.text.starts_with('m')),
+            "peer a rows present"
+        );
+        assert!(
+            !page.has_more,
+            "peer a has exactly 3 rows, page of 10 → no more"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_empty_thread_returns_empty_no_more() {
+        let path = tmp();
+        let peer = [0x99; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        let page = store.messages_page(&peer, None, 20).unwrap();
+        assert!(page.rows.is_empty());
+        assert!(!page.has_more, "empty thread → no older history");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_limit_zero_returns_empty_but_reports_more() {
+        // A zero-width page fetches limit+1 = 1 probe row, so it returns no
+        // display rows yet still reports `has_more` if any history exists.
+        // This documents the probe-row semantics; callers should use limit ≥ 1.
+        let path = tmp();
+        let peer = [0xAA; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &peer, 2);
+        let page = store.messages_page(&peer, None, 0).unwrap();
+        assert!(page.rows.is_empty(), "limit 0 → no display rows");
+        assert!(page.has_more, "probe row proves history exists");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_preserves_sender_metadata() {
+        // The `sender` column (author pub for incoming group messages) must
+        // round-trip through the paged path exactly as through `messages()`.
+        let path = tmp();
+        let peer = [0xBB; 32];
+        let author = [0xCC; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "hi".into(),
+                    status: 2,
+                },
+                1_700_000_000,
+                Some(&author),
+            )
+            .unwrap();
+        let page = store.messages_page(&peer, None, 10).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].sender, Some(author), "sender preserved in page");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_page_uses_index_not_full_scan() {
+        // The keyset query (`WHERE peer = ?1 AND id < ?2 ORDER BY id DESC
+        // LIMIT ?3`) must use `idx_messages_peer_id` (a reverse range scan),
+        // not a full table scan + sort. Assert the plan mentions the index.
+        let path = tmp();
+        let peer = [0xDD; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        seed_thread(&store, &peer, 5);
+        let plan: String = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id, direction, sealed, timestamp, sender FROM messages \
+                 WHERE peer = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![peer.as_slice(), 3i64, 2i64], |r| {
+                let s: String = r.get(3)?;
+                Ok(s)
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_messages_peer_id") || plan.contains("COVERING INDEX"),
+            "paged query did not use the index; plan = {plan:?}"
+        );
         let _ = fs::remove_file(&path);
     }
 
