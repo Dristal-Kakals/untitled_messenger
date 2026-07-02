@@ -3,8 +3,24 @@
 //! Lost on restart (per the locked design decision). All access goes through
 //! `Store`, which is `Send + Sync` via an internal mutex.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use um_protocol::{EncryptedEnvelope, PreKeyBundle};
+
+/// Maximum undelivered envelopes buffered per recipient outbox. A recipient
+/// that never `Ack`s (gone offline long-term, or a malicious/buggy client
+/// that polls but never acks) would otherwise let a sender flood its outbox
+/// without bound → relay OOM. The connection-flood / write-timeout guards
+/// bound the *rate* of arrival, but not the *accumulated* backlog for a
+/// single never-acking recipient; this cap is the memory backstop.
+///
+/// Eviction is FIFO: when a `deliver` would exceed the cap the oldest
+/// undelivered envelope is dropped. Newer envelopes survive; the dropped id
+/// is simply absent from future `poll`/`Subscribe`-flush results (the
+/// recipient never acked it, so it was never displayed). A legitimate
+/// recipient polls and acks promptly and never approaches the cap; only a
+/// never-acking recipient accumulates, which is exactly the vector bounded
+/// here.
+pub const MAX_OUTBOX_PER_RECIPIENT: usize = 4096;
 
 /// In-memory relay state. One instance shared across all connections
 /// (`Arc<Store>`). All mutations go through the internal mutex.
@@ -15,23 +31,36 @@ pub struct Store {
 struct StoreInner {
     /// Registered identity pub -> prekey bundle.
     bundles: HashMap<[u8; 32], PreKeyBundle>,
-    /// Recipient identity pub -> undelivered envelopes (FIFO outbox).
-    outboxes: HashMap<[u8; 32], Vec<EncryptedEnvelope>>,
+    /// Recipient identity pub -> undelivered envelopes (FIFO outbox). A
+    /// `VecDeque` for O(1) back-push / front-evict; bounded to
+    /// `max_outbox_per_recipient` entries per recipient.
+    outboxes: HashMap<[u8; 32], VecDeque<EncryptedEnvelope>>,
     /// Identities that have completed `Register`.
     registered: HashSet<[u8; 32]>,
     /// Monotonic envelope id counter.
     next_envelope_id: u64,
+    /// Per-recipient outbox cap (see [`MAX_OUTBOX_PER_RECIPIENT`]).
+    max_outbox_per_recipient: usize,
 }
 
 impl Store {
-    /// Create an empty store.
+    /// Create an empty store with the production outbox cap
+    /// ([`MAX_OUTBOX_PER_RECIPIENT`]).
     pub fn new() -> Self {
+        Self::with_outbox_cap(MAX_OUTBOX_PER_RECIPIENT)
+    }
+
+    /// Create an empty store with a caller-supplied per-recipient outbox cap.
+    /// Production uses [`Store::new`] (the default constant); tests shrink the
+    /// cap so eviction is exercised with a handful of delivers instead of 4097.
+    pub fn with_outbox_cap(max_outbox_per_recipient: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(StoreInner {
                 bundles: HashMap::new(),
                 outboxes: HashMap::new(),
                 registered: HashSet::new(),
                 next_envelope_id: 1,
+                max_outbox_per_recipient,
             }),
         }
     }
@@ -74,6 +103,7 @@ impl Store {
         mut envelope: EncryptedEnvelope,
     ) -> Vec<([u8; 32], u64, EncryptedEnvelope)> {
         let mut g = self.inner.lock().expect("store mutex poisoned");
+        let cap = g.max_outbox_per_recipient;
         let mut out = Vec::with_capacity(recipients.len());
         for recipient in recipients {
             if !g.registered.contains(recipient) {
@@ -82,10 +112,16 @@ impl Store {
             envelope.id = g.next_envelope_id;
             g.next_envelope_id += 1;
             let id = envelope.id;
-            g.outboxes
-                .entry(*recipient)
-                .or_default()
-                .push(envelope.clone());
+            let outbox = g.outboxes.entry(*recipient).or_default();
+            // FIFO eviction: if the recipient has never acked and the outbox
+            // is at the cap, drop the oldest undelivered envelope to make
+            // room. Keeps the per-recipient backlog bounded against an
+            // un-acking recipient flood; a promptly-acking recipient never
+            // triggers this.
+            if outbox.len() >= cap {
+                outbox.pop_front();
+            }
+            outbox.push_back(envelope.clone());
             out.push((*recipient, id, envelope.clone()));
         }
         out
@@ -103,10 +139,17 @@ impl Store {
     }
 
     /// Drop the acknowledged envelopes (by id) from `identity`'s outbox.
+    /// Builds a `HashSet` of acked ids so each outbox scan is O(outbox) not
+    /// O(outbox × acks) — a batched `Ack` of N ids against an outbox of M
+    /// envelopes was O(M·N) with `Vec::contains`; now O(M + N).
     pub fn ack(&self, identity: &[u8; 32], envelope_ids: &[u64]) {
         let mut g = self.inner.lock().expect("store mutex poisoned");
         if let Some(outbox) = g.outboxes.get_mut(identity) {
-            outbox.retain(|e| !envelope_ids.contains(&e.id));
+            if envelope_ids.is_empty() {
+                return;
+            }
+            let acked: HashSet<u64> = envelope_ids.iter().copied().collect();
+            outbox.retain(|e| !acked.contains(&e.id));
         }
     }
 
@@ -120,7 +163,12 @@ impl Store {
     #[cfg(feature = "test-helpers")]
     pub fn reinsert_envelope(&self, identity: &[u8; 32], envelope: EncryptedEnvelope) {
         let mut g = self.inner.lock().expect("store mutex poisoned");
-        g.outboxes.entry(*identity).or_default().push(envelope);
+        let cap = g.max_outbox_per_recipient;
+        let outbox = g.outboxes.entry(*identity).or_default();
+        if outbox.len() >= cap {
+            outbox.pop_front();
+        }
+        outbox.push_back(envelope);
     }
 }
 
@@ -272,5 +320,135 @@ mod tests {
         let store = Store::new();
         // Should not panic.
         store.ack(&[0xFF; 32], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn outbox_cap_evicts_oldest_when_full() {
+        // Cap of 3 so a 4th deliver evicts id 1 (the oldest).
+        let store = Store::with_outbox_cap(3);
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        // Bob never acks; deliver 4 envelopes. Only the newest 3 survive.
+        for _ in 0..4 {
+            store.deliver(&[bob], envelope(0));
+        }
+        let polled = store.poll(&bob, 0);
+        assert_eq!(polled.len(), 3, "capped at 3, oldest evicted");
+        // FIFO eviction: ids 2, 3, 4 remain; id 1 was dropped.
+        assert_eq!(polled[0].id, 2);
+        assert_eq!(polled[1].id, 3);
+        assert_eq!(polled[2].id, 4);
+    }
+
+    #[test]
+    fn outbox_cap_preserves_newest_under_flood() {
+        // A never-acking recipient under a flood keeps only the newest cap
+        // envelopes; the backlog cannot grow unbounded.
+        let store = Store::with_outbox_cap(8);
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        for _ in 0..100 {
+            store.deliver(&[bob], envelope(0));
+        }
+        let polled = store.poll(&bob, 0);
+        assert_eq!(polled.len(), 8, "backlog bounded at cap after 100 delivers");
+        // The newest 8 ids are 93..=100.
+        assert_eq!(polled[0].id, 93);
+        assert_eq!(polled[7].id, 100);
+    }
+
+    #[test]
+    fn outbox_cap_per_recipient_isolation() {
+        // Eviction is per-recipient: flooding bob's outbox does not evict
+        // from alice's.
+        let store = Store::with_outbox_cap(2);
+        let alice = [0x01; 32];
+        let bob = [0x02; 32];
+        store.register(bundle(alice));
+        store.register(bundle(bob));
+        store.deliver(&[alice], envelope(0));
+        // Flood bob past its cap.
+        for _ in 0..5 {
+            store.deliver(&[bob], envelope(0));
+        }
+        // Alice's single envelope survives untouched.
+        assert_eq!(store.poll(&alice, 0).len(), 1);
+        assert_eq!(store.poll(&alice, 0)[0].id, 1);
+        // Bob is capped at 2. Alice got id 1; bob's 5 delivers got ids 2..=6,
+        // so the newest 2 (ids 5, 6) survive — ids 2, 3, 4 evicted FIFO.
+        let bob_polled = store.poll(&bob, 0);
+        assert_eq!(bob_polled.len(), 2);
+        assert_eq!(bob_polled[0].id, 5);
+        assert_eq!(bob_polled[1].id, 6);
+    }
+
+    #[test]
+    fn outbox_cap_ack_frees_room_then_no_eviction() {
+        // A promptly-acking recipient frees room as it acks, so subsequent
+        // delivers do not evict — the cap only bites never-acking recipients.
+        let store = Store::with_outbox_cap(3);
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        for _ in 0..3 {
+            store.deliver(&[bob], envelope(0));
+        }
+        // Bob acks all 3; outbox is now empty.
+        store.ack(&bob, &[1, 2, 3]);
+        assert!(store.poll(&bob, 0).is_empty());
+        // 3 more delivers fit without eviction (outbox was empty).
+        for _ in 0..3 {
+            store.deliver(&[bob], envelope(0));
+        }
+        let polled = store.poll(&bob, 0);
+        assert_eq!(polled.len(), 3);
+        // ids 4, 5, 6 — none evicted (all present).
+        assert_eq!(polled[0].id, 4);
+        assert_eq!(polled[2].id, 6);
+    }
+
+    #[test]
+    fn ack_batched_is_efficient_and_correct() {
+        // Ack a batch of ids; only those are dropped, the rest survive. This
+        // exercises the HashSet-based retain against the old O(M·N) contains.
+        let store = Store::new();
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        for _ in 0..6 {
+            store.deliver(&[bob], envelope(0));
+        }
+        // Ack a non-contiguous batch: ids 2, 4, 6.
+        store.ack(&bob, &[6, 2, 4]);
+        let polled = store.poll(&bob, 0);
+        let remaining: Vec<u64> = polled.iter().map(|e| e.id).collect();
+        assert_eq!(remaining, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn ack_empty_batch_is_noop() {
+        let store = Store::new();
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        store.deliver(&[bob], envelope(0));
+        store.ack(&bob, &[]);
+        assert_eq!(store.poll(&bob, 0).len(), 1);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn reinsert_envelope_respects_cap() {
+        // The test-helper reinsert path also bounds the outbox; reinserting
+        // past the cap evicts the oldest (so a test simulating lost-ack
+        // re-delivery cannot itself grow the outbox unbounded).
+        let store = Store::with_outbox_cap(2);
+        let bob = [0x02; 32];
+        store.register(bundle(bob));
+        store.deliver(&[bob], envelope(0)); // id 1
+        store.deliver(&[bob], envelope(0)); // id 2
+        // Reinsert a third (lost-ack sim) — evicts id 1.
+        store.reinsert_envelope(&bob, envelope(99));
+        let polled = store.poll(&bob, 0);
+        assert_eq!(polled.len(), 2);
+        assert_eq!(polled[0].id, 2);
+        assert_eq!(polled[1].id, 99);
     }
 }

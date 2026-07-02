@@ -1079,9 +1079,30 @@ async fn bridge_redelivery_dedups_decrypted_event() {
             // any ack. `poll(identity, 0)` returns every envelope with id > 0
             // WITHOUT removing it from the outbox, so this is a non-destructive
             // snapshot of the re-delivery candidate.
-            let pending = server_store.poll(&bob_pub, 0);
-            assert_eq!(pending.len(), 1, "one envelope pending for offline bob");
-            let captured = pending[0].clone();
+            //
+            // `Event::Sent` only confirms the `Send` frame was written to the
+            // socket; the relay processes it asynchronously in its accept-loop
+            // task, so the envelope may not yet be in bob's outbox when we
+            // reach this point. Poll with a bounded retry instead of a one-shot
+            // assert so the test is deterministic regardless of scheduling.
+            let captured = {
+                let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+                tokio::pin!(deadline);
+                loop {
+                    let pending = server_store.poll(&bob_pub, 0);
+                    if pending.len() == 1 {
+                        break pending[0].clone();
+                    }
+                    tokio::select! {
+                        biased;
+                        () = &mut deadline => panic!(
+                            "one envelope pending for offline bob; got {} before timeout",
+                            pending.len()
+                        ),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    }
+                }
+            };
             let env_id = captured.id;
 
             // Bring bob back online with the SAME store + session: reopen the
@@ -1150,12 +1171,27 @@ async fn bridge_redelivery_dedups_decrypted_event() {
             if let Event::Decrypted { msg, .. } = &first {
                 assert_eq!(msg.local_id, env_id, "local_id == relay envelope id");
             }
-            // Let bob's best-effort ack reach the relay.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            assert!(
-                server_store.poll(&bob_pub, 0).is_empty(),
-                "ack dropped the envelope after delivery #1"
-            );
+            // Let bob's best-effort ack reach the relay. The ack is sent
+            // during the Subscribe drain (before this Decrypted was emitted),
+            // but the relay processes it asynchronously; retry the empty-poll
+            // check for a short window instead of a fixed 200ms sleep so the
+            // test is robust to scheduling jitter.
+            {
+                let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+                tokio::pin!(deadline);
+                loop {
+                    if server_store.poll(&bob_pub, 0).is_empty() {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = &mut deadline => panic!(
+                            "ack dropped the envelope after delivery #1 (still pending)"
+                        ),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    }
+                }
+            }
 
             // Simulate a LOST ACK from the relay's perspective: the client
             // thought it acked, but the relay never recorded it, so the
@@ -1215,12 +1251,25 @@ async fn bridge_redelivery_dedups_decrypted_event() {
 
             // The relay outbox must be empty now: the bridge acked the
             // re-delivered envelope even though it was a local duplicate, so
-            // the relay stops re-flushing it on future Subscribes.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            assert!(
-                server_store.poll(&bob_pub, 0).is_empty(),
-                "re-delivered envelope acked → dropped from outbox"
-            );
+            // the relay stops re-flushing it on future Subscribes. Retry the
+            // empty-poll check for a short window — the ack is processed
+            // asynchronously by the relay.
+            {
+                let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+                tokio::pin!(deadline);
+                loop {
+                    if server_store.poll(&bob_pub, 0).is_empty() {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = &mut deadline => panic!(
+                            "re-delivered envelope acked → dropped from outbox (still pending)"
+                        ),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    }
+                }
+            }
 
             // The store holds exactly ONE row for the 1:1 thread (keyed by the
             // peer identity pub): the original delivery, not a duplicate from
