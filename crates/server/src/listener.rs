@@ -116,8 +116,23 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
             let (msg, consumed): (ClientMessage, usize) = match decode(&buf) {
                 Ok((msg, consumed)) => (msg, consumed),
                 Err(um_protocol::ProtocolError::Incomplete) => break, // need more bytes
+                Err(um_protocol::ProtocolError::FrameTooLarge(_)) => {
+                    // A frame whose length header exceeds MAX_FRAME_SIZE. Tell
+                    // the client why before closing, so it can log a precise
+                    // error instead of a bare EOF. Per the spec the connection
+                    // is still closed — the oversized frame cannot be skipped
+                    // because the length prefix is untrusted and the stream is
+                    // no longer frame-aligned.
+                    send_error(&mut writer, um_protocol::ServerError::TooLarge).await;
+                    return;
+                }
                 Err(_) => {
-                    // Malformed frame: close the connection.
+                    // A complete-length frame that failed to deserialize
+                    // (postcard decode error). The bytes were frame-aligned, so
+                    // we *could* drain and continue, but a malformed frame
+                    // indicates a protocol/version mismatch; per the spec we
+                    // surface the error and close the connection.
+                    send_error(&mut writer, um_protocol::ServerError::MalformedFrame).await;
                     return;
                 }
             };
@@ -187,5 +202,15 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
     // Cleanup: remove our subscriber entry only if it is still ours.
     if let (Some(id), Some(tx)) = (self_id, push_tx.as_ref()) {
         subs.unregister_if_match(&id, tx);
+    }
+}
+
+/// Best-effort write of a single `ServerError` frame, then the caller closes
+/// the connection. A write failure is ignored — the connection is being torn
+/// down regardless, and the error frame is advisory (the client observes it if
+/// it can, EOF otherwise).
+async fn send_error(writer: &mut tokio::net::tcp::OwnedWriteHalf, err: um_protocol::ServerError) {
+    if let Ok(frame) = encode(&ServerMessage::Error(err)) {
+        let _ = writer.write_all(&frame).await;
     }
 }

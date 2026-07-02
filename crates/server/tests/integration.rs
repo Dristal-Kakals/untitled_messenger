@@ -256,3 +256,71 @@ async fn poll_before_register_errors() {
         "expected close or NotRegistered, got {msg:?}"
     );
 }
+
+/// A frame whose 4-byte length header claims more than `MAX_FRAME_SIZE` bytes
+/// must be rejected with `ServerError::TooLarge` (then the connection closes).
+/// Before the fix the server lumped this into the generic malformed-frame arm
+/// and silently closed, so the client saw a bare EOF and the `TooLarge` variant
+/// was dead code on the wire.
+#[tokio::test]
+async fn oversized_frame_rejected_with_too_large() {
+    use um_protocol::framing::MAX_FRAME_SIZE;
+
+    let store = Arc::new(Store::new());
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
+
+    let mut alice = TestClient::connect(addr).await;
+    // Craft a length header claiming MAX_FRAME_SIZE + 1 bytes, followed by a
+    // few junk bytes (the server reads the header, rejects, and never reads the
+    // claimed body).
+    let len = (MAX_FRAME_SIZE + 1) as u32;
+    let mut bad = Vec::new();
+    bad.extend_from_slice(&len.to_be_bytes());
+    bad.extend_from_slice(&[0u8; 8]);
+    alice.writer.write_all(&bad).await.expect("write bad frame");
+
+    // The server must reply with Error(TooLarge) before closing.
+    let msg = alice.recv().await;
+    assert!(
+        matches!(
+            msg,
+            Some(ServerMessage::Error(um_protocol::ServerError::TooLarge))
+        ),
+        "expected Error(TooLarge), got {msg:?}"
+    );
+}
+
+/// A complete-length frame whose body is not a valid postcard `ClientMessage`
+/// must be rejected with `ServerError::MalformedFrame` (then the connection
+/// closes). The length header is honest (matches the junk body length) so the
+/// frame is fully read and the failure is purely a deserialize error — the
+/// `MalformedFrame` path, distinct from `TooLarge`.
+#[tokio::test]
+async fn malformed_frame_rejected_with_malformed_frame() {
+    let store = Arc::new(Store::new());
+    let addr = serve("127.0.0.1:0", store, Arc::new(Subscribers::new()))
+        .await
+        .expect("serve");
+
+    let mut alice = TestClient::connect(addr).await;
+    // An honest length header wrapping bytes that are not a valid ClientMessage
+    // encoding (postcard will reject this variant tag).
+    let junk = [0xFFu8; 16];
+    let mut bad = Vec::new();
+    bad.extend_from_slice(&(junk.len() as u32).to_be_bytes());
+    bad.extend_from_slice(&junk);
+    alice.writer.write_all(&bad).await.expect("write bad frame");
+
+    let msg = alice.recv().await;
+    assert!(
+        matches!(
+            msg,
+            Some(ServerMessage::Error(
+                um_protocol::ServerError::MalformedFrame
+            ))
+        ),
+        "expected Error(MalformedFrame), got {msg:?}"
+    );
+}
