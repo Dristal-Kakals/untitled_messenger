@@ -12,7 +12,7 @@ use iced::alignment;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, hex32, matches_query, short_hex};
+use super::{Message, UmApp, hex32, query_rank, short_hex};
 use crate::ChatId;
 use crate::theme;
 
@@ -77,7 +77,6 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
 
     // ---- Contacts list (scrollable).
     let mut list = column![text("Contacts").size(20),].spacing(4);
-    let mut shown_contacts = 0u32;
     if app.contacts.is_empty() {
         list = list.push(
             text("No contacts yet — add one by pasting their identity pub below.")
@@ -85,15 +84,25 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
                 .size(13),
         );
     }
-    for c in &app.contacts {
-        let id_hex = hex32(&c.identity_pub);
-        if !matches_query(
-            &app.search_query,
-            &[&c.nickname, &id_hex, &short_hex(&c.identity_pub)],
-        ) {
-            continue;
-        }
-        shown_contacts += 1;
+    // Rank every contact against the query and drop non-matches, then sort
+    // by rank (best first). Stable sort preserves the original `app.contacts`
+    // order for ties (e.g. empty query → rank 0 for all → original order),
+    // so an unfiltered list keeps its insertion order.
+    let mut ranked: Vec<(u32, &um_gui::types::ContactView)> = app
+        .contacts
+        .iter()
+        .filter_map(|c| {
+            let id_hex = hex32(&c.identity_pub);
+            query_rank(
+                &app.search_query,
+                &[&c.nickname, &id_hex, &short_hex(&c.identity_pub)],
+            )
+            .map(|r| (r, c))
+        })
+        .collect();
+    ranked.sort_by_key(|(r, _)| *r);
+    let shown_contacts = ranked.len() as u32;
+    for (_, c) in &ranked {
         let chat = ChatId::Peer(c.identity_pub);
         let is_open = app.open_chat == Some(chat);
         let badge = app
@@ -154,16 +163,23 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
 
     // ---- Groups section.
     let mut groups = column![section("Groups"),].spacing(4);
-    let mut shown_groups = 0u32;
     if app.groups.is_empty() {
         groups = groups.push(text("(no groups yet)").color(theme::MUTED).size(13));
     }
-    for g in &app.groups {
-        let id_hex = hex32(&g.id);
-        if !matches_query(&app.search_query, &[&g.name, &id_hex, &short_hex(&g.id)]) {
-            continue;
-        }
-        shown_groups += 1;
+    // Rank + sort groups the same way as contacts (best match first, stable
+    // for ties so the persisted roster order holds when the query is empty).
+    let mut ranked_groups: Vec<(u32, &um_gui::types::GroupView)> = app
+        .groups
+        .iter()
+        .filter_map(|g| {
+            let id_hex = hex32(&g.id);
+            query_rank(&app.search_query, &[&g.name, &id_hex, &short_hex(&g.id)])
+                .map(|r| (r, g))
+        })
+        .collect();
+    ranked_groups.sort_by_key(|(r, _)| *r);
+    let shown_groups = ranked_groups.len() as u32;
+    for (_, g) in &ranked_groups {
         let chat = ChatId::Group(g.id);
         let is_open = app.open_chat == Some(chat);
         let badge = app

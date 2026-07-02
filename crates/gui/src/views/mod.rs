@@ -79,12 +79,63 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
 /// lowercase hex of the identity pub or group id. Pure, testable.
 ///
 /// Whitespace in the query is ignored so a stray space never hides everything.
+///
+/// Thin wrapper over [`query_rank`]: a row matches iff it has a rank.
+/// Kept for direct callers/tests even though the sidebar now sorts via
+/// [`query_rank`] directly.
+#[allow(dead_code)]
 pub fn matches_query(query: &str, haystacks: &[&str]) -> bool {
+    query_rank(query, haystacks).is_some()
+}
+
+/// Ranked match for the sidebar search box. Returns `Some(score)` when the
+/// query matches at least one haystack, `None` when it matches none. Lower
+/// score = better match; the sidebar sorts rows ascending by score so the
+/// best hits float to the top. Empty/whitespace query matches everything with
+/// score `0` (all rows tie → original order preserved by stable sort).
+///
+/// Scoring (per haystack; the minimum across haystacks wins):
+/// - **tier 0** — exact (case-insensitive) equality, e.g. query `"bob"` vs
+///   nickname `"Bob"`. Best.
+/// - **tier 1** — prefix match, e.g. `"bo"` vs `"Bob"`.
+/// - **tier 2** — substring match anywhere, e.g. `"ob"` vs `"Bob"`.
+///
+/// Within a tier, an earlier match position scores lower (so `"al"` at the
+/// start of `"alice"` beats `"al"` later in `"real"`).
+///
+/// A haystack that looks like a hex id (≥8 chars, all ASCII hex digits or
+/// the `…` ellipsis used by [`short_hex`]) is penalized by `+500` so a name
+/// hit always sorts above a hex-id hit for the same query — pasting part of
+/// a pubkey still finds the contact, but it drops below nickname matches.
+///
+/// The score is `tier * 1000 + position + id_penalty`. The `1000` gap between
+/// tiers dwarfs any realistic position (names are short), so tier dominates;
+/// position only breaks ties within a tier.
+pub fn query_rank(query: &str, haystacks: &[&str]) -> Option<u32> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
-        return true;
+        return Some(0);
     }
-    haystacks.iter().any(|h| h.to_lowercase().contains(&q))
+    let mut best: Option<u32> = None;
+    for h in haystacks {
+        let hl = h.to_lowercase();
+        let (tier, pos) = if hl == q {
+            (0u32, 0u32)
+        } else if hl.starts_with(&q) {
+            (1, 0u32)
+        } else if let Some(p) = hl.find(&q) {
+            (2, p as u32)
+        } else {
+            continue;
+        };
+        // A hex-id haystack (full 64-char pub or the short "abababab…" form)
+        // ranks below a name haystack for the same query so nickname hits
+        // surface first. `…` is the trailing ellipsis [`short_hex`] appends.
+        let is_id = h.len() >= 8 && h.chars().all(|c| c.is_ascii_hexdigit() || c == '…');
+        let score = tier * 1000 + pos + u32::from(is_id) * 500;
+        best = Some(best.map_or(score, |b: u32| b.min(score)));
+    }
+    best
 }
 
 /// Format a unix-seconds timestamp as `HH:MM` (UTC). Returns `""` for `0`
@@ -242,5 +293,70 @@ mod tests {
     #[test]
     fn matches_query_ignores_surrounding_whitespace() {
         assert!(matches_query("  bob  ", &["bob"]));
+    }
+
+    #[test]
+    fn query_rank_empty_is_zero() {
+        assert_eq!(query_rank("", &["bob"]), Some(0));
+        assert_eq!(query_rank("   ", &["bob"]), Some(0));
+    }
+
+    #[test]
+    fn query_rank_no_match_is_none() {
+        assert_eq!(query_rank("zzz", &["bob", "deadbeef…"]), None);
+    }
+
+    #[test]
+    fn query_rank_exact_beats_prefix_beats_substring() {
+        // "bob" exact, "bobby" prefix, "barboba" substring.
+        let exact = query_rank("bob", &["bob"]).unwrap();
+        let prefix = query_rank("bob", &["bobby"]).unwrap();
+        let substr = query_rank("bob", &["barboba"]).unwrap();
+        assert!(exact < prefix, "{exact} should beat {prefix}");
+        assert!(prefix < substr, "{prefix} should beat {substr}");
+    }
+
+    #[test]
+    fn query_rank_earlier_position_beats_later_within_tier() {
+        // Both substring (tier 2) matches; "al" at pos 0 in "alice" beats
+        // "al" at pos 2 in "real".
+        let early = query_rank("al", &["alice"]).unwrap();
+        let late = query_rank("al", &["real"]).unwrap();
+        assert!(
+            early < late,
+            "earlier match ({early}) should beat later ({late})"
+        );
+    }
+
+    #[test]
+    fn query_rank_name_beats_hex_id_for_same_query() {
+        // Query "ab" matches both a nickname-ish "ab" and a hex id. The name
+        // hit must rank strictly below the hex-id hit so nickname matches
+        // float above pasted-pubkey matches in the sidebar.
+        let name = query_rank("ab", &["ab"]).unwrap();
+        let id = query_rank("ab", &["abababababababab"]).unwrap();
+        assert!(name < id, "name ({name}) should beat hex id ({id})");
+    }
+
+    #[test]
+    fn query_rank_takes_min_across_haystacks() {
+        // "bob" matches the nickname exactly (tier 0) and the hex id as
+        // substring (tier 2 + id penalty). The row's rank is the better
+        // (lower) of the two — the nickname wins.
+        let id_hex = hex32(&[0xAB; 32]); // contains "ababab…", no "bob" → no match
+        let rank = query_rank("bob", &["bob", &id_hex]).unwrap();
+        assert_eq!(rank, 0, "exact nickname match → tier 0, score 0");
+    }
+
+    #[test]
+    fn query_rank_short_hex_is_treated_as_id() {
+        // short_hex form "abababab…" is ≥8 chars and all hex/ellipsis → id
+        // penalty applies, so a nickname prefix match beats it.
+        let name_prefix = query_rank("ab", &["abbot"]).unwrap();
+        let short = query_rank("ab", &["abababab…"]).unwrap();
+        assert!(
+            name_prefix < short,
+            "name prefix ({name_prefix}) should beat short-hex ({short})"
+        );
     }
 }
