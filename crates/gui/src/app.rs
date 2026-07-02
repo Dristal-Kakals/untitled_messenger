@@ -3,6 +3,7 @@
 //! directly — they emit `Message`s, which `update` maps to bridge `Command`s.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use iced::widget::{button, column, row, text};
@@ -29,6 +30,13 @@ pub enum View {
 
 /// The iced `Application` state. Display-only: holds copies of *data*, never
 /// live `um_client` objects. The bridge owns all crypto/net/store state.
+///
+/// `Clone` is sound: every field is cheaply cloneable (the bridge command
+/// sender and the event-receiver slot are behind `Arc`), and iced's `boot`
+/// closure is `Fn` (called once at startup), so the clone taken there is the
+/// only one. The shared `event_rx` slot means a clone still references the same
+/// single receiver — only the subscription ever takes it.
+#[derive(Clone)]
 pub struct UmApp {
     pub view: View,
     pub identity_pub: Option<[u8; 32]>,
@@ -488,32 +496,51 @@ fn handle_event(app: &mut UmApp, ev: Event) {
 }
 
 /// The iced `subscription` function: streams bridge `Event`s into
-/// `Message::Event`. The event receiver is taken once from the shared slot
-/// (iced keys the subscription by id, so the stream is built once and reused).
+/// `Message::Event`. The event receiver lives behind a shared slot; iced
+/// identifies the subscription by its `data` (the slot's `Arc` pointer, which
+/// is stable for the process lifetime), so the builder runs once and the stream
+/// drains the receiver until the bridge drops its sender.
 pub fn subscription(app: &UmApp) -> Subscription<Message> {
-    // Take the receiver out of the shared slot once. Iced identifies the
-    // subscription by its id (`"um-bridge"`); on subsequent `subscription`
-    // calls it keeps the already-running stream and discards the new recipe,
-    // so this take happens exactly once. If the slot is already empty (e.g. a
-    // rebuild after the receiver was taken), return an empty subscription.
-    let rx = {
-        let mut guard = match app.event_rx.lock() {
-            Ok(g) => g,
-            Err(_) => return Subscription::none(),
-        };
-        match guard.take() {
-            Some(rx) => rx,
-            None => return Subscription::none(),
-        }
-    };
+    // Clone the slot handle into the subscription `data`. Iced keys the
+    // subscription by `BridgeSlot`'s `Hash` (the `Arc` pointer address), which
+    // is stable across `subscription` calls, so the stream is built once. The
+    // builder takes the receiver out of the slot the first time it runs; later
+    // rebuilds (which iced avoids anyway thanks to the stable id) find `None`
+    // and yield an immediately-finished stream.
+    let slot = BridgeSlot(app.event_rx.clone());
+    Subscription::run_with(slot, bridge_stream)
+}
 
-    // Drive the receiver as a stream: one `Message::Event` per event, forever.
-    // The stream ends only when the bridge drops its event sender (bridge
-    // thread exited), which is process-lifetime in practice.
+/// A shared slot holding the bridge's event receiver, wrapped so it can key an
+/// iced subscription. `Hash` is by `Arc` pointer address (stable for the
+/// process lifetime), not by contents — the receiver is taken once.
+#[derive(Clone)]
+struct BridgeSlot(Arc<Mutex<Option<mpsc::Receiver<Event>>>>);
+
+impl Hash for BridgeSlot {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+/// Build the bridge event stream: take the receiver from the slot once, then
+/// pump one `Message::Event` per event until the bridge drops its sender. If
+/// the slot is already empty (a rebuild after the receiver was taken), the
+/// stream finishes immediately. The boxed type lets the function satisfy
+/// `iced`'s `fn(&D) -> S` builder signature with a single concrete `S`.
+fn bridge_stream(
+    slot: &BridgeSlot,
+) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    use iced::futures::StreamExt;
+
+    let rx = slot.0.lock().ok().and_then(|mut g| g.take());
     let stream = iced::futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|ev| (Message::Event(ev), rx))
+        match rx.as_mut() {
+            Some(r) => r.recv().await.map(|ev| (Message::Event(ev), rx)),
+            None => None,
+        }
     });
-    Subscription::run_with_id("um-bridge", stream)
+    stream.boxed()
 }
 
 /// The iced `view` function: routes to the active view.

@@ -63,9 +63,10 @@ fn main() -> iced::Result {
     let mut um_app = app::UmApp::new(bridge_cmd, initial_view, config);
     um_app.set_event_rx(event_rx);
 
-    iced::application("UM", app::update, app::view)
+    iced::application(move || um_app.clone(), app::update, app::view)
+        .title("UM")
         .subscription(app::subscription)
-        .run_with(move || (um_app, iced::Task::none()))
+        .run()
 }
 
 /// Spawn the async bridge on a dedicated background thread with its own

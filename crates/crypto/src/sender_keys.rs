@@ -170,7 +170,7 @@ pub fn encode_distribution(
     state: &SenderKeyState,
     group_id: [u8; 32],
 ) -> Result<Vec<u8>, CryptoError> {
-    bincode::serialize(&DistributionPayload {
+    postcard::to_allocvec(&DistributionPayload {
         group_id,
         state: state.clone(),
     })
@@ -179,7 +179,7 @@ pub fn encode_distribution(
 
 pub fn decode_distribution(bytes: &[u8]) -> Result<(SenderKeyState, [u8; 32]), CryptoError> {
     let payload: DistributionPayload =
-        bincode::deserialize(bytes).map_err(|_| CryptoError::MalformedBundle)?;
+        postcard::from_bytes(bytes).map_err(|_| CryptoError::MalformedBundle)?;
     Ok((payload.state, payload.group_id))
 }
 

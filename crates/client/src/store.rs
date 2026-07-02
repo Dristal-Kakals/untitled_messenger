@@ -94,10 +94,10 @@ fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, ClientE
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
+    let nonce = chacha20poly1305::XNonce::from(nonce_bytes);
     let ct = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -116,10 +116,11 @@ fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, ClientError>
         return Err(ClientError::Store("sealed blob too short".into()));
     }
     let (nonce_bytes, ct) = blob.split_at(NONCE_LEN);
-    let nonce = chacha20poly1305::XNonce::from_slice(nonce_bytes);
+    let nonce = chacha20poly1305::XNonce::try_from(nonce_bytes)
+        .expect("nonce slice is exactly NONCE_LEN bytes");
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(nonce, Payload { msg: ct, aad })
+        .decrypt(&nonce, Payload { msg: ct, aad })
         .map_err(|_| ClientError::Store("open failed (wrong passphrase or corrupt)".into()))
 }
 

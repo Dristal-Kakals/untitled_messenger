@@ -20,16 +20,16 @@ path = "src/main.rs"
 um_client = { path = "../client" }
 um_protocol = { path = "../protocol" }
 um_crypto = { path = "../crypto" }
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-dirs = "5"
+toml = "1"
+dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 thiserror = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 postcard = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]

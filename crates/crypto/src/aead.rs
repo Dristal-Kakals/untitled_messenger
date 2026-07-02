@@ -1,9 +1,9 @@
 use chacha20poly1305::{
     XChaCha20Poly1305,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 
@@ -69,12 +69,12 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], len: usize) -> Vec<u8> {
 
 pub fn kdf_chain(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let mut mk = [0u8; 32];
-    let mut m1 = <HmacSha256 as Mac>::new_from_slice(ck).expect("hmac key len");
+    let mut m1 = HmacSha256::new_from_slice(ck).expect("hmac key len");
     m1.update(&[0x01]);
     mk.copy_from_slice(&m1.finalize().into_bytes());
 
     let mut nck = [0u8; 32];
-    let mut m2 = <HmacSha256 as Mac>::new_from_slice(ck).expect("hmac key len");
+    let mut m2 = HmacSha256::new_from_slice(ck).expect("hmac key len");
     m2.update(&[0x02]);
     nck.copy_from_slice(&m2.finalize().into_bytes());
 

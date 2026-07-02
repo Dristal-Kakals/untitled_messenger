@@ -14,11 +14,11 @@ um_crypto = { path = "../crypto" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 argon2 = "0.5"
-chacha20poly1305 = { version = "0.10", features = ["std"] }
-hkdf = "0.12"
-sha2 = "0.10"
+chacha20poly1305 = { version = "0.11", features = ["alloc", "getrandom"] }
+hkdf = "0.13"
+sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["alloc"] }
 rand = "0.8"
