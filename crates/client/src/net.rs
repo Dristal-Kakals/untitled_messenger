@@ -37,11 +37,22 @@ impl Client {
     }
 
     /// Receive one server message. Returns `None` on EOF.
+    ///
+    /// `ProtocolError::Incomplete` means the buffered bytes do not yet hold a
+    /// full frame, so we read another chunk and retry. Any other decode error
+    /// (`FrameTooLarge` from a corrupt length header, or `Decode` from a
+    /// malformed payload) is fatal for this stream: the framing state is
+    /// unrecoverable and looping would buffer forever. We surface it instead
+    /// of hanging the recv side on a single bad byte.
     pub async fn recv_msg(&mut self) -> Result<Option<ServerMessage>, ClientError> {
         loop {
-            if let Ok((msg, consumed)) = decode::<ServerMessage>(&self.buf) {
-                self.buf.drain(0..consumed);
-                return Ok(Some(msg));
+            match decode::<ServerMessage>(&self.buf) {
+                Ok((msg, consumed)) => {
+                    self.buf.drain(0..consumed);
+                    return Ok(Some(msg));
+                }
+                Err(um_protocol::ProtocolError::Incomplete) => {}
+                Err(e) => return Err(ClientError::Protocol(e)),
             }
             let mut chunk = [0u8; 4096];
             let n = self.reader.read(&mut chunk).await?;
@@ -74,11 +85,19 @@ pub struct ClientReader {
 
 impl ClientReader {
     /// Receive one server message. Returns `None` on EOF.
+    ///
+    /// Same fatal-error handling as [`Client::recv_msg`]: `Incomplete` waits
+    /// for more bytes, any other decode error is surfaced rather than looping
+    /// forever on a corrupt frame.
     pub async fn recv_msg(&mut self) -> Result<Option<ServerMessage>, ClientError> {
         loop {
-            if let Ok((msg, consumed)) = decode::<ServerMessage>(&self.buf) {
-                self.buf.drain(0..consumed);
-                return Ok(Some(msg));
+            match decode::<ServerMessage>(&self.buf) {
+                Ok((msg, consumed)) => {
+                    self.buf.drain(0..consumed);
+                    return Ok(Some(msg));
+                }
+                Err(um_protocol::ProtocolError::Incomplete) => {}
+                Err(e) => return Err(ClientError::Protocol(e)),
             }
             let mut chunk = [0u8; 4096];
             let n = self.reader.read(&mut chunk).await?;
@@ -229,5 +248,106 @@ mod tests {
             }
             other => panic!("expected Delivered, got {other:?}"),
         }
+    }
+
+    /// A minimal raw TCP peer: accepts one connection and writes `bytes`
+    /// directly to it (bypassing the framing encoder), so we can feed the
+    /// client a deliberately malformed frame. Returns the bound address.
+    async fn raw_peer_writing(bytes: Vec<u8>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            sock.write_all(&bytes).await.expect("write raw bytes");
+            // Keep the connection open so the client does not see EOF first;
+            // the malformed frame must be surfaced before any EOF.
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// `recv_msg` must surface a `Decode` error (a frame with a valid length
+    /// header but a payload that is not a valid `ServerMessage`) instead of
+    /// looping forever waiting for a decode that will never succeed. Before
+    /// the fix this hung the recv side on a single bad byte and buffered
+    /// forever.
+    #[tokio::test]
+    async fn recv_msg_surfaces_decode_error_instead_of_hanging() {
+        // Length-prefixed frame claiming 4 bytes of payload, with garbage that
+        // postcard cannot deserialize as a ServerMessage.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let addr = raw_peer_writing(frame).await;
+
+        let mut client = Client::connect(addr).await.expect("connect");
+        let result = client.recv_msg().await;
+        assert!(
+            matches!(result, Err(ClientError::Protocol(_))),
+            "expected Protocol error, got {result:?}"
+        );
+    }
+
+    /// `recv_msg` must surface a `FrameTooLarge` error (a length header
+    /// claiming more than `MAX_FRAME_SIZE`) instead of trying to buffer
+    /// 16+ MiB and looping.
+    #[tokio::test]
+    async fn recv_msg_surfaces_frame_too_large_instead_of_hanging() {
+        let len = (um_protocol::MAX_FRAME_SIZE + 1) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&len.to_be_bytes());
+        let addr = raw_peer_writing(frame).await;
+
+        let mut client = Client::connect(addr).await.expect("connect");
+        let result = client.recv_msg().await;
+        assert!(
+            matches!(result, Err(ClientError::Protocol(_))),
+            "expected Protocol error, got {result:?}"
+        );
+    }
+
+    /// `Incomplete` is still handled correctly: a partial frame (length header
+    /// claims more bytes than were sent) returns `Ok(None)` only on EOF, and
+    /// otherwise keeps waiting. Here the peer closes after a partial frame,
+    /// so the client should observe EOF as `Ok(None)` — proving the Incomplete
+    /// branch still drives a read and does not error out.
+    #[tokio::test]
+    async fn recv_msg_incomplete_then_eof_returns_none() {
+        // Claim 16 bytes of payload but send only 2, then drop the peer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut partial = Vec::new();
+            partial.extend_from_slice(&16u32.to_be_bytes());
+            partial.extend_from_slice(&[1, 2]);
+            sock.write_all(&partial).await.expect("write partial");
+            // Drop sock -> EOF on the client side.
+        });
+
+        let mut client = Client::connect(addr).await.expect("connect");
+        let result = client.recv_msg().await.expect("recv should not error");
+        assert_eq!(result, None, "partial frame + EOF should yield None");
+    }
+
+    /// Same fatal-error contract for the split `ClientReader`.
+    #[tokio::test]
+    async fn client_reader_surfaces_decode_error() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let addr = raw_peer_writing(frame).await;
+
+        let client = Client::connect(addr).await.expect("connect");
+        let (mut reader, _writer) = client.into_split();
+        let result = reader.recv_msg().await;
+        assert!(
+            matches!(result, Err(ClientError::Protocol(_))),
+            "expected Protocol error, got {result:?}"
+        );
     }
 }
