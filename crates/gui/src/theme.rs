@@ -34,6 +34,15 @@ pub const MUTED: Color = Color::from_rgb8(0x8B, 0xE9, 0xFD);
 /// "Connected" status dot.
 pub const OK: Color = Color::from_rgb8(0x50, 0xFA, 0x7B);
 
+/// Match-highlight background for the sidebar search: a translucent accent
+/// wash that marks the substring the query matched. Paired with
+/// `HIGHLIGHT_FG` so the highlighted fragment stays readable on the wash.
+pub const HIGHLIGHT: Color = Color::from_rgba8(0xBD, 0x93, 0xF9, 0.45);
+
+/// Text color for a search match fragment: dark on the light accent wash so
+/// the matched substring pops without fighting the rest of the row.
+pub const HIGHLIGHT_FG: Color = Color::from_rgb8(0x1E, 0x1F, 0x29);
+
 /// Bubble corner radius (px).
 const BUBBLE_RADIUS: f32 = 12.0;
 
@@ -281,5 +290,22 @@ mod tests {
         // clippy does not flag `assertions_on_constants`.
         let w = SIDEBAR_WIDTH;
         assert!((200.0..=400.0).contains(&w));
+    }
+
+    #[test]
+    fn highlight_is_translucent_accent_wash() {
+        // The match highlight is the accent purple at <1.0 alpha so it reads as
+        // a wash over the row, not a solid block.
+        let c = HIGHLIGHT;
+        assert!(c.a > 0.0 && c.a < 1.0, "semi-transparent wash, got {c:?}");
+        assert!(c.r > 0.7 && c.b > 0.9, "accent-tinted: {c:?}");
+    }
+
+    #[test]
+    fn highlight_fg_is_dark_for_contrast() {
+        // Highlighted fragment text is dark so it stays legible on the light
+        // accent wash (luminance well below 0.5 on all channels).
+        let c = HIGHLIGHT_FG;
+        assert!(c.r < 0.3 && c.g < 0.3 && c.b < 0.3, "dark fg: {c:?}");
     }
 }

@@ -166,6 +166,64 @@ pub fn format_time(unix_secs: u64) -> String {
     format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}")
 }
 
+/// Byte range `(start, end)` of the first case-insensitive match of `query`
+/// inside `haystack`, or `None` when the (trimmed) query is empty or does not
+/// occur. The range indexes `haystack`'s bytes; the caller slices the original
+/// (mixed-case) string with them so the displayed fragment keeps its original
+/// capitalization while the *match* itself is case-insensitive.
+///
+/// Empty/whitespace query → `None` (no highlight: the whole row is shown
+/// unstyled, matching the "empty query shows everything" rule of
+/// [`query_rank`]). This keeps the highlighter consistent with the filter: a
+/// row only gets a highlighted fragment when it actually matched a real query.
+///
+/// Pure, testable. The sidebar's `highlighted_name` wraps this to build the
+/// `iced` `Span` list.
+pub fn match_range(query: &str, haystack: &str) -> Option<(usize, usize)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    let hl = haystack.to_lowercase();
+    let start = hl.find(&q)?;
+    Some((start, start + q.len()))
+}
+
+/// Build the `iced` `Span` list for a display string, highlighting the
+/// substring the sidebar search matched. When `query` matches `label`
+/// (case-insensitive, via [`match_range`]) the matched fragment is rendered
+/// with the accent highlight wash (`theme::HIGHLIGHT` background +
+/// `theme::HIGHLIGHT_FG` text); the text before and after it is plain. When
+/// there is no match (empty query, or this label was not the haystack that
+/// matched — e.g. the nickname matched but we are also rendering the hex id),
+/// a single plain span is returned so the row looks unchanged.
+///
+/// `label` is borrowed for the span lifetimes; the returned `Vec` is fed
+/// straight to `iced::widget::rich_text`.
+pub fn highlighted_name<'a>(query: &str, label: &'a str) -> Vec<iced::widget::text::Span<'a>> {
+    use iced::widget::span;
+
+    let Some((start, end)) = match_range(query, label) else {
+        return vec![span(label)];
+    };
+    let before = &label[..start];
+    let mid = &label[start..end];
+    let after = &label[end..];
+    let mut spans = Vec::with_capacity(3);
+    if !before.is_empty() {
+        spans.push(span(before));
+    }
+    spans.push(
+        span(mid)
+            .color(crate::theme::HIGHLIGHT_FG)
+            .background(crate::theme::HIGHLIGHT),
+    );
+    if !after.is_empty() {
+        spans.push(span(after));
+    }
+    spans
+}
+
 pub use chat_thread::chat_thread;
 pub use contact_list::{contact_list, sidebar};
 pub use group_chat::group_chat;
@@ -358,5 +416,46 @@ mod tests {
             name_prefix < short,
             "name prefix ({name_prefix}) should beat short-hex ({short})"
         );
+    }
+
+    #[test]
+    fn match_range_empty_query_is_none() {
+        assert_eq!(match_range("", "bob"), None);
+        assert_eq!(match_range("   ", "bob"), None);
+    }
+
+    #[test]
+    fn match_range_no_match_is_none() {
+        assert_eq!(match_range("zzz", "bob"), None);
+    }
+
+    #[test]
+    fn match_range_substring_case_insensitive() {
+        // "BO" matches "bob" at byte range (0, 2) — indexes the original
+        // (lowercase) haystack so the caller slices the mixed-case label.
+        assert_eq!(match_range("BO", "bob"), Some((0, 2)));
+        assert_eq!(match_range("ob", "Bob"), Some((1, 3)));
+    }
+
+    #[test]
+    fn match_range_returns_first_occurrence() {
+        // "ab" first occurs at index 0 in "abab", not 2.
+        assert_eq!(match_range("ab", "abab"), Some((0, 2)));
+    }
+
+    #[test]
+    fn match_range_trims_query() {
+        // Surrounding whitespace in the query is ignored, matching
+        // [`query_rank`]'s trim rule.
+        assert_eq!(match_range("  bob  ", "bob"), Some((0, 3)));
+    }
+
+    #[test]
+    fn match_range_preserves_original_case_range() {
+        // The range indexes the haystack bytes directly, so slicing the
+        // original (mixed-case) string yields the matched fragment with its
+        // original capitalization — the highlighter keeps "Bob" not "bob".
+        let (s, e) = match_range("ob", "Bob").unwrap();
+        assert_eq!(&"Bob"[s..e], "ob");
     }
 }

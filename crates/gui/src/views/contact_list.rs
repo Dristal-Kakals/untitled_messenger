@@ -9,10 +9,10 @@
 //! placeholder so the window is fully used even before a chat is opened.
 
 use iced::alignment;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, rich_text, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, hex32, query_rank, short_hex};
+use super::{Message, UmApp, hex32, highlighted_name, query_rank, short_hex};
 use crate::ChatId;
 use crate::theme;
 
@@ -112,8 +112,20 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
             .filter(|n| *n > 0)
             .map_or_else(|| unread_badge(0), unread_badge);
         let verified = if c.verified { "✓ " } else { "" };
+        // Highlight the matched fragment of the nickname when a search query
+        // is active. `rich_text` renders the spans; the hex id / fingerprint
+        // sub-lines stay plain `text` (matches there are less useful to mark
+        // and would clutter the row).
+        let name_spans = {
+            let mut spans = Vec::with_capacity(2);
+            if !verified.is_empty() {
+                spans.push(iced::widget::span(verified));
+            }
+            spans.extend(highlighted_name(&app.search_query, &c.nickname));
+            spans
+        };
         let row = row![
-            text(format!("{verified}{}", c.nickname)).size(15),
+            rich_text(name_spans).size(15),
             text(short_hex(&c.identity_pub))
                 .color(theme::MUTED)
                 .size(11),
@@ -189,7 +201,7 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
             .filter(|n| *n > 0)
             .map_or_else(|| unread_badge(0), unread_badge);
         let row = row![
-            text(g.name.clone()).size(15),
+            rich_text(highlighted_name(&app.search_query, &g.name)).size(15),
             text(short_hex(&g.id)).color(theme::MUTED).size(11),
             Space::new().width(Fill),
             badge,
