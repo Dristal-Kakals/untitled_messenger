@@ -109,6 +109,19 @@ impl Store {
             outbox.retain(|e| !envelope_ids.contains(&e.id));
         }
     }
+
+    /// Test-only: re-insert an already-delivered envelope into `identity`'s
+    /// outbox **with its existing id**, simulating an ack that never reached
+    /// the relay (network drop / relay restart before processing the ack). The
+    /// next `Subscribe` flush or `Poll { since < id }` re-delivers the SAME
+    /// envelope (same `id`) to the client, which is exactly the duplicate the
+    /// store-level `(peer, server_id)` dedup must collapse. Used by the
+    /// headless bridge dedup E2E test; not wired into any production path.
+    #[cfg(feature = "test-helpers")]
+    pub fn reinsert_envelope(&self, identity: &[u8; 32], envelope: EncryptedEnvelope) {
+        let mut g = self.inner.lock().expect("store mutex poisoned");
+        g.outboxes.entry(*identity).or_default().push(envelope);
+    }
 }
 
 impl Default for Store {

@@ -8,6 +8,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `test-helpers` exposes relay-internal knobs (e.g. `Store::reinsert_envelope`
+# to simulate a lost ack) so downstream integration tests can drive failure
+# modes the production API cannot. Never enabled in a release build.
+test-helpers = []
+
 [dependencies]
 um_protocol = { path = "../protocol" }
 um_crypto = { path = "../crypto" }

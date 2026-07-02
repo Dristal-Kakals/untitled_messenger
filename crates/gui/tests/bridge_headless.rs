@@ -992,3 +992,260 @@ async fn bridge_unread_count_survives_restart() {
         })
         .await;
 }
+
+/// Acks are best-effort: if an ack never reaches the relay (network drop, or
+/// the relay restarts before processing it), the envelope stays in the outbox
+/// and the next `Subscribe` flush re-delivers the SAME envelope (same
+/// relay-assigned `id`). Without dedup this would (a) insert a duplicate row
+/// in the store and (b) emit a second `Event::Decrypted`, showing the message
+/// twice in the UI. The store's `(peer, server_id)` partial unique index +
+/// `INSERT OR IGNORE` in `put_message` collapses the re-delivery: the bridge's
+/// `deliver_chat` sees `Ok(None)` and suppresses the duplicate event while
+/// still acking so the relay drops the envelope.
+///
+/// This test simulates a lost ack with `ServerStore::reinsert_envelope`
+/// (gated behind the `test-helpers` feature). Flow: bob registers then goes
+/// offline; alice sends a 1:1 message so the envelope sits UNACKED in bob's
+/// outbox; the test captures that exact envelope; bob comes online (Subscribe
+/// flush → delivery #1 → Decrypted → ack → relay drops); the test re-inserts
+/// the SAME envelope (lost ack from the relay's view); bob reconnects
+/// (Subscribe re-flushes → the store dedups → NO second Decrypted, but the
+/// bridge still acks so the relay drops it). Asserts: exactly one
+/// `Event::Decrypted`, one store row, and the relay outbox empty afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_redelivery_dedups_decrypted_event() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    let server_store = Arc::new(ServerStore::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", server_store.clone(), subs)
+        .await
+        .expect("serve relay");
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (alice_bridge, alice_pub) = make_bridge(&dir, &server_addr);
+            let (bob_bridge, bob_pub) = make_bridge(&dir, &server_addr);
+
+            let (alice_cmd, mut alice_ev) = spawn_bridge(alice_bridge);
+            let (bob_cmd, mut bob_ev) = spawn_bridge(bob_bridge);
+
+            // Bob registers (Connect = Register + Subscribe) while his outbox
+            // is empty, so the Subscribe drain is a no-op and bob idles. Then
+            // take bob OFFLINE: drop the bridge so the relay sees a
+            // disconnect. bob stays REGISTERED, so alice's send still lands in
+            // bob's outbox (deliver skips only unregistered recipients).
+            bob_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob connect");
+            expect_event(&mut bob_ev, |e| matches!(e, Event::Connected)).await;
+            drop(bob_cmd);
+            drop(bob_ev);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Alice connects + sends the first (X3DH) message. The envelope
+            // lands in bob's outbox and STAYS there: bob is offline, so there
+            // is no push and no ack.
+            alice_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("alice connect");
+            expect_event(&mut alice_ev, |e| matches!(e, Event::Connected)).await;
+            alice_cmd
+                .send(Command::StartSession {
+                    peer: bob_pub,
+                    first_message: "offline dedup me".to_string(),
+                    local_id: 10,
+                })
+                .await
+                .expect("alice startsession");
+            expect_event(&mut alice_ev, |e| {
+                matches!(e, Event::Sent { local_id: 10, .. })
+            })
+            .await;
+
+            // Capture the exact envelope the relay is holding for bob, BEFORE
+            // any ack. `poll(identity, 0)` returns every envelope with id > 0
+            // WITHOUT removing it from the outbox, so this is a non-destructive
+            // snapshot of the re-delivery candidate.
+            let pending = server_store.poll(&bob_pub, 0);
+            assert_eq!(pending.len(), 1, "one envelope pending for offline bob");
+            let captured = pending[0].clone();
+            let env_id = captured.id;
+
+            // Bring bob back online with the SAME store + session: reopen the
+            // store bob's bridge created, load the persisted session, spawn a
+            // fresh bridge. The Subscribe drain delivers the offline mail
+            // (delivery #1), bob acks, the relay drops the envelope.
+            let bob_path = dir.join(format!("{}.db", hex::encode(bob_pub)));
+            let bob_store = Store::open(&bob_path, "test-pass").expect("open bob store");
+            let bob_session: ClientSession = bob_store
+                .get("session")
+                .expect("load bob session")
+                .expect("bob session present");
+            let bob_bridge2 = Bridge::new(
+                bob_session,
+                Some(bob_store),
+                Config {
+                    server_addr: server_addr.clone(),
+                    ..Default::default()
+                },
+            );
+            let (bob_cmd2, mut bob_ev2) = spawn_bridge(bob_bridge2);
+            bob_cmd2
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob reconnect");
+
+            // The Subscribe drain emits `Event::Decrypted` for the offline
+            // envelope BEFORE `Event::Connected`, so we must collect every
+            // event in one pass (draining until Connected would discard the
+            // first Decrypted). Capture delivery #1 here.
+            let mut first: Option<Event> = None;
+            let mut saw_connected = false;
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+            tokio::pin!(deadline);
+            loop {
+                if saw_connected && first.is_some() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => panic!(
+                        "delivery#1 timed out; connected={saw_connected}, first={first:?}"
+                    ),
+                    ev = bob_ev2.recv() => match ev {
+                        Some(e) => {
+                            if first.is_none() && matches!(e, Event::Decrypted { .. }) {
+                                first = Some(e);
+                            } else if matches!(e, Event::Connected) {
+                                saw_connected = true;
+                            } else if let Event::Error(msg) = e {
+                                panic!("bob2 bridge error: {msg}");
+                            }
+                        }
+                        None => panic!("bob2 channel closed before delivery #1"),
+                    },
+                }
+            }
+            let first = first.expect("delivery #1 Decrypted");
+            match &first {
+                Event::Decrypted { msg, .. } => assert_eq!(msg.text, "offline dedup me"),
+                other => panic!("expected first Decrypted, got {other:?}"),
+            }
+            // The Decrypted message's local_id IS the relay envelope id (the
+            // bridge uses env.id as the MessageView local_id for incoming
+            // messages), so it must match the id we captured pre-delivery.
+            if let Event::Decrypted { msg, .. } = &first {
+                assert_eq!(msg.local_id, env_id, "local_id == relay envelope id");
+            }
+            // Let bob's best-effort ack reach the relay.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                server_store.poll(&bob_pub, 0).is_empty(),
+                "ack dropped the envelope after delivery #1"
+            );
+
+            // Simulate a LOST ACK from the relay's perspective: the client
+            // thought it acked, but the relay never recorded it, so the
+            // envelope reappears in the outbox with the SAME id. The next
+            // Subscribe flush will re-deliver it verbatim.
+            server_store.reinsert_envelope(&bob_pub, captured);
+
+            // Bob reconnects again. We drop bob2 and spawn bob3 from the same
+            // store (the unambiguous restart path; the store already holds the
+            // delivered row, which is the dedup target).
+            drop(bob_cmd2);
+            drop(bob_ev2);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let bob_store2 = Store::open(&bob_path, "test-pass").expect("reopen bob store");
+            let bob_session2: ClientSession = bob_store2
+                .get("session")
+                .expect("reload bob session")
+                .expect("bob session present");
+            let bob_bridge3 = Bridge::new(
+                bob_session2,
+                Some(bob_store2),
+                Config {
+                    server_addr: server_addr.clone(),
+                    ..Default::default()
+                },
+            );
+            let (bob_cmd3, mut bob_ev3) = spawn_bridge(bob_bridge3);
+            bob_cmd3
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob reconnect 2");
+            expect_event(&mut bob_ev3, |e| matches!(e, Event::Connected)).await;
+
+            // The re-delivered envelope must be deduped: the bridge acks it
+            // (dropping it from the outbox) but emits NO second Decrypted.
+            // Watch bob's event stream for 2s; a duplicate Decrypted would
+            // surface here. Silence is success (the dedup suppressed it).
+            let mut got_second = false;
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => break,
+                    ev = bob_ev3.recv() => match ev {
+                        Some(Event::Decrypted { .. }) => { got_second = true; break; }
+                        Some(Event::Error(e)) => panic!("bridge error: {e}"),
+                        Some(_) => {}
+                        None => break,
+                    },
+                }
+            }
+            assert!(
+                !got_second,
+                "re-delivered envelope must NOT emit a second Decrypted (dedup)"
+            );
+
+            // The relay outbox must be empty now: the bridge acked the
+            // re-delivered envelope even though it was a local duplicate, so
+            // the relay stops re-flushing it on future Subscribes.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                server_store.poll(&bob_pub, 0).is_empty(),
+                "re-delivered envelope acked → dropped from outbox"
+            );
+
+            // The store holds exactly ONE row for the 1:1 thread (keyed by the
+            // peer identity pub): the original delivery, not a duplicate from
+            // the re-delivery. Drop the bridge first so its store connection
+            // is released, then reopen the file and read the thread via the
+            // paginated production path.
+            drop(alice_cmd);
+            drop(bob_cmd3);
+            drop(bob_ev3);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let bob_store_check = Store::open(&bob_path, "test-pass").expect("reopen for check");
+            // The 1:1 thread is keyed by the PEER's identity pub (alice's),
+            // not bob's own: an incoming message lives under
+            // `ChatId::Peer(env.sender)` = `ChatId::Peer(alice_pub)`.
+            let page = bob_store_check
+                .messages_page(&alice_pub, None, 100)
+                .expect("load bob's thread with alice");
+            assert_eq!(
+                page.rows.len(),
+                1,
+                "store holds one row, not a duplicate from re-delivery"
+            );
+            assert_eq!(page.rows[0].msg.text, "offline dedup me");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
+}

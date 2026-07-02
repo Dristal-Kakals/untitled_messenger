@@ -14,16 +14,25 @@
 //!   — nickname/fingerprint are plaintext metadata (pub keys are already
 //!   public).
 //! - `messages(id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB,
-//!   timestamp INT, sender BLOB)` — `sealed` is the XChaCha-encrypted postcard
-//!   of the message plaintext + status. `sender` is the author identity pub for
-//!   an incoming group message (so the view can prefix "author: …" after a
-//!   restart), `NULL` for 1:1 (the peer is implied by the thread) and for
-//!   outgoing messages. `sender` is public metadata — a pub key, like `peer` —
-//!   so it is stored in plaintext alongside the row, NOT inside the sealed
-//!   blob, and is NOT part of the AEAD associated data (changing it does not
-//!   break the seal). The sealed `StoredMessage` is unchanged, so existing
-//!   rows (written before this column existed) re-open unchanged; the
-//!   `ALTER TABLE ADD COLUMN` migration backfills `NULL`. Indexed by
+//!   timestamp INT, sender BLOB, server_id INT)` — `sealed` is the
+//!   XChaCha-encrypted postcard of the message plaintext + status. `sender`
+//!   is the author identity pub for an incoming group message (so the view
+//!   can prefix "author: …" after a restart), `NULL` for 1:1 (the peer is
+//!   implied by the thread) and for outgoing messages. `sender` is public
+//!   metadata — a pub key, like `peer` — so it is stored in plaintext
+//!   alongside the row, NOT inside the sealed blob, and is NOT part of the
+//!   AEAD associated data (changing it does not break the seal). The sealed
+//!   `StoredMessage` is unchanged, so existing rows (written before this
+//!   column existed) re-open unchanged; the `ALTER TABLE ADD COLUMN`
+//!   migration backfills `NULL`. `server_id` is the relay-assigned monotonic
+//!   envelope id for an incoming message (`NULL` for outgoing): it is the
+//!   stable dedup key the relay uses when re-flushing an unacked outbox, so
+//!   a partial-index `idx_messages_peer_server_id` on `(peer, server_id)`
+//!   WHERE `server_id IS NOT NULL` makes a re-delivered envelope
+//!   `INSERT OR IGNORE`-collide with the original row instead of creating a
+//!   duplicate. `server_id` is also public metadata (a server counter, not a
+//!   secret), stored in plaintext and excluded from the sealed blob + AAD,
+//!   so the migration does not invalidate any existing seal. Indexed by
 //!   `(peer, id)` (`idx_messages_peer_id`) so `load_history`'s
 //!   `WHERE peer = ?1 ORDER BY id ASC` is an index range scan, not a full
 //!   table scan + sort.
@@ -285,8 +294,20 @@ impl Store {
     /// messages and for all outgoing messages. `sender` is stored as a
     /// plaintext column — it is a public key, not secret — and is deliberately
     /// kept OUT of the sealed blob and the AEAD AAD so adding it never
-    /// invalidates existing rows. `timestamp` is unix seconds. Returns the
-    /// assigned row id.
+    /// invalidates existing rows. `timestamp` is unix seconds.
+    ///
+    /// `server_id` is the relay-assigned monotonic envelope id for an incoming
+    /// message (`None` for outgoing and for callers that do not dedup). It is
+    /// the stable key the relay uses when re-flushing an unacked outbox: the
+    /// same envelope re-delivered on the next Subscribe carries the same
+    /// `server_id`, so the `(peer, server_id)` partial unique index makes the
+    /// re-delivery collide with the original row. The insert is
+    /// `INSERT OR IGNORE`: a collision (a re-delivered envelope) inserts
+    /// nothing and returns `Ok(None)`, letting the caller suppress the
+    /// duplicate `Event::Decrypted` while still acking the envelope so the
+    /// relay drops it from the outbox. A fresh row returns `Ok(Some(rowid))`.
+    /// Outgoing rows pass `server_id = None` and always insert (NULLs are
+    /// distinct under the partial index), returning `Ok(Some(rowid))`.
     pub fn put_message(
         &self,
         peer: &[u8; 32],
@@ -294,31 +315,74 @@ impl Store {
         payload: &StoredMessage,
         timestamp: i64,
         sender: Option<&[u8; 32]>,
-    ) -> Result<i64, ClientError> {
+        server_id: Option<i64>,
+    ) -> Result<Option<i64>, ClientError> {
         let bytes = postcard::to_allocvec(payload)?;
         // AAD binds the sealed blob to the peer + direction + timestamp so a
         // row-swap attack (copying one message's sealed blob into another's
-        // slot) fails to open. `sender` is intentionally excluded: it is public
-        // metadata and excluding it keeps the AAD identical to pre-column rows.
+        // slot) fails to open. `sender` and `server_id` are intentionally
+        // excluded: both are public metadata and excluding them keeps the AAD
+        // identical to pre-column rows (so the migrations do not invalidate
+        // existing seals).
         let mut aad = Vec::with_capacity(32 + 1 + 8);
         aad.extend_from_slice(peer);
         aad.push(direction as u8);
         aad.extend_from_slice(&timestamp.to_be_bytes());
         let sealed = seal(&self.key, &aad, &bytes)?;
-        self.conn
+        // `INSERT OR IGNORE`: a re-delivered incoming envelope (same `peer` +
+        // `server_id`, caught by the partial unique index) inserts no row and
+        // `changes()` returns 0 → we report `None` so the caller can suppress
+        // the duplicate. A fresh row (or any outgoing row, whose `server_id`
+        // NULL is not constrained by the partial index) inserts normally.
+        let changed = self
+            .conn
             .execute(
-                "INSERT INTO messages (peer, direction, sealed, timestamp, sender) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO messages \
+                 (peer, direction, sealed, timestamp, sender, server_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     peer.as_slice(),
                     direction,
                     sealed,
                     timestamp,
-                    sender.map(|s| s.as_slice())
+                    sender.map(|s| s.as_slice()),
+                    server_id,
                 ],
             )
             .map_err(|e| ClientError::Store(format!("put_message: {e}")))?;
-        Ok(self.conn.last_insert_rowid())
+        if changed == 0 {
+            // No row inserted: a (peer, server_id) collision — a re-delivered
+            // envelope. `last_insert_rowid()` is stale here, so do not report
+            // it; the caller treats `None` as "already had this message".
+            Ok(None)
+        } else {
+            Ok(Some(self.conn.last_insert_rowid()))
+        }
+    }
+
+    /// Returns `true` if an incoming message with relay-assigned `server_id`
+    /// is already persisted for `peer`. This is the dedup probe: a
+    /// re-delivered envelope (same `peer` + `server_id`, e.g. an unacked
+    /// outbox re-flushed on the next Subscribe) reports `true`, letting the
+    /// bridge skip the decrypt entirely instead of advancing the Double
+    /// Ratchet past a message number it has already consumed and then
+    /// surfacing a spurious decrypt-failure `Event::Error`. Outgoing rows
+    /// (`server_id IS NULL`) are never matched. A `None` `server_id` (no
+    /// dedup key) reports `false`.
+    pub fn has_server_id(&self, peer: &[u8; 32], server_id: Option<i64>) -> bool {
+        let Some(sid) = server_id else {
+            return false;
+        };
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages \
+                 WHERE peer = ?1 AND server_id = ?2 LIMIT 1)",
+                rusqlite::params![peer.as_slice(), sid],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        exists
     }
 
     /// Load all messages for `peer` (1:1 or group id), oldest first. Each row
@@ -765,6 +829,32 @@ fn init_schema(conn: &Connection) -> Result<(), ClientError> {
     // `ALTER TABLE ADD COLUMN` is a no-op if the column already exists, so
     // this is idempotent across reopen.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN sender BLOB", []);
+    // Backfill the `server_id` column on pre-existing message stores created
+    // before the column existed. `server_id` is the relay-assigned monotonic
+    // envelope id for an incoming message (`NULL` for outgoing): the stable
+    // dedup key the relay uses when re-flushing an unacked outbox, so a
+    // re-delivered envelope collides with the original row on the
+    // `(peer, server_id)` partial index instead of creating a duplicate. It
+    // is public metadata (a server counter, not a secret), stored in
+    // plaintext and excluded from the sealed blob + AEAD AAD — so adding the
+    // column does NOT invalidate any existing seal: old rows load with
+    // `server_id = NULL` (treated as outgoing / pre-dedup, inserted
+    // unconditionally). The `ALTER TABLE ADD COLUMN` is a no-op if the
+    // column already exists, so this is idempotent across reopen.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN server_id INTEGER", []);
+    // Partial unique index on `(peer, server_id)` for incoming rows only
+    // (`server_id IS NOT NULL`). Outgoing rows have `server_id = NULL` and
+    // SQLite treats multiple NULLs as distinct under a unique index, so this
+    // partial form lets outgoing rows coexist without colliding while still
+    // rejecting a re-delivered incoming envelope (same `peer` + same
+    // `server_id`). `CREATE INDEX IF NOT EXISTS` is a no-op on reopen, so
+    // this is idempotent across migrations. A partial index is smaller than
+    // a full one and never constrains outgoing inserts.
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_peer_server_id \
+         ON messages (peer, server_id) WHERE server_id IS NOT NULL",
+        [],
+    );
     // Cover the `load_history` query (`WHERE peer = ?1 ORDER BY id ASC`). Without
     // this index SQLite scans the whole `messages` table and sorts the matches;
     // with it the planner walks a single index range per peer, no sort step.
@@ -1069,6 +1159,7 @@ mod tests {
                     },
                     1_700_000_000,
                     Some(&author),
+                    Some(101),
                 )
                 .unwrap();
             // A 1:1 incoming message carries no sender.
@@ -1082,9 +1173,10 @@ mod tests {
                     },
                     1_700_000_001,
                     None,
+                    Some(102),
                 )
                 .unwrap();
-            // An outgoing message carries no sender.
+            // An outgoing message carries no sender (and no server_id).
             store
                 .put_message(
                     &peer,
@@ -1094,6 +1186,7 @@ mod tests {
                         status: 1,
                     },
                     1_700_000_002,
+                    None,
                     None,
                 )
                 .unwrap();
@@ -1128,6 +1221,7 @@ mod tests {
                         status: 2,
                     },
                     1_700_000_000,
+                    None,
                     None,
                 )
                 .unwrap();
@@ -1196,6 +1290,7 @@ mod tests {
                     },
                     1_700_000_000 + i,
                     None,
+                    None,
                 )
                 .unwrap();
         }
@@ -1254,8 +1349,13 @@ mod tests {
                     },
                     1_700_000_000 + i as i64,
                     if i % 2 == 1 { Some(peer) } else { None },
+                    // No server_id: these are mixed in/out test rows, and a
+                    // NULL server_id is never constrained by the partial
+                    // unique index, so every insert returns Some(rowid).
+                    None,
                 )
-                .unwrap();
+                .unwrap()
+                .expect("NULL server_id always inserts");
             ids.push(id);
         }
         ids
@@ -1428,6 +1528,7 @@ mod tests {
                 },
                 1_700_000_000,
                 Some(&author),
+                Some(201),
             )
             .unwrap();
         let page = store.messages_page(&peer, None, 10).unwrap();
@@ -1595,6 +1696,282 @@ mod tests {
         // Writing after migration works.
         store.put_unread(&[0x09; 32], 2).unwrap();
         assert_eq!(store.unread_counts().unwrap(), vec![([0x09; 32], 2)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_message_dedups_incoming_by_server_id() {
+        // The relay re-flushes an unacked outbox on the next Subscribe, so the
+        // SAME envelope (same relay-assigned `server_id`) is re-delivered. The
+        // `(peer, server_id)` partial unique index must make the re-delivery
+        // `INSERT OR IGNORE`-collide with the original row: `put_message`
+        // returns `Ok(None)` and NO second row is created. A different
+        // `server_id` (a genuinely new message) still inserts `Ok(Some)`.
+        let path = tmp();
+        let peer = [0x12; 32];
+        let store = Store::create(&path, "pw").unwrap();
+
+        // First delivery of envelope 501.
+        let first = store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "hello".into(),
+                    status: 2,
+                },
+                1_700_000_000,
+                None,
+                Some(501),
+            )
+            .unwrap();
+        assert!(first.is_some(), "first delivery inserts a row");
+
+        // Re-delivery of the SAME envelope 501 → collision, no new row.
+        let dup = store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "hello".into(),
+                    status: 2,
+                },
+                1_700_000_001, // different timestamp must NOT bypass dedup
+                None,
+                Some(501),
+            )
+            .unwrap();
+        assert!(dup.is_none(), "re-delivery of same server_id is a no-op");
+
+        // A genuinely new envelope (502) still inserts.
+        let second = store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "world".into(),
+                    status: 2,
+                },
+                1_700_000_002,
+                None,
+                Some(502),
+            )
+            .unwrap();
+        assert!(second.is_some(), "different server_id inserts normally");
+
+        // Exactly two rows, no duplicate.
+        let msgs = store.messages(&peer).unwrap();
+        assert_eq!(msgs.len(), 2, "no duplicate row for re-delivered envelope");
+        assert_eq!(msgs[0].msg.text, "hello");
+        assert_eq!(msgs[1].msg.text, "world");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_message_outgoing_null_server_id_always_inserts() {
+        // Outgoing rows carry `server_id = NULL`. The partial unique index
+        // only constrains rows WHERE `server_id IS NOT NULL`, so multiple
+        // outgoing rows (which all have NULL) must coexist without colliding
+        // — SQLite treats NULLs as distinct under a unique index. Each
+        // outgoing `put_message` returns `Ok(Some(rowid))`.
+        let path = tmp();
+        let peer = [0x13; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        for i in 0..3 {
+            let r = store
+                .put_message(
+                    &peer,
+                    0,
+                    &StoredMessage {
+                        text: format!("out{i}"),
+                        status: 1,
+                    },
+                    1_700_000_000 + i,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(r.is_some(), "outgoing row {i} always inserts");
+        }
+        assert_eq!(store.messages(&peer).unwrap().len(), 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_message_server_id_isolated_per_peer() {
+        // `server_id` is relay-global, but the dedup key is `(peer,
+        // server_id)`: the same `server_id` delivered to two different peers
+        // (two different threads) are distinct messages and must BOTH insert.
+        // (The relay assigns a fresh id per recipient copy, but the index
+        // must not over-dedup if ids ever coincide across peers.)
+        let path = tmp();
+        let a = [0x14; 32];
+        let b = [0x15; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        let ra = store
+            .put_message(
+                &a,
+                1,
+                &StoredMessage {
+                    text: "to a".into(),
+                    status: 2,
+                },
+                1_700_000_000,
+                None,
+                Some(777),
+            )
+            .unwrap();
+        let rb = store
+            .put_message(
+                &b,
+                1,
+                &StoredMessage {
+                    text: "to b".into(),
+                    status: 2,
+                },
+                1_700_000_000,
+                None,
+                Some(777),
+            )
+            .unwrap();
+        assert!(
+            ra.is_some() && rb.is_some(),
+            "same server_id, diff peer → both insert"
+        );
+        assert_eq!(store.messages(&a).unwrap().len(), 1);
+        assert_eq!(store.messages(&b).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_store_without_server_id_column_is_migrated() {
+        // A store created before the `server_id` column existed must reopen,
+        // run the ALTER TABLE ADD COLUMN migration (backfilling NULL), and
+        // still load pre-existing rows (the seal is untouched). New incoming
+        // rows written after the migration dedup normally.
+        let path = tmp();
+        let peer = [0x16; 32];
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .put_message(
+                    &peer,
+                    1,
+                    &StoredMessage {
+                        text: "legacy".into(),
+                        status: 2,
+                    },
+                    1_700_000_000,
+                    None,
+                    None,
+                )
+                .unwrap();
+            // Wipe `server_id` to force the ALTER TABLE migration path.
+            store
+                .conn
+                .execute("ALTER TABLE messages RENAME TO messages_old", [])
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, \
+                     sealed BLOB, timestamp INT, sender BLOB)",
+                    [],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages SELECT id, peer, direction, sealed, timestamp, sender \
+                     FROM messages_old",
+                    [],
+                )
+                .unwrap();
+            store.conn.execute("DROP TABLE messages_old", []).unwrap();
+        }
+        // Reopen: init_schema adds `server_id` (NULL backfill) + the partial
+        // unique index. The legacy row still loads.
+        let store = Store::open(&path, "pw").unwrap();
+        let msgs = store.messages(&peer).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].msg.text, "legacy");
+        // Dedup works on the migrated store: a fresh incoming row with a
+        // server_id inserts, and its re-delivery collides.
+        let first = store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "new".into(),
+                    status: 2,
+                },
+                1_700_000_010,
+                None,
+                Some(999),
+            )
+            .unwrap();
+        let dup = store
+            .put_message(
+                &peer,
+                1,
+                &StoredMessage {
+                    text: "new".into(),
+                    status: 2,
+                },
+                1_700_000_011,
+                None,
+                Some(999),
+            )
+            .unwrap();
+        assert!(first.is_some(), "first delivery on migrated store inserts");
+        assert!(dup.is_none(), "re-delivery on migrated store dedups");
+        assert_eq!(
+            store.messages(&peer).unwrap().len(),
+            2,
+            "legacy + one new, no dup"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn peer_server_id_partial_index_exists_and_is_unique() {
+        // The dedup guarantee rests on `idx_messages_peer_server_id` being a
+        // UNIQUE partial index over `(peer, server_id) WHERE server_id IS NOT
+        // NULL`. Assert it exists, is unique, and is partial (so outgoing
+        // NULL-server_id rows are unconstrained). Survives a reopen.
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        let row: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT sql, 'x' FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_peer_server_id'",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let sql = row.0.to_ascii_lowercase();
+        assert!(
+            sql.contains("unique"),
+            "index must be UNIQUE; sql = {sql:?}"
+        );
+        assert!(
+            sql.contains("server_id is not null"),
+            "index must be partial (WHERE server_id IS NOT NULL); sql = {sql:?}"
+        );
+        // Reopen: idempotent CREATE INDEX IF NOT EXISTS.
+        drop(store);
+        let store = Store::open(&path, "pw").unwrap();
+        let still: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_peer_server_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(still, "partial index lost after reopen");
         let _ = fs::remove_file(&path);
     }
 

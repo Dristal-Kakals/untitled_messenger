@@ -198,7 +198,7 @@ impl Bridge {
                     }
                 } => match frame {
                     Ok(Some(ServerMessage::Delivered(envs))) => {
-                        self.handle_delivered(&envs, &event_tx).await;
+                        let _ = self.handle_delivered(&envs, &event_tx).await;
                     }
                     Ok(Some(ServerMessage::AckOk)) => {}
                     Ok(Some(ServerMessage::Bundle(_))) => {
@@ -454,12 +454,19 @@ impl Bridge {
         // recovered, not lost. Bounded by the client's read timeout so a
         // relay that stops mid-flush is detected instead of hanging the
         // (re)connect handshake forever.
+        //
+        // `self.net` is NOT set yet (it is assigned only after the drain
+        // completes), so `handle_delivered`'s internal `ack_envelopes` is a
+        // no-op here. We collect the acked ids from each batch and ack them
+        // directly on `client` — otherwise the recovered offline mail is
+        // never acked and the relay re-flushes it on every reconnect.
+        let mut pending_acks: Vec<u64> = Vec::new();
         loop {
             let frame = client.recv_msg_timeout().await.map_err(|e| humanize(&e))?;
             match frame {
                 Some(ServerMessage::AckOk) => break,
                 Some(ServerMessage::Delivered(envs)) => {
-                    self.handle_delivered(&envs, event_tx).await;
+                    pending_acks.extend(self.handle_delivered(&envs, event_tx).await);
                 }
                 Some(ServerMessage::Error(e)) => {
                     return Err(format!("server: {e:?}"));
@@ -467,6 +474,16 @@ impl Bridge {
                 Some(_) => {}
                 None => return Err("connection closed during subscribe".into()),
             }
+        }
+        // Flush the accumulated acks now that the Subscribe handshake is
+        // done. Best-effort: a failure leaves the envelopes in the outbox
+        // for the next flush (which dedups them at the store level).
+        if !pending_acks.is_empty() {
+            let _ = client
+                .send_msg(&ClientMessage::Ack {
+                    envelope_ids: pending_acks,
+                })
+                .await;
         }
         self.net = Some(client);
         Ok(())
@@ -910,7 +927,7 @@ impl Bridge {
                 Some(ServerMessage::Bundle(b)) => return Ok(b),
                 Some(ServerMessage::Delivered(envs)) => {
                     // Decrypt inline so push during the fetch is not lost.
-                    self.handle_delivered(&envs, event_tx).await;
+                    let _ = self.handle_delivered(&envs, event_tx).await;
                 }
                 Some(ServerMessage::AckOk) => {}
                 Some(ServerMessage::Error(e)) => {
@@ -969,10 +986,37 @@ impl Bridge {
         &mut self,
         envs: &[EncryptedEnvelope],
         event_tx: &mpsc::Sender<Event>,
-    ) {
+    ) -> Vec<u64> {
         let mut acked_ids: Vec<u64> = Vec::new();
         for env in envs {
             self.last_delivered_id = self.last_delivered_id.max(env.id);
+            // Dedup BEFORE decrypt: a re-delivered envelope (same relay
+            // `server_id`, e.g. an unacked outbox re-flushed on the next
+            // Subscribe) is already persisted + displayed. Decrypting it again
+            // would advance the Double Ratchet past a message number already
+            // consumed and then fail (the repeated number is not in the
+            // skipped cache), surfacing a spurious `Event::Error`. The store's
+            // `(peer, server_id)` partial unique index is the dedup key; with
+            // no store attached (embedded in-memory mode) there is no dedup
+            // and we always decrypt. Either way the envelope is acked below so
+            // the relay drops it from the outbox.
+            let server_id = i64::try_from(env.id).ok();
+            let chat_key = match env.kind {
+                MessageKind::Direct => ChatId::Peer(env.sender).key(),
+                MessageKind::Group => {
+                    match um_client::crypto_bridge::group_header_from_envelope(env) {
+                        Ok(h) => ChatId::Group(h.group_id).key(),
+                        Err(_) => ChatId::Peer(env.sender).key(),
+                    }
+                }
+            };
+            if let Some(store) = self.store.as_ref()
+                && store.has_server_id(&chat_key, server_id)
+            {
+                // Already had this exact envelope: ack + skip, no decrypt.
+                acked_ids.push(env.id);
+                continue;
+            }
             let (plaintext, _sender) = match self.session.receive(env) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1045,6 +1089,7 @@ impl Bridge {
         if !acked_ids.is_empty() {
             self.ack_envelopes(&acked_ids).await;
         }
+        acked_ids
     }
 
     /// Send an `Ack` for our own identity with the given envelope ids.
@@ -1068,6 +1113,16 @@ impl Bridge {
     /// Persist + emit an incoming chat message (1:1 or group text). `sender`
     /// is the author identity pub for a group message (so the view can prefix
     /// the sender); `None` for 1:1 (the peer is implied by the thread).
+    /// `env_id` is the relay-assigned monotonic envelope id, used as the dedup
+    /// key: the store's `(peer, server_id)` partial unique index makes a
+    /// re-delivered envelope (same `env_id`, e.g. an unacked outbox re-flushed
+    /// on the next Subscribe) `INSERT OR IGNORE`-collide with the original
+    /// row. When a store is attached and the insert reports a collision
+    /// (`Ok(None)`), the message is already persisted + displayed, so we
+    /// suppress the duplicate `Event::Decrypted` — but the caller still acks
+    /// the envelope (in `handle_delivered`) so the relay drops it from the
+    /// outbox and stops re-flushing it. With no store attached (embedded
+    /// in-memory mode) there is no dedup, so the event is always emitted.
     async fn deliver_chat(
         &self,
         chat: ChatId,
@@ -1077,9 +1132,17 @@ impl Bridge {
         event_tx: &mpsc::Sender<Event>,
     ) {
         let timestamp = now_secs();
+        // `env_id` is a u64 monotonic counter; the store column is i64. The
+        // relay's counter starts at 1 and a single client never approaches
+        // i64::MAX in a lifetime, so the cast is safe in practice. On the
+        // absurd off-chance env_id overflows i64, fall back to `None` (no
+        // dedup) rather than panicking — a duplicate is preferable to losing
+        // the message.
+        let server_id = i64::try_from(env_id).ok();
+        let mut is_duplicate = false;
         if let Some(store) = self.store.as_ref() {
             let key = chat.key();
-            let _ = store.put_message(
+            match store.put_message(
                 &key,
                 1,
                 &StoredMessage {
@@ -1088,7 +1151,25 @@ impl Bridge {
                 },
                 timestamp as i64,
                 sender.as_ref(),
-            );
+                server_id,
+            ) {
+                Ok(Some(_)) => {}                // fresh row: emit below
+                Ok(None) => is_duplicate = true, // re-delivery: suppress
+                Err(e) => {
+                    // Persist failure is not a reason to drop the in-memory
+                    // message; surface the error and still emit so the user
+                    // sees the message this session (it just won't survive a
+                    // restart).
+                    let _ = event_tx
+                        .send(Event::Error(format!("store: {}", humanize(&e))))
+                        .await;
+                }
+            }
+        }
+        if is_duplicate {
+            // Already persisted + displayed on a prior delivery; acking (in
+            // the caller) still drops it from the relay outbox.
+            return;
         }
         let msg = MessageView {
             local_id: env_id,
@@ -1228,6 +1309,11 @@ impl Bridge {
                     status: status.as_u8(),
                 },
                 timestamp as i64,
+                None,
+                // Outgoing: no relay-assigned server_id (the sender is us, not
+                // the relay), and a NULL server_id is never constrained by the
+                // partial unique index, so the optimistic-send row always
+                // inserts.
                 None,
             );
         }

@@ -33,7 +33,7 @@ sha2 = "0.11"
 postcard = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
-um_server = { path = "../server" }
+um_server = { path = "../server", features = ["test-helpers"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "test-util"] }
 iced_tiny_skia = "0.14"
 iced_graphics = "0.14"
