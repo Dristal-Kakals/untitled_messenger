@@ -1292,6 +1292,9 @@ pub fn humanize(e: &ClientError) -> String {
     match e {
         ClientError::NoSession => "no secure session with this contact yet".to_string(),
         ClientError::NoGroupSession(_) => "no group session for this group".to_string(),
+        ClientError::GroupSenderMismatch => {
+            "group message sender does not match its claimed author".to_string()
+        }
         ClientError::NoOneTimePreKey(_) => "missing one-time prekey".to_string(),
         ClientError::NotConnected => "not connected to server".to_string(),
         ClientError::Store(s) if s.contains("wrong passphrase") => "wrong passphrase".to_string(),

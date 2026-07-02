@@ -72,10 +72,13 @@ fn real_bundle() -> (IdentityKey, PreKeyBundle) {
     (id, bundle)
 }
 
-fn envelope() -> EncryptedEnvelope {
+/// Build an envelope claiming to be from `sender`. The Send arm checks
+/// `envelope.sender == self_id`, so a test driving `Send` as `alice` must pass
+/// `alice_pub` here.
+fn envelope_from(sender: [u8; 32]) -> EncryptedEnvelope {
     EncryptedEnvelope {
         id: 0, // server assigns
-        sender: [0x55; 32],
+        sender,
         kind: um_protocol::MessageKind::Direct,
         header: vec![1, 2, 3],
         init: None,
@@ -190,7 +193,8 @@ async fn send_to_unregistered_recipient_errors() {
         .await
         .expect("serve");
 
-    let (_, bundle) = real_bundle();
+    let (alice_id, bundle) = real_bundle();
+    let alice_pub = alice_id.verifying.to_bytes();
     let mut alice = TestClient::connect(addr).await;
     alice.send(&ClientMessage::Register { bundle }).await;
     let _ = alice.recv().await; // AckOk
@@ -198,7 +202,7 @@ async fn send_to_unregistered_recipient_errors() {
     alice
         .send(&ClientMessage::Send {
             recipients: vec![[0xFF; 32]],
-            envelope: envelope(),
+            envelope: envelope_from(alice_pub),
         })
         .await;
     assert!(matches!(

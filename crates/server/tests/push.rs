@@ -61,10 +61,10 @@ fn real_bundle() -> ([u8; 32], PreKeyBundle) {
     (id.verifying.to_bytes(), bundle)
 }
 
-fn envelope() -> EncryptedEnvelope {
+fn envelope_from(sender: [u8; 32]) -> EncryptedEnvelope {
     EncryptedEnvelope {
         id: 0,
-        sender: [0x55; 32],
+        sender,
         kind: um_protocol::MessageKind::Direct,
         header: vec![1, 2, 3],
         init: None,
@@ -131,7 +131,7 @@ async fn subscribe_receives_push_for_new_message() {
 #[tokio::test]
 async fn subscribe_flushes_unacked_outbox() {
     let addr = spawn_server().await;
-    let (_, alice_bundle) = real_bundle();
+    let (alice_pub, alice_bundle) = real_bundle();
     let (bob_pub, bob_bundle) = real_bundle();
 
     let mut alice = TestClient::connect(addr).await;
@@ -153,7 +153,7 @@ async fn subscribe_flushes_unacked_outbox() {
     alice
         .send(&ClientMessage::Send {
             recipients: vec![bob_pub],
-            envelope: envelope(),
+            envelope: envelope_from(alice_pub),
         })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
@@ -178,7 +178,7 @@ async fn subscribe_flushes_unacked_outbox() {
 #[tokio::test]
 async fn reconnect_repushes_unacked() {
     let addr = spawn_server().await;
-    let (_, alice_bundle) = real_bundle();
+    let (alice_pub, alice_bundle) = real_bundle();
     let (bob_pub, bob_bundle) = real_bundle();
 
     let mut alice = TestClient::connect(addr).await;
@@ -202,7 +202,7 @@ async fn reconnect_repushes_unacked() {
     alice
         .send(&ClientMessage::Send {
             recipients: vec![bob_pub],
-            envelope: envelope(),
+            envelope: envelope_from(alice_pub),
         })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
@@ -233,7 +233,7 @@ async fn reconnect_repushes_unacked() {
 #[tokio::test]
 async fn last_subscribe_wins_evicts_old() {
     let addr = spawn_server().await;
-    let (_, alice_bundle) = real_bundle();
+    let (alice_pub, alice_bundle) = real_bundle();
     let (bob_pub, bob_bundle) = real_bundle();
 
     let mut alice = TestClient::connect(addr).await;
@@ -282,7 +282,7 @@ async fn last_subscribe_wins_evicts_old() {
     alice
         .send(&ClientMessage::Send {
             recipients: vec![bob_pub],
-            envelope: envelope(),
+            envelope: envelope_from(alice_pub),
         })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));
@@ -295,7 +295,7 @@ async fn last_subscribe_wins_evicts_old() {
 #[tokio::test]
 async fn poll_still_works_alongside_subscribe() {
     let addr = spawn_server().await;
-    let (_, alice_bundle) = real_bundle();
+    let (alice_pub, alice_bundle) = real_bundle();
     let (bob_pub, bob_bundle) = real_bundle();
 
     let mut alice = TestClient::connect(addr).await;
@@ -316,7 +316,7 @@ async fn poll_still_works_alongside_subscribe() {
     alice
         .send(&ClientMessage::Send {
             recipients: vec![bob_pub],
-            envelope: envelope(),
+            envelope: envelope_from(alice_pub),
         })
         .await;
     assert!(matches!(alice.recv().await, ServerMessage::AckOk));

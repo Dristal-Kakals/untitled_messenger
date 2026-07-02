@@ -315,11 +315,29 @@ impl ClientSession {
 
     /// Group Sender Keys receive path. Looks up the `GroupSession` by the
     /// `group_id` encoded in the group header and decrypts with it.
+    ///
+    /// Sender authentication: the Sender-Key `header.sender_id` is the sender's
+    /// `fingerprint(identity_pub)` (set in `GroupSession::new`), and the group
+    /// AEAD signature is over the header + ciphertext — **not** over
+    /// `envelope.sender`. So a group member could sign a valid group message
+    /// with their own Sender-Key key while setting `envelope.sender` to another
+    /// member's pub, fooling the receiver into attributing the message to that
+    /// other member. We bind the two: `header.sender_id` must equal
+    /// `fingerprint_of_pub(envelope.sender)`, else the message is rejected with
+    /// `GroupSenderMismatch` (before any decrypt work).
     fn receive_group(
         &mut self,
         envelope: &EncryptedEnvelope,
     ) -> Result<(Vec<u8>, [u8; 32]), ClientError> {
         let group_encrypted = group_encrypted_from_envelope(envelope)?;
+        // Bind the wire-level sender to the crypto-level sender id. The header
+        // is deserialized above, so `sender_id` is attacker-controlled only in
+        //sofar as the envelope bytes are; the fingerprint check ties it to the
+        // identity pub the relay attributed the envelope to.
+        let expected_sender_id = um_crypto::fingerprint_of_pub(&envelope.sender);
+        if group_encrypted.header.sender_id != expected_sender_id {
+            return Err(ClientError::GroupSenderMismatch);
+        }
         let group_id = group_encrypted.header.group_id;
         let session = self
             .groups
@@ -546,6 +564,41 @@ mod tests {
         let mut alice = ClientSession::generate(1);
         let err = alice.send_group(&[0x99; 32], b"hi").unwrap_err();
         assert!(matches!(err, ClientError::NoGroupSession(_)));
+    }
+
+    /// A group message whose `envelope.sender` does not match the Sender-Key
+    /// `header.sender_id` is rejected with `GroupSenderMismatch`. This is the
+    /// spoofing fix: a group member signs a valid group message with their own
+    /// Sender-Key key but sets `envelope.sender` to another member's pub to
+    /// misattribute. The receiver binds the two via
+    /// `fingerprint_of_pub(envelope.sender) == header.sender_id` and rejects.
+    #[test]
+    fn group_receive_rejects_spoofed_sender() {
+        let mut alice = ClientSession::generate(1);
+        let mut bob = ClientSession::generate(1);
+        let gid = [0xCC; 32];
+        alice.create_group(gid).unwrap();
+        bob.create_group(gid).unwrap();
+        let alice_state = alice.group_distribution(&gid).unwrap();
+        let bob_state = bob.group_distribution(&gid).unwrap();
+        alice.add_group_peer(&gid, bob_state).unwrap();
+        bob.add_group_peer(&gid, alice_state).unwrap();
+
+        // Alice sends a legitimate group message.
+        let mut env = alice.send_group(&gid, b"from alice").unwrap();
+        // Sanity: it decrypts cleanly before tampering.
+        assert_eq!(bob.receive(&env).unwrap().0, b"from alice");
+
+        // Spoof: rewrite the wire sender to bob's own pub. The header + signature
+        // are still alice's (header.sender_id = fingerprint(alice)), so the AEAD
+        // would decrypt — but the sender binding now fails: the envelope claims
+        // to be from bob while the Sender-Key state is alice's.
+        env.sender = bob.identity_pub();
+        let err = bob.receive(&env).unwrap_err();
+        assert!(
+            matches!(err, ClientError::GroupSenderMismatch),
+            "spoofed sender must be rejected, got {err:?}"
+        );
     }
 
     // ---- Signed-prekey rotation + one-time replenishment --------------------

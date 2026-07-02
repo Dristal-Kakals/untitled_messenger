@@ -11,3 +11,4 @@ pub mod sender_keys;
 pub mod x3dh;
 pub use ed25519_dalek::{Signature, VerifyingKey};
 pub use error::CryptoError;
+pub use identity::fingerprint_of_pub;

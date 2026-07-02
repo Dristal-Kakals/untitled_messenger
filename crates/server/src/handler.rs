@@ -48,6 +48,17 @@ pub fn handle(
             recipients,
             envelope,
         } => {
+            // The envelope must claim to come from the authenticated identity.
+            // The relay is not a crypto authority, but it is the one place that
+            // knows which connection owns `self_id`, so it can stop a client
+            // from sending envelopes attributed to a different identity (a
+            // cheap impersonation that the E2E crypto layer cannot detect on
+            // its own for group traffic, where `envelope.sender` is not covered
+            // by the Sender-Key signature). Defense-in-depth alongside the
+            // client's `GroupSenderMismatch` check.
+            if envelope.sender != *self_id {
+                return ServerMessage::Error(um_protocol::ServerError::BadSender);
+            }
             // Reject if any recipient is not registered.
             if !recipients.iter().all(|r| store.is_registered(r)) {
                 return ServerMessage::Error(um_protocol::ServerError::UnknownRecipient);
@@ -126,10 +137,13 @@ mod tests {
         (id.verifying.to_bytes(), bundle)
     }
 
-    fn envelope(id: u64) -> EncryptedEnvelope {
+    /// Build an envelope claiming to be from `sender`. The Send arm checks
+    /// `envelope.sender == self_id`, so a test that drives `Send` as `alice`
+    /// must pass `alice` here.
+    fn envelope_from(id: u64, sender: [u8; 32]) -> EncryptedEnvelope {
         EncryptedEnvelope {
             id,
-            sender: [0x55; 32],
+            sender,
             kind: um_protocol::MessageKind::Direct,
             header: vec![1, 2, 3],
             init: None,
@@ -236,7 +250,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         assert_eq!(reply, ServerMessage::AckOk);
@@ -259,7 +273,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![[0xFF; 32]],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         assert_eq!(reply, ServerMessage::Error(ServerError::UnknownRecipient));
@@ -302,7 +316,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         let reply = handle(
@@ -340,7 +354,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         let reply = handle(
@@ -391,7 +405,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         assert_eq!(reply, ServerMessage::AckOk);
@@ -428,7 +442,7 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         assert_eq!(reply, ServerMessage::AckOk);
@@ -466,11 +480,79 @@ mod tests {
             &alice,
             ClientMessage::Send {
                 recipients: vec![bob],
-                envelope: envelope(0),
+                envelope: envelope_from(0, alice),
             },
         );
         assert_eq!(reply, ServerMessage::AckOk);
         // The envelope is still in bob's outbox (recoverable on flush/poll).
+        assert_eq!(store.poll(&bob, 0).len(), 1);
+    }
+
+    /// `Send` with `envelope.sender != self_id` is rejected with `BadSender`.
+    /// A connection may only send envelopes attributed to its own identity.
+    #[test]
+    fn send_with_wrong_sender_rejected() {
+        let store = Store::new();
+        let subs = Subscribers::new();
+        let (alice, bundle_a) = real_bundle(true);
+        let (bob, bundle_b) = real_bundle(true);
+        handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &subs,
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
+        // Alice's connection sends an envelope claiming to be from bob.
+        let reply = handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Send {
+                recipients: vec![bob],
+                envelope: envelope_from(0, bob),
+            },
+        );
+        assert_eq!(reply, ServerMessage::Error(ServerError::BadSender));
+        // Nothing was delivered: the sender check runs before delivery.
+        assert!(store.poll(&bob, 0).is_empty());
+    }
+
+    /// `Send` with `envelope.sender == self_id` is accepted (the happy path the
+    /// BadSender check must not break).
+    #[test]
+    fn send_with_correct_sender_accepted() {
+        let store = Store::new();
+        let subs = Subscribers::new();
+        let (alice, bundle_a) = real_bundle(true);
+        let (bob, bundle_b) = real_bundle(true);
+        handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Register { bundle: bundle_a },
+        );
+        handle(
+            &store,
+            &subs,
+            &bob,
+            ClientMessage::Register { bundle: bundle_b },
+        );
+        let reply = handle(
+            &store,
+            &subs,
+            &alice,
+            ClientMessage::Send {
+                recipients: vec![bob],
+                envelope: envelope_from(0, alice),
+            },
+        );
+        assert_eq!(reply, ServerMessage::AckOk);
         assert_eq!(store.poll(&bob, 0).len(), 1);
     }
 }

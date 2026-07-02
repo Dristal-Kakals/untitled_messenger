@@ -115,6 +115,10 @@ pub enum ServerError {
     UnknownRecipient,
     /// `Register` carried a bad signed-prekey signature.
     InvalidSignature,
+    /// `Send` carried an `envelope.sender` that does not match the connection's
+    /// authenticated identity. A connection may only send envelopes it authored;
+    /// this blocks a client from impersonating another identity at the relay.
+    BadSender,
     /// The client sent a malformed frame; the connection is closed.
     MalformedFrame,
     /// A frame exceeded the maximum payload size.
@@ -245,6 +249,7 @@ mod tests {
     fn server_message_ackok_and_error_round_trip() {
         round_trip(&ServerMessage::AckOk);
         round_trip(&ServerMessage::Error(ServerError::UnknownRecipient));
+        round_trip(&ServerMessage::Error(ServerError::BadSender));
     }
 
     #[test]
@@ -252,6 +257,8 @@ mod tests {
         assert_ne!(ServerError::UnknownRecipient, ServerError::InvalidSignature);
         assert_ne!(ServerError::MalformedFrame, ServerError::TooLarge);
         assert_ne!(ServerError::TooLarge, ServerError::NotRegistered);
+        assert_ne!(ServerError::BadSender, ServerError::UnknownRecipient);
+        assert_ne!(ServerError::BadSender, ServerError::InvalidSignature);
     }
 
     #[test]
