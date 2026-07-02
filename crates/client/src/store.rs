@@ -34,7 +34,7 @@ use std::path::Path;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 use rusqlite::Connection;
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -61,7 +61,7 @@ impl StoreKey {
     /// Derive a fresh key from `passphrase` with a random salt (new store).
     pub fn derive_new(passphrase: &str) -> Result<Self, ClientError> {
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut salt);
         let key = derive_key(passphrase, &salt)?;
         Ok(Self { key, salt })
     }
@@ -93,7 +93,7 @@ fn derive_key(passphrase: &str, salt: &[u8; 16]) -> Result<[u8; 32], ClientError
 fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, ClientError> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = chacha20poly1305::XNonce::from(nonce_bytes);
     let ct = cipher
         .encrypt(
@@ -531,9 +531,8 @@ mod tests {
 
     fn tmp() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 8];
-        rng.fill_bytes(&mut bytes);
+        OsRng.fill_bytes(&mut bytes);
         p.push(format!("um-store-test-{}.db", hex_encode(&bytes)));
         p
     }

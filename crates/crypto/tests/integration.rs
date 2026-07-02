@@ -57,8 +57,8 @@ fn group_then_private_works_independently() {
 
 fn random_group_id() -> [u8; 32] {
     let mut g = [0u8; 32];
-    use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut g);
+    use rand_core::{OsRng, RngCore};
+    OsRng.fill_bytes(&mut g);
     g
 }
 

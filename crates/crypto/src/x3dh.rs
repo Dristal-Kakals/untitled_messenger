@@ -1,6 +1,6 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 

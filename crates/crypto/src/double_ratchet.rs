@@ -58,7 +58,7 @@ fn evict_if_full(skipped: &mut HashMap<(PublicKey, u32), [u8; 32]>) {
 
 impl RatchetSession {
     pub fn init_alice(session_init: &SessionInit) -> Result<Self, CryptoError> {
-        let rng = rand::rngs::OsRng;
+        let rng = rand_core::OsRng;
         let dh_priv = StaticSecret::random_from_rng(rng);
         let dh_pub = PublicKey::from(&dh_priv);
 
@@ -163,7 +163,7 @@ impl RatchetSession {
             self.nr = 0;
 
             // DH ratchet (sending): new self priv × new peer pub.
-            let rng = rand::rngs::OsRng;
+            let rng = rand_core::OsRng;
             self.dh_priv = StaticSecret::random_from_rng(rng);
             self.dh_pub = PublicKey::from(&self.dh_priv);
             let dh_send = self

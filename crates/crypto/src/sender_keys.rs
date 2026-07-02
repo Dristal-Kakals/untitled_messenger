@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 
 use crate::CryptoError;
 use crate::aead::{kdf_chain, open, random_nonce, seal};
@@ -68,8 +68,8 @@ fn group_header_aad(h: &GroupHeader) -> Vec<u8> {
 impl GroupSession {
     pub fn new(group_id: [u8; 32], self_identity: &IdentityKey) -> Result<Self, CryptoError> {
         let mut seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
-        let mut rng = rand::rngs::OsRng;
+        OsRng.fill_bytes(&mut seed);
+        let mut rng = OsRng;
         let signing_priv = SigningKey::generate(&mut rng);
         let signing_pub = signing_priv.verifying_key();
 
@@ -189,7 +189,7 @@ mod tests {
 
     fn gid() -> [u8; 32] {
         let mut g = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut g);
+        OsRng.fill_bytes(&mut g);
         g
     }
 

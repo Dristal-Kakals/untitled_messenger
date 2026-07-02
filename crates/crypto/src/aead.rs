@@ -4,7 +4,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
 use crate::CryptoError;
@@ -48,7 +48,7 @@ pub fn open(
 
 pub fn random_nonce() -> [u8; 24] {
     let mut n = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut n);
+    OsRng.fill_bytes(&mut n);
     n
 }
 
