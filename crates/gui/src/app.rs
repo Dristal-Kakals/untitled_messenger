@@ -181,6 +181,15 @@ impl UmApp {
         let _ = self.bridge_cmd.blocking_send(cmd);
     }
 
+    /// Sum of per-chat unread counts across every chat (peers + groups). Drives
+    /// the total-unread badge in the sidebar header, which stays visible even
+    /// when the contacts list is scrolled or filtered so the user notices new
+    /// messages without scanning every row. Chats with no entry (count 0) are
+    /// absent from the map, so this is just a sum of the stored values.
+    pub fn total_unread(&self) -> u32 {
+        self.unread.values().copied().sum()
+    }
+
     /// The next optimistic-send local id.
     const fn next_local_id(&mut self) -> u64 {
         let id = self.next_local_id;
@@ -957,5 +966,36 @@ mod tests {
         assert_eq!(app.identity_pub, Some(pub_));
         assert_eq!(app.identity_fingerprint, Some(fp));
         assert_eq!(app.view, View::ContactList);
+    }
+
+    #[test]
+    fn total_unread_sums_across_peers_and_groups() {
+        // The header badge sums every entry in `unread`, peers + groups alike.
+        let mut app = test_app();
+        assert_eq!(app.total_unread(), 0, "empty unread → 0");
+        app.unread.insert(ChatId::Peer([0x11; 32]), 2);
+        app.unread.insert(ChatId::Peer([0x22; 32]), 3);
+        app.unread.insert(ChatId::Group([0x33; 32]), 5);
+        assert_eq!(app.total_unread(), 10, "2 + 3 + 5 across peer + group");
+    }
+
+    #[test]
+    fn total_unread_drops_to_zero_when_chats_opened() {
+        // Opening a chat clears its unread entry, so the total reflects that.
+        let mut app = test_app();
+        app.unread.insert(ChatId::Peer([0x11; 32]), 4);
+        app.unread.insert(ChatId::Group([0x22; 32]), 1);
+        assert_eq!(app.total_unread(), 5);
+        let _ = update(&mut app, Message::OpenChat([0x11; 32]));
+        assert_eq!(app.total_unread(), 1, "opened peer's unread cleared");
+    }
+
+    #[test]
+    fn total_unread_zero_after_logout() {
+        let mut app = test_app();
+        app.unread.insert(ChatId::Peer([0x11; 32]), 7);
+        assert_eq!(app.total_unread(), 7);
+        let _ = update(&mut app, Message::Logout);
+        assert_eq!(app.total_unread(), 0, "logout clears unread → total 0");
     }
 }

@@ -49,9 +49,24 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
     }
     .color(theme::MUTED)
     .size(12);
+
+    // Total-unread badge: sum across every chat. Shown in the header so it
+    // stays visible even when the contacts list is scrolled or filtered — a
+    // glance at the sidebar is enough to know something new arrived. Hidden
+    // (empty spacer) when there is nothing unread so the header doesn't jump.
+    let total = app.total_unread();
+    let total_badge = if total > 0 {
+        text(format!("{total} unread"))
+            .color(theme::ACCENT)
+            .size(12)
+    } else {
+        text("")
+    };
+
     let header = row![
         status_dot,
         status_label,
+        total_badge,
         Space::new().width(Fill),
         button(text("⚙ settings"))
             .style(theme::secondary_button_style)
