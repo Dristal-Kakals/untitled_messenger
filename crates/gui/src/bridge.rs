@@ -492,11 +492,11 @@ impl Bridge {
     ) {
         // Persist the manual-verification flag so the UI's ✓ mark survives
         // restarts (previously UI-local state, lost on every reopen).
-        if let Some(store) = self.store.as_ref() {
-            if let Err(e) = store.set_verified(&identity_pub, true) {
-                let _ = event_tx.send(Event::Error(humanize(&e))).await;
-                return;
-            }
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = store.set_verified(&identity_pub, true)
+        {
+            let _ = event_tx.send(Event::Error(humanize(&e))).await;
+            return;
         }
         let _ = event_tx
             .send(Event::FingerprintVerified { identity_pub })

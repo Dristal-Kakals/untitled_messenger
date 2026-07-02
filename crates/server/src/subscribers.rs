@@ -38,10 +38,10 @@ impl Subscribers {
     /// removing a newer subscriber that evicted this connection.
     pub fn unregister_if_match(&self, id: &[u8; 32], tx: &mpsc::Sender<ServerMessage>) {
         let mut g = self.inner.lock().expect("subscribers mutex poisoned");
-        if let Some(existing) = g.get(id) {
-            if existing.same_channel(tx) {
-                g.remove(id);
-            }
+        if let Some(existing) = g.get(id)
+            && existing.same_channel(tx)
+        {
+            g.remove(id);
         }
     }
 

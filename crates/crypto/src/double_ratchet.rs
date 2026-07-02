@@ -49,10 +49,10 @@ fn header_aad(h: &Header) -> Vec<u8> {
 }
 
 fn evict_if_full(skipped: &mut HashMap<(PublicKey, u32), [u8; 32]>) {
-    if skipped.len() >= MAX_SKIPPED {
-        if let Some((&key, _)) = skipped.iter().min_by_key(|((_, n), _)| *n) {
-            skipped.remove(&key);
-        }
+    if skipped.len() >= MAX_SKIPPED
+        && let Some((&key, _)) = skipped.iter().min_by_key(|((_, n), _)| *n)
+    {
+        skipped.remove(&key);
     }
 }
 

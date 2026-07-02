@@ -58,12 +58,11 @@ fn server_addr() -> SocketAddr {
 fn server_addr_from(args: impl Iterator<Item = String>, env: Option<String>) -> SocketAddr {
     let mut args = args;
     while let Some(a) = args.next() {
-        if a == "--server" {
-            if let Some(v) = args.next() {
-                if let Ok(parsed) = v.parse() {
-                    return parsed;
-                }
-            }
+        if a == "--server"
+            && let Some(v) = args.next()
+            && let Ok(parsed) = v.parse()
+        {
+            return parsed;
         }
     }
     env.and_then(|v| v.parse().ok())
