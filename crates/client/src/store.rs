@@ -23,7 +23,10 @@
 //!   blob, and is NOT part of the AEAD associated data (changing it does not
 //!   break the seal). The sealed `StoredMessage` is unchanged, so existing
 //!   rows (written before this column existed) re-open unchanged; the
-//!   `ALTER TABLE ADD COLUMN` migration backfills `NULL`.
+//!   `ALTER TABLE ADD COLUMN` migration backfills `NULL`. Indexed by
+//!   `(peer, id)` (`idx_messages_peer_id`) so `load_history`'s
+//!   `WHERE peer = ?1 ORDER BY id ASC` is an index range scan, not a full
+//!   table scan + sort.
 //! - `groups(group_id BLOB PRIMARY KEY, name TEXT)` — group id + display name.
 //!   The group id is public (a `SHA-256` of name+members+founder, not a secret);
 //!   the name is plaintext metadata. Persists the roster's identity so the
@@ -543,6 +546,17 @@ fn init_schema(conn: &Connection) -> Result<(), ClientError> {
     // `ALTER TABLE ADD COLUMN` is a no-op if the column already exists, so
     // this is idempotent across reopen.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN sender BLOB", []);
+    // Cover the `load_history` query (`WHERE peer = ?1 ORDER BY id ASC`). Without
+    // this index SQLite scans the whole `messages` table and sorts the matches;
+    // with it the planner walks a single index range per peer, no sort step.
+    // `(peer, id)` is chosen over `(peer, timestamp)` because `id` is the actual
+    // `ORDER BY` key and is monotonic with insert order, which matches the
+    // arrival order we want to display. `CREATE INDEX IF NOT EXISTS` is a no-op
+    // on reopen, so this is idempotent across migrations.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_peer_id ON messages (peer, id)",
+        [],
+    );
     Ok(())
 }
 
@@ -925,6 +939,82 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].msg.text, "legacy");
         assert_eq!(msgs[0].sender, None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_peer_id_index_exists_and_is_used() {
+        // `load_history` does `WHERE peer = ?1 ORDER BY id ASC`. We added
+        // `idx_messages_peer_id` to make that an index range scan instead of a
+        // full table scan + sort. Assert the index exists after init_schema and
+        // that the planner actually picks it for the load_history query.
+        let path = tmp();
+        let peer = [0x33; 32];
+        let store = Store::create(&path, "pw").unwrap();
+
+        // Index present in the schema.
+        let has_index: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_peer_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "idx_messages_peer_id missing after create");
+
+        // Insert a few rows so the planner has a reason to prefer the index.
+        for i in 0..5 {
+            store
+                .put_message(
+                    &peer,
+                    i % 2,
+                    &StoredMessage {
+                        text: format!("m{i}"),
+                        status: 2,
+                    },
+                    1_700_000_000 + i,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // The load-history query plan must mention the covering index.
+        let plan: String = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id, direction, sealed, timestamp, sender FROM messages \
+                 WHERE peer = ?1 ORDER BY id ASC",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![peer.as_slice()], |r| {
+                let s: String = r.get(3)?;
+                Ok(s)
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_messages_peer_id") || plan.contains("COVERING INDEX"),
+            "planner did not use idx_messages_peer_id; plan = {plan:?}"
+        );
+
+        // Index survives a reopen (CREATE INDEX IF NOT EXISTS is idempotent).
+        drop(store);
+        let store = Store::open(&path, "pw").unwrap();
+        let still: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_peer_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(still, "idx_messages_peer_id lost after reopen");
         let _ = fs::remove_file(&path);
     }
 
