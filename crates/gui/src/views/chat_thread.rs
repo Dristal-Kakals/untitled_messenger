@@ -8,7 +8,7 @@ use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, TopHint, UmApp, format_time, hex32, history_top_hint};
+use super::{Message, UmApp, format_time, hex32, history_top_hint, top_hint_line};
 use crate::ChatId;
 use crate::theme;
 
@@ -64,21 +64,6 @@ fn message_row(
         .into()
 }
 
-/// A dim centered line shown at the top of the thread (above the oldest cached
-/// message) when an older page is loading or the start of history has been
-/// reached. Pure over the `TopHint`; returns `None` when no hint applies so the
-/// caller can skip pushing anything.
-fn top_hint_line(hint: TopHint) -> Element<'static, Message> {
-    let (label, color) = match hint {
-        TopHint::Loading => ("loading older…", theme::MUTED),
-        TopHint::StartOfHistory => ("start of history", theme::MUTED),
-    };
-    container(text(label).color(color).size(11))
-        .align_x(alignment::Horizontal::Center)
-        .width(Fill)
-        .into()
-}
-
 pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
     let contact = app.contacts.iter().find(|c| c.identity_pub == peer);
     let title = match contact {
@@ -104,10 +89,7 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
     // a "start of history" marker once the oldest row is reached. Only shown
     // once the thread has at least one cached message — a bare "no messages
     // yet" thread has no pagination state to hint about.
-    let thread_nonempty = app
-        .threads
-        .get(&chat)
-        .is_some_and(|t| !t.is_empty());
+    let thread_nonempty = app.threads.get(&chat).is_some_and(|t| !t.is_empty());
     if thread_nonempty {
         let loading = app.loading_older.contains(&chat);
         let has_more = app.has_more_history.get(&chat).copied().unwrap_or(false);
@@ -120,11 +102,7 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
             msgs = msgs.push(message_row(&m.text, m.dir, m.timestamp, m.status));
         }
     }
-    if app
-        .threads
-        .get(&chat)
-        .is_none_or(|t| t.is_empty())
-    {
+    if app.threads.get(&chat).is_none_or(|t| t.is_empty()) {
         msgs = msgs.push(
             container(text("no messages yet").color(theme::MUTED).size(13))
                 .align_x(alignment::Horizontal::Center)
@@ -154,6 +132,7 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
             .on_scroll(move |vp: Viewport| Message::ChatScrolled {
                 chat: ChatId::Peer(peer),
                 at_top: vp.absolute_offset().y <= SCROLL_AT_TOP_EPS,
+                offset: vp.absolute_offset().y,
             })
             .spacing(4),
         compose,

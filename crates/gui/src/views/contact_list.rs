@@ -9,7 +9,9 @@
 //! placeholder so the window is fully used even before a chat is opened.
 
 use iced::alignment;
-use iced::widget::{Space, button, column, container, rich_text, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, rich_text, row, scrollable, text, text_input,
+};
 use iced::{Element, Fill, Length};
 
 use super::{Message, UmApp, hex32, highlighted_name, query_rank, short_hex};
@@ -185,8 +187,7 @@ pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
         .iter()
         .filter_map(|g| {
             let id_hex = hex32(&g.id);
-            query_rank(&app.search_query, &[&g.name, &id_hex, &short_hex(&g.id)])
-                .map(|r| (r, g))
+            query_rank(&app.search_query, &[&g.name, &id_hex, &short_hex(&g.id)]).map(|r| (r, g))
         })
         .collect();
     ranked_groups.sort_by_key(|(r, _)| *r);

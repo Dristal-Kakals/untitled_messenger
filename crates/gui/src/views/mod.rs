@@ -265,6 +265,48 @@ pub fn history_top_hint(loading: bool, has_more: bool) -> Option<TopHint> {
     None
 }
 
+/// Target absolute y-offset to scroll a thread to after prepending `prepended`
+/// older rows, so the previously-topmost visible row stays in view. `saved` is
+/// the viewport's `absolute_offset().y` captured *before* the prepend (from the
+/// last `ChatScrolled`); `row_height` is the per-row height estimate
+/// ([`crate::theme::EST_ROW_HEIGHT`]).
+///
+/// Prepending `prepended` rows grows the content from the top by
+/// `prepended * row_height`, so the row that was at absolute offset `saved`
+/// moves down to `saved + prepended * row_height`. Scrolling to that offset
+/// puts it back at the top of the viewport. When `at_top` triggered the load,
+/// `saved ≈ 0` and the target is just the prepended block's height — the user
+/// keeps seeing the row they were reading, with the older page above it.
+///
+/// Pure, testable. The app calls this on `OlderHistoryLoaded` and emits a
+/// `scroll_to` task with the result for the open chat's scrollable.
+pub fn scroll_restore_target(saved: f32, prepended: usize, row_height: f32) -> f32 {
+    saved + (prepended as f32) * row_height
+}
+
+/// Render a [`TopHint`] as a small dim centered line, shown at the top of a
+/// chat thread (above the oldest cached message). Both the 1:1
+/// ([`chat_thread`]) and group ([`group_chat`]) views render this above the
+/// message list, so it lives here once instead of being copy-pasted into each.
+///
+/// Returns `None` only via [`history_top_hint`] (the caller decides whether to
+/// push the line at all); this helper always produces a line for a given
+/// `TopHint`. The element is `'static` (no borrowed content) so it can be
+/// pushed into the message column freely.
+pub fn top_hint_line(hint: TopHint) -> iced::Element<'static, Message> {
+    use iced::alignment;
+    use iced::widget::{container, text};
+
+    let label = match hint {
+        TopHint::Loading => "loading older…",
+        TopHint::StartOfHistory => "start of history",
+    };
+    container(text(label).color(crate::theme::MUTED).size(11))
+        .align_x(alignment::Horizontal::Center)
+        .width(iced::Fill)
+        .into()
+}
+
 pub use chat_thread::chat_thread;
 pub use contact_list::{contact_list, sidebar};
 pub use group_chat::group_chat;
@@ -517,7 +559,10 @@ mod tests {
     #[test]
     fn history_top_hint_no_more_shows_start_of_history() {
         // has_more = false and nothing loading → oldest row reached.
-        assert_eq!(history_top_hint(false, false), Some(TopHint::StartOfHistory));
+        assert_eq!(
+            history_top_hint(false, false),
+            Some(TopHint::StartOfHistory)
+        );
     }
 
     #[test]
@@ -525,5 +570,26 @@ mod tests {
         // Mid-thread: more history exists, nothing loading, user not at the
         // top → no hint.
         assert_eq!(history_top_hint(false, true), None);
+    }
+
+    #[test]
+    fn scroll_restore_target_at_top_loads_full_prepended_height() {
+        // Scrolled to the top (saved ≈ 0) when the load fires; prepending 5
+        // rows of height 50 → target 250, so the previously-top row (now 250px
+        // down) returns to the top of the viewport.
+        assert_eq!(scroll_restore_target(0.0, 5, 50.0), 250.0);
+    }
+
+    #[test]
+    fn scroll_restore_target_preserves_mid_scroll_anchor() {
+        // If the saved offset was non-zero (user slightly below the top), the
+        // target shifts by exactly the prepended block height on top of it.
+        assert_eq!(scroll_restore_target(120.0, 4, 50.0), 320.0);
+    }
+
+    #[test]
+    fn scroll_restore_target_zero_prepended_is_saved_unchanged() {
+        // An empty older page prepends nothing → no shift; the viewport stays.
+        assert_eq!(scroll_restore_target(80.0, 0, 50.0), 80.0);
     }
 }

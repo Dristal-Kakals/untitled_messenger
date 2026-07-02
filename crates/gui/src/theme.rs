@@ -53,6 +53,16 @@ pub const BUBBLE_PAD: f32 = 8.0;
 /// list column does not flex with the window; the active chat fills the rest.
 pub const SIDEBAR_WIDTH: f32 = 300.0;
 
+/// Estimated height of one message row (px), used only by scroll-position
+/// restoration when an older history page is prepended to a thread. iced 0.14
+/// has no "scroll to widget by id" operation, so after prepending N rows the
+/// app scrolls down by `N * EST_ROW_HEIGHT` to keep the previously-topmost row
+/// in view. The estimate (bubble text ~14px + `BUBBLE_PAD` top/bottom + a
+/// 9px timestamp + inter-row spacing) need not be exact: a small error just
+/// leaves the user a few pixels off the original anchor instead of jumping to
+/// the very top or bottom of the thread.
+pub const EST_ROW_HEIGHT: f32 = 50.0;
+
 /// Sidebar background fill — a touch darker than `panel_style` so the sidebar
 /// reads as a distinct column against the window background and the active
 /// chat panel.

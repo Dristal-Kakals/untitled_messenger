@@ -323,21 +323,45 @@ impl Store {
     /// metadata; rows written before the column existed have `NULL` and load
     /// as `sender = None`.
     ///
-    /// Loads the *entire* thread in one query — fine for short histories, but
-    /// for long threads prefer [`Store::messages_page`], which fetches a
-    /// keyset page (newest N, then older pages on demand) over the same
-    /// `(peer, id)` index without pulling the whole table.
+    /// **Deprecated:** this pulls the *entire* thread into memory. Production
+    /// callers (the GUI bridge) use [`Store::messages_page`] for keyset
+    /// pagination. This method is now itself a thin wrapper that assembles the
+    /// full thread by looping `messages_page` (so there is a single SQL path —
+    /// the old direct `ORDER BY id ASC` query is gone), kept for tests and any
+    /// future caller that genuinely wants the whole thread at once. Prefer
+    /// `messages_page` for anything user-facing.
+    #[deprecated(since = "0.1.0", note = "use messages_page for keyset pagination")]
     pub fn messages(&self, peer: &[u8; 32]) -> Result<Vec<StoredMessageRow>, ClientError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, direction, sealed, timestamp, sender FROM messages WHERE peer = ?1 ORDER BY id ASC",
-            )
-            .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
-        let rows = stmt
-            .query_map(rusqlite::params![peer.as_slice()], map_message_row)
-            .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
-        decode_message_rows(&self.key, peer, rows)
+        // Assemble the full thread by paging backward from the newest row.
+        // Each page is oldest-first within its slice; older pages are strictly
+        // older than the current cursor, so prepend each older page before the
+        // accumulated rows to end up oldest-first overall. `PAGE` is sized for
+        // few round-trips on typical threads while staying bounded per query.
+        const PAGE: usize = 500;
+        let mut acc: Vec<StoredMessageRow> = Vec::new();
+        let mut before_id: Option<i64> = None;
+        loop {
+            let page = self.messages_page(peer, before_id, PAGE)?;
+            // `messages_page` returns oldest-first; an older page precedes the
+            // already-collected (newer) rows, so splice it in front.
+            let older = page.rows;
+            let mut combined = older;
+            combined.append(&mut acc);
+            acc = combined;
+            if !page.has_more {
+                break;
+            }
+            // Next page is strictly older than the smallest id now held.
+            before_id = acc.first().map(|r| r.id);
+            // If a page reported `has_more` but yielded no rows (e.g. every row
+            // on it was corrupt and skipped), there is no cursor to advance —
+            // stop to avoid an infinite loop. `has_more` is a hint, not a
+            // guarantee that a decodeable older row exists.
+            if before_id.is_none() {
+                break;
+            }
+        }
+        Ok(acc)
     }
 
     /// Load one keyset page of messages for `peer`, oldest-first within the
@@ -719,6 +743,7 @@ fn get_kv_raw(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, ClientErr
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests exercise the deprecated `messages` wrapper on purpose
 mod tests {
     use super::*;
     use std::fs;
@@ -1182,7 +1207,10 @@ mod tests {
         assert!(page.has_more, "older rows exist → has_more true");
         assert_eq!(page.rows.len(), 3);
         assert_eq!(
-            page.rows.iter().map(|r| r.msg.text.clone()).collect::<Vec<_>>(),
+            page.rows
+                .iter()
+                .map(|r| r.msg.text.clone())
+                .collect::<Vec<_>>(),
             vec!["m2", "m3", "m4"],
             "newest page is oldest-first within the slice"
         );
@@ -1200,16 +1228,22 @@ mod tests {
         seed_thread(&store, &peer, 5);
         let first = store.messages_page(&peer, None, 3).unwrap();
         let oldest_in_page = first.rows.first().unwrap().id;
-        let second = store
-            .messages_page(&peer, Some(oldest_in_page), 3)
-            .unwrap();
+        let second = store.messages_page(&peer, Some(oldest_in_page), 3).unwrap();
         assert!(
             !second.has_more,
             "no rows older than the oldest in the first page → has_more false"
         );
-        assert_eq!(second.rows.len(), 2, "only 2 rows remain older than the page");
         assert_eq!(
-            second.rows.iter().map(|r| r.msg.text.clone()).collect::<Vec<_>>(),
+            second.rows.len(),
+            2,
+            "only 2 rows remain older than the page"
+        );
+        assert_eq!(
+            second
+                .rows
+                .iter()
+                .map(|r| r.msg.text.clone())
+                .collect::<Vec<_>>(),
             vec!["m0", "m1"],
             "older page is oldest-first"
         );
@@ -1241,8 +1275,10 @@ mod tests {
         }
         assert_eq!(collected.len(), full.len(), "no rows lost or duplicated");
         // Same set of ids, same text per id — order-independent.
-        let mut col_by_id: Vec<(i64, String)> =
-            collected.iter().map(|r| (r.id, r.msg.text.clone())).collect();
+        let mut col_by_id: Vec<(i64, String)> = collected
+            .iter()
+            .map(|r| (r.id, r.msg.text.clone()))
+            .collect();
         let mut full_by_id: Vec<(i64, String)> =
             full.iter().map(|r| (r.id, r.msg.text.clone())).collect();
         col_by_id.sort_by_key(|(id, _)| *id);
@@ -1251,8 +1287,11 @@ mod tests {
         // No id appears twice across pages.
         let mut ids: Vec<i64> = collected.iter().map(|r| r.id).collect();
         ids.sort();
-        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len(),
-            "no duplicate ids across pages");
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len(),
+            "no duplicate ids across pages"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1326,7 +1365,11 @@ mod tests {
             .unwrap();
         let page = store.messages_page(&peer, None, 10).unwrap();
         assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.rows[0].sender, Some(author), "sender preserved in page");
+        assert_eq!(
+            page.rows[0].sender,
+            Some(author),
+            "sender preserved in page"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1359,6 +1402,43 @@ mod tests {
             plan.contains("idx_messages_peer_id") || plan.contains("COVERING INDEX"),
             "paged query did not use the index; plan = {plan:?}"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_wrapper_assembles_full_thread_oldest_first() {
+        // The deprecated `messages()` is now a thin wrapper that loops
+        // `messages_page`. It must still return the whole thread oldest-first,
+        // with ids contiguous and no gaps/dups, even when the page size is
+        // smaller than the thread (so the wrapper's backward walk + prepend
+        // runs more than one iteration). Seed more rows than the wrapper's
+        // internal `PAGE` would not be practical, but a thread larger than a
+        // tiny page proves the multi-page prepend path; here we just assert
+        // the wrapper's own output is the full contiguous oldest-first thread.
+        let path = tmp();
+        let peer = [0xEE; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        let ids = seed_thread(&store, &peer, 9);
+        let full = store.messages(&peer).unwrap();
+        assert_eq!(full.len(), 9, "wrapper returns every row");
+        // Oldest-first = ids ascending, matching insertion order.
+        let got_ids: Vec<i64> = full.iter().map(|r| r.id).collect();
+        assert_eq!(got_ids, ids, "oldest-first, insertion order preserved");
+        // Text round-trips through the wrapper path too.
+        assert_eq!(full[0].msg.text, "m0");
+        assert_eq!(full[8].msg.text, "m8");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn messages_wrapper_empty_thread_is_empty() {
+        // A peer with no rows must yield an empty vec, not an error or a
+        // spurious `has_more` loop.
+        let path = tmp();
+        let peer = [0xEF; 32];
+        let store = Store::create(&path, "pw").unwrap();
+        let full = store.messages(&peer).unwrap();
+        assert!(full.is_empty(), "empty thread → empty wrapper result");
         let _ = fs::remove_file(&path);
     }
 

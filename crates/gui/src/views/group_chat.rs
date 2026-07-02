@@ -6,8 +6,8 @@ use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, TopHint, UmApp, format_time, hex32, history_top_hint, short_hex};
 use super::chat_thread::SCROLL_AT_TOP_EPS;
+use super::{Message, UmApp, format_time, hex32, history_top_hint, short_hex, top_hint_line};
 use crate::ChatId;
 use crate::ContactView;
 use crate::theme;
@@ -71,21 +71,6 @@ fn message_row<'a>(
         .into()
 }
 
-/// A dim centered line shown at the top of the group thread (above the oldest
-/// cached message) when an older page is loading or the start of history has
-/// been reached. Mirrors [`chat_thread::top_hint_line`]; kept here so the group
-/// view stays self-contained (no shared widget module yet).
-fn top_hint_line(hint: TopHint) -> Element<'static, Message> {
-    let (label, color) = match hint {
-        TopHint::Loading => ("loading older…", theme::MUTED),
-        TopHint::StartOfHistory => ("start of history", theme::MUTED),
-    };
-    container(text(label).color(color).size(11))
-        .align_x(alignment::Horizontal::Center)
-        .width(Fill)
-        .into()
-}
-
 pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
     let title = match app.groups.iter().find(|g| g.id == group) {
         Some(g) => {
@@ -108,10 +93,7 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
     // Top-of-thread hint (see chat_thread::chat_thread): only once the thread
     // has cached messages — an empty group thread shows "no group messages
     // yet" instead.
-    let thread_nonempty = app
-        .threads
-        .get(&chat)
-        .is_some_and(|t| !t.is_empty());
+    let thread_nonempty = app.threads.get(&chat).is_some_and(|t| !t.is_empty());
     if thread_nonempty {
         let loading = app.loading_older.contains(&chat);
         let has_more = app.has_more_history.get(&chat).copied().unwrap_or(false);
@@ -131,11 +113,7 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
             ));
         }
     }
-    if app
-        .threads
-        .get(&chat)
-        .is_none_or(|t| t.is_empty())
-    {
+    if app.threads.get(&chat).is_none_or(|t| t.is_empty()) {
         msgs = msgs.push(
             container(text("no group messages yet").color(theme::MUTED).size(13))
                 .align_x(alignment::Horizontal::Center)
@@ -165,6 +143,7 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
             .on_scroll(move |vp: Viewport| Message::ChatScrolled {
                 chat: ChatId::Group(group),
                 at_top: vp.absolute_offset().y <= SCROLL_AT_TOP_EPS,
+                offset: vp.absolute_offset().y,
             })
             .spacing(4),
         compose,
