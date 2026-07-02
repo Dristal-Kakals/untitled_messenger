@@ -168,6 +168,16 @@ impl Bridge {
             if !groups.is_empty() {
                 let _ = event_tx.send(Event::GroupsLoaded(groups)).await;
             }
+            // Reload persisted unread counts so the sidebar badges reappear
+            // immediately in the embedded-store path (mirrors `handle_unlock`).
+            let unread = self
+                .store
+                .as_ref()
+                .and_then(|s| s.unread_counts().ok())
+                .unwrap_or_default();
+            if !unread.is_empty() {
+                let _ = event_tx.send(Event::UnreadLoaded(unread)).await;
+            }
         }
         loop {
             tokio::select! {
@@ -274,6 +284,17 @@ impl Bridge {
                 self.handle_replenish_one_time(count, event_tx).await;
             }
             Command::ChangeServer { addr } => self.handle_change_server(addr, event_tx).await,
+            Command::SetUnread { peer, count } => {
+                // Persist the new unread count for this chat. Best-effort: a
+                // store failure is logged, not surfaced — the in-memory map is
+                // the source of truth for the current session, and a missed
+                // persist only means the badge resets on next restart.
+                if let Some(store) = self.store.as_ref()
+                    && let Err(e) = store.put_unread(&peer, count)
+                {
+                    tracing::warn!("failed to persist unread count: {e}");
+                }
+            }
             Command::Logout => self.handle_logout(event_tx).await,
         }
     }
@@ -367,6 +388,15 @@ impl Bridge {
         // "Groups" section work right after a restart (the Sender-Key sessions
         // are restored from `session`, but the rosters are bridge-local).
         let groups = self.load_groups();
+        // Reload persisted unread counts so the sidebar badges reappear after a
+        // restart instead of resetting to 0 (the in-memory `unread` map is
+        // cleared on Logout/exit). Best-effort: a store error yields an empty
+        // list (no badges), not a failed unlock.
+        let unread = self
+            .store
+            .as_ref()
+            .and_then(|s| s.unread_counts().ok())
+            .unwrap_or_default();
         let _ = event_tx
             .send(Event::Ready {
                 identity_pub,
@@ -375,6 +405,7 @@ impl Bridge {
             .await;
         let _ = event_tx.send(Event::ContactsLoaded(contacts)).await;
         let _ = event_tx.send(Event::GroupsLoaded(groups)).await;
+        let _ = event_tx.send(Event::UnreadLoaded(unread)).await;
     }
 
     // ---- Connect / reconnect -------------------------------------------

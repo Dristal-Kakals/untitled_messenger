@@ -82,6 +82,12 @@ pub enum Command {
     ReplenishOneTimePrekeys { count: u32 },
     /// Disconnect from the current server and reconnect to `addr`.
     ChangeServer { addr: SocketAddr },
+    /// Persist the unread count for a chat (`peer` = chat key). The app sends
+    /// this whenever its in-memory `unread` map changes (a new message bumps
+    /// the count, opening the chat clears it) so the badges survive a restart.
+    /// A count of `0` clears the stored row. Fire-and-forget; the bridge does
+    /// not reply.
+    SetUnread { peer: [u8; 32], count: u32 },
     /// Drop the store + net, return to the Login view.
     Logout,
 }

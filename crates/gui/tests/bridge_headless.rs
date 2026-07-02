@@ -885,3 +885,110 @@ async fn bridge_group_roster_survives_restart() {
         })
         .await;
 }
+
+/// Persisted unread counts survive a bridge restart. The app emits
+/// `Command::SetUnread` whenever its in-memory badge count changes; the bridge
+/// writes it to the `unread` table. On a fresh `Unlock` the bridge reloads the
+/// counts and emits `Event::UnreadLoaded`, so the sidebar badges reappear
+/// instead of resetting to 0. This test drives the bridge directly (no iced
+/// app): it sets a count, drops the bridge, reopens the same store into a new
+/// bridge, and asserts the count comes back via `UnreadLoaded`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_unread_count_survives_restart() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    let store = Arc::new(ServerStore::new());
+    let subs = Arc::new(Subscribers::new());
+    let addr = serve("127.0.0.1:0", store, subs)
+        .await
+        .expect("serve relay");
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (bob_bridge, bob_pub) = make_bridge(&dir, &server_addr);
+            let (bob_cmd, mut bob_ev) = spawn_bridge(bob_bridge);
+
+            // Connect so the store is attached + registered.
+            bob_cmd
+                .send(Command::Connect { addr })
+                .await
+                .expect("bob connect");
+            expect_event(&mut bob_ev, |e| matches!(e, Event::Connected)).await;
+
+            // Simulate the app bumping bob's unread for a peer chat to 2
+            // (two incoming messages while the chat was closed). The bridge
+            // persists this to the `unread` table.
+            let peer = [0xAA; 32];
+            bob_cmd
+                .send(Command::SetUnread { peer, count: 2 })
+                .await
+                .expect("set unread");
+            // Give the best-effort persist a moment to land (the command is
+            // fire-and-forget; the bridge does not reply).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Drop the bridge (closes the store), then reopen the SAME store
+            // into a fresh bridge — exactly what happens on restart.
+            drop(bob_cmd);
+            drop(bob_ev);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let bob_pub_hex = hex::encode(bob_pub);
+            let path = dir.join(format!("{bob_pub_hex}.db"));
+            let store = Store::open(&path, "test-pass").expect("reopen bob store");
+            let session: ClientSession = store.get("session").expect("load session").unwrap();
+            // Sanity: the count persisted to the `unread` table.
+            let counts = store.unread_counts().expect("load unread counts");
+            assert_eq!(counts, vec![(peer, 2)], "unread count persisted");
+
+            let config = Config {
+                server_addr: server_addr.clone(),
+                ..Default::default()
+            };
+            let bob_bridge2 = Bridge::new(session, Some(store), config);
+            let (bob_cmd2, mut bob_ev2) = spawn_bridge(bob_bridge2);
+            // The reopened bridge emits UnreadLoaded with the persisted count.
+            let loaded = expect_event(&mut bob_ev2, |e| matches!(e, Event::UnreadLoaded(_))).await;
+            match loaded {
+                Event::UnreadLoaded(counts) => {
+                    assert_eq!(
+                        counts,
+                        vec![(peer, 2)],
+                        "UnreadLoaded carries persisted count"
+                    );
+                }
+                other => panic!("expected UnreadLoaded, got {other:?}"),
+            }
+
+            // Clearing the count (app opens the chat) must delete the row, so a
+            // further restart loads nothing.
+            bob_cmd2
+                .send(Command::SetUnread { peer, count: 0 })
+                .await
+                .expect("clear unread");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            drop(bob_cmd2);
+            drop(bob_ev2);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let store = Store::open(&path, "test-pass").expect("reopen bob store 2");
+            assert!(
+                store.unread_counts().expect("load unread 2").is_empty(),
+                "count=0 clears the row"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
+}

@@ -29,6 +29,11 @@ pub enum Event {
     /// "Groups" section list known groups immediately on restart, before any
     /// fresh distribution arrives. Each entry is id + display name.
     GroupsLoaded(Vec<GroupView>),
+    /// Persisted unread-message counts loaded from the store (after Unlock),
+    /// so the sidebar badges reappear after a restart instead of resetting to
+    /// 0. Each entry is `(chat key, count)`; chats with no pending messages
+    /// are absent (a count of 0 is stored as a missing row).
+    UnreadLoaded(Vec<([u8; 32], u32)>),
     /// Thread history loaded from the store (response to `LoadThread` /
     /// `LoadGroupThread`). Replaces the cache for that chat with the newest
     /// keyset page (see `Command::LoadThread`). `has_more` is `true` when

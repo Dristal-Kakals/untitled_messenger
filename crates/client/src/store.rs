@@ -37,6 +37,12 @@
 //! - `group_members(group_id BLOB, identity_pub BLOB)` — the member identity
 //!   pubs per group, so the bridge knows who to fan a group send out to after a
 //!   restart. `(group_id, identity_pub)` is unique; re-adding is a no-op.
+//! - `unread(peer BLOB PRIMARY KEY, count INT NOT NULL)` — per-chat unread
+//!   message counts so the sidebar badges survive a restart. `peer` is the
+//!   32-byte chat key (1:1 identity pub or group id, both public) and `count`
+//!   is a small integer, so both are plaintext metadata — like `contacts` and
+//!   the `sender` column, not sealed. A count of `0` is stored as an absent row
+//!   (DELETE), mirroring the in-memory `unread` map which `remove`s on open.
 //!
 //! No panics; all fallible paths return `Result<_, ClientError>`.
 
@@ -544,6 +550,66 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Persist the unread-message count for a chat (`peer` is the 32-byte chat
+    /// key — a 1:1 identity pub or a group id). A count of `0` clears the row
+    /// (DELETE) so the `unread` table only ever holds chats with pending
+    /// messages, mirroring the in-memory `app.unread` map which `remove`s on
+    /// open. Upsert semantics: re-writing a count for an existing chat replaces
+    /// it. The chat key is public (a pub/group id) and the count is a small
+    /// integer, so both are plaintext metadata — like `contacts` and the
+    /// `sender` column, not sealed.
+    pub fn put_unread(&self, peer: &[u8; 32], count: u32) -> Result<(), ClientError> {
+        if count == 0 {
+            self.conn
+                .execute(
+                    "DELETE FROM unread WHERE peer = ?1",
+                    rusqlite::params![peer.as_slice()],
+                )
+                .map_err(|e| ClientError::Store(format!("put_unread: {e}")))?;
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO unread (peer, count) VALUES (?1, ?2) \
+                 ON CONFLICT(peer) DO UPDATE SET count = excluded.count",
+                rusqlite::params![peer.as_slice(), i64::from(count)],
+            )
+            .map_err(|e| ClientError::Store(format!("put_unread: {e}")))?;
+        Ok(())
+    }
+
+    /// Load every persisted unread count (`peer`, `count`), for chats that had
+    /// pending messages at last shutdown. Chats opened (and thus cleared)
+    /// before shutdown are absent. Returned in arbitrary order; the caller
+    /// rebuilds its in-memory `unread` map from this. Rows with a corrupt
+    /// (non-32-byte) peer are skipped rather than failing the whole load — a
+    /// single bad row never hides every badge.
+    pub fn unread_counts(&self) -> Result<Vec<([u8; 32], u32)>, ClientError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer, count FROM unread")
+            .map_err(|e| ClientError::Store(format!("unread_counts: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let peer: Vec<u8> = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                Ok((peer, count))
+            })
+            .map_err(|e| ClientError::Store(format!("unread_counts: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (peer, count) =
+                row.map_err(|e| ClientError::Store(format!("unread_counts: {e}")))?;
+            if peer.len() != 32 {
+                continue; // corrupt row: skip, keep loading the rest
+            }
+            let mut p = [0u8; 32];
+            p.copy_from_slice(&peer);
+            out.push((p, count.max(0) as u32));
+        }
+        Ok(out)
+    }
 }
 
 /// A stored chat message: plaintext text + delivery status. Sealed into the
@@ -679,7 +745,8 @@ fn init_schema(conn: &Connection) -> Result<(), ClientError> {
          CREATE TABLE IF NOT EXISTS contacts (identity_pub BLOB PRIMARY KEY, nickname TEXT, fingerprint BLOB, verified INT NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB, timestamp INT);
          CREATE TABLE IF NOT EXISTS groups (group_id BLOB PRIMARY KEY, name TEXT);
-         CREATE TABLE IF NOT EXISTS group_members (group_id BLOB, identity_pub BLOB, PRIMARY KEY (group_id, identity_pub));",
+         CREATE TABLE IF NOT EXISTS group_members (group_id BLOB, identity_pub BLOB, PRIMARY KEY (group_id, identity_pub));
+         CREATE TABLE IF NOT EXISTS unread (peer BLOB PRIMARY KEY, count INT NOT NULL);",
     )
     .map_err(|e| ClientError::Store(format!("init_schema: {e}")))?;
     // Backfill the `verified` column on pre-existing stores created before
@@ -1439,6 +1506,95 @@ mod tests {
         let store = Store::create(&path, "pw").unwrap();
         let full = store.messages(&peer).unwrap();
         assert!(full.is_empty(), "empty thread → empty wrapper result");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_unread_then_counts_round_trips() {
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        let a = [0x01; 32];
+        let b = [0x02; 32];
+        store.put_unread(&a, 3).unwrap();
+        store.put_unread(&b, 7).unwrap();
+        let mut counts: Vec<([u8; 32], u32)> = store.unread_counts().unwrap();
+        counts.sort();
+        assert_eq!(counts, vec![(a, 3), (b, 7)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_unread_replaces_existing_count() {
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        let a = [0x01; 32];
+        store.put_unread(&a, 3).unwrap();
+        store.put_unread(&a, 10).unwrap();
+        let counts = store.unread_counts().unwrap();
+        assert_eq!(counts, vec![(a, 10)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_unread_zero_deletes_row() {
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        let a = [0x01; 32];
+        store.put_unread(&a, 3).unwrap();
+        // Clearing the count drops the row entirely (mirror of the in-memory
+        // `unread.remove` on chat open), so `unread_counts` no longer lists it.
+        store.put_unread(&a, 0).unwrap();
+        assert!(store.unread_counts().unwrap().is_empty());
+        // Re-clearing an already-absent row is a no-op (DELETE matches nothing).
+        store.put_unread(&a, 0).unwrap();
+        assert!(store.unread_counts().unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unread_counts_empty_when_none_written() {
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        assert!(store.unread_counts().unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unread_counts_survive_reopen() {
+        let path = tmp();
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store.put_unread(&[0x01; 32], 5).unwrap();
+            store.put_unread(&[0x02; 32], 1).unwrap();
+        }
+        // Reopen with the same passphrase: the `unread` table persists, so the
+        // sidebar badges reappear after restart instead of resetting to 0.
+        let store = Store::open(&path, "pw").unwrap();
+        let mut counts: Vec<([u8; 32], u32)> = store.unread_counts().unwrap();
+        counts.sort();
+        assert_eq!(counts, vec![([0x01; 32], 5), ([0x02; 32], 1)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unread_table_created_on_old_store_via_migration() {
+        // A store created before the `unread` table existed must still open and
+        // expose an (empty) unread_counts after init_schema runs the CREATE
+        // TABLE IF NOT EXISTS migration.
+        let path = tmp();
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            // Drop the table to simulate a pre-unread store.
+            store
+                .conn
+                .execute("DROP TABLE unread", [])
+                .expect("drop unread");
+        }
+        let store = Store::open(&path, "pw").unwrap();
+        assert!(store.unread_counts().unwrap().is_empty());
+        // Writing after migration works.
+        store.put_unread(&[0x09; 32], 2).unwrap();
+        assert_eq!(store.unread_counts().unwrap(), vec![([0x09; 32], 2)]);
         let _ = fs::remove_file(&path);
     }
 

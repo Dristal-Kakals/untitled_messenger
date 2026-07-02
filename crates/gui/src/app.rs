@@ -361,6 +361,12 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             let chat = ChatId::Peer(peer);
             app.open_chat = Some(chat);
             app.unread.remove(&chat);
+            // Persist the cleared count so a restart does not resurrect the
+            // badge for a chat the user already opened.
+            app.send_cmd(Command::SetUnread {
+                peer: chat.key(),
+                count: 0,
+            });
             app.view = View::ChatThread(peer);
             app.send_cmd(Command::LoadThread { peer });
         }
@@ -368,6 +374,10 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
             let chat = ChatId::Group(group);
             app.open_chat = Some(chat);
             app.unread.remove(&chat);
+            app.send_cmd(Command::SetUnread {
+                peer: chat.key(),
+                count: 0,
+            });
             app.view = View::GroupChat(group);
             app.send_cmd(Command::LoadGroupThread { group });
         }
@@ -580,6 +590,27 @@ fn handle_event(app: &mut UmApp, ev: Event) -> Task<Message> {
                 app.upsert_group(g.id, g.name, g.members);
             }
         }
+        Event::UnreadLoaded(counts) => {
+            // Rehydrate the in-memory unread map from the persisted counts so
+            // the sidebar badges reappear after a restart. Replaces any prior
+            // entries (Logout already cleared the map, and a fresh Unlock is
+            // the only emitter of this event). The store keys chats by their
+            // 32-byte key only (a peer pub or a group id), so we disambiguate
+            // Peer vs Group by checking the loaded groups roster: a key that
+            // matches a known group id is a group chat, otherwise a 1:1 peer.
+            app.unread.clear();
+            for (key, count) in counts {
+                if count == 0 {
+                    continue;
+                }
+                let chat = if app.groups.iter().any(|g| g.id == key) {
+                    ChatId::Group(key)
+                } else {
+                    ChatId::Peer(key)
+                };
+                app.unread.insert(chat, count);
+            }
+        }
         Event::HistoryLoaded {
             chat,
             msgs,
@@ -631,7 +662,16 @@ fn handle_event(app: &mut UmApp, ev: Event) -> Task<Message> {
                 app.threads.entry(chat).or_default().push(msg);
                 return snap_for_chat(app, &chat);
             } else {
-                *app.unread.entry(chat).or_insert(0) += 1;
+                let count = {
+                    let entry = app.unread.entry(chat).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+                // Persist the bumped count so the badge survives a restart.
+                app.send_cmd(Command::SetUnread {
+                    peer: chat.key(),
+                    count,
+                });
             }
         }
         Event::Sent {
@@ -884,6 +924,144 @@ mod tests {
         assert_eq!(app.open_chat, Some(chat));
         assert_eq!(app.view, View::ChatThread(peer));
         assert_eq!(app.unread.get(&chat), None, "unread cleared on open");
+    }
+
+    #[test]
+    fn decrypted_when_chat_closed_sends_set_unread_with_bumped_count() {
+        // Bumping the unread count on a closed chat must also emit a
+        // `SetUnread` command so the badge survives a restart. The count in
+        // the command matches the new in-memory count.
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        let bridge_cmd = Arc::new(tx);
+        let mut app = UmApp::new(bridge_cmd, View::ContactList, Config::default());
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        let _ = handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("a"),
+            },
+        );
+        let _ = handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("b"),
+            },
+        );
+        assert_eq!(app.unread.get(&chat), Some(&2));
+        let mut seen = 0;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::SetUnread { peer: p, count } => {
+                    assert_eq!(p, peer);
+                    assert_eq!(count, seen + 1, "count must be the bumped value");
+                    seen += 1;
+                }
+                other => panic!("expected SetUnread, got {other:?}"),
+            }
+        }
+        assert_eq!(seen, 2, "one SetUnread per incoming message");
+    }
+
+    #[test]
+    fn decrypted_when_chat_open_sends_no_set_unread() {
+        // An incoming message in the OPEN chat appends to the thread and does
+        // not touch unread, so no `SetUnread` command is emitted.
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        let bridge_cmd = Arc::new(tx);
+        let mut app = UmApp::new(bridge_cmd, View::ContactList, Config::default());
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        app.open_chat = Some(chat);
+        let _ = handle_event(
+            &mut app,
+            Event::Decrypted {
+                chat,
+                msg: incoming("hi"),
+            },
+        );
+        assert!(rx.try_recv().is_err(), "open chat sends no SetUnread");
+    }
+
+    #[test]
+    fn opening_chat_sends_set_unread_zero() {
+        // Opening a chat clears its unread and must persist the zero so a
+        // restart does not resurrect the badge.
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        let bridge_cmd = Arc::new(tx);
+        let mut app = UmApp::new(bridge_cmd, View::ContactList, Config::default());
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        app.unread.insert(chat, 4);
+        let _ = update(&mut app, Message::OpenChat(peer));
+        let mut got_zero = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::SetUnread { peer: p, count: 0 } = cmd {
+                assert_eq!(p, peer);
+                got_zero = true;
+            }
+        }
+        assert!(got_zero, "OpenChat must emit SetUnread with count 0");
+    }
+
+    #[test]
+    fn opening_group_sends_set_unread_zero_with_group_key() {
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        let bridge_cmd = Arc::new(tx);
+        let mut app = UmApp::new(bridge_cmd, View::ContactList, Config::default());
+        let gid = [0x22; 32];
+        let chat = ChatId::Group(gid);
+        app.unread.insert(chat, 2);
+        let _ = update(&mut app, Message::OpenGroup(gid));
+        let mut got_zero = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::SetUnread { peer: p, count: 0 } = cmd {
+                assert_eq!(p, gid, "group chat keys by the group id");
+                got_zero = true;
+            }
+        }
+        assert!(got_zero, "OpenGroup must emit SetUnread with count 0");
+    }
+
+    #[test]
+    fn unread_loaded_hydrates_map_peer_vs_group() {
+        // The store keys chats by 32-byte key only; `UnreadLoaded` must
+        // disambiguate Peer vs Group against the loaded groups roster. A key
+        // matching a known group id becomes a group chat; otherwise a peer.
+        let mut app = test_app();
+        app.groups.push(GroupView {
+            id: [0x33; 32],
+            name: "team".into(),
+            members: 3,
+        });
+        let _ = handle_event(
+            &mut app,
+            Event::UnreadLoaded(vec![
+                ([0x11; 32], 2), // peer
+                ([0x33; 32], 5), // group (matches roster)
+                ([0x44; 32], 0), // zero → skipped
+            ]),
+        );
+        assert_eq!(app.unread.get(&ChatId::Peer([0x11; 32])), Some(&2));
+        assert_eq!(app.unread.get(&ChatId::Group([0x33; 32])), Some(&5));
+        // Zero-count entries are not inserted (absent = no badge).
+        assert!(!app.unread.contains_key(&ChatId::Peer([0x44; 32])));
+    }
+
+    #[test]
+    fn unread_loaded_replaces_prior_entries() {
+        // A fresh Unlock's `UnreadLoaded` must replace any stale in-memory
+        // entries (Logout clears the map, but this guards against double-emit).
+        let mut app = test_app();
+        app.unread.insert(ChatId::Peer([0xAA; 32]), 99);
+        let _ = handle_event(&mut app, Event::UnreadLoaded(vec![([0x11; 32], 1)]));
+        assert!(
+            !app.unread.contains_key(&ChatId::Peer([0xAA; 32])),
+            "stale dropped"
+        );
+        assert_eq!(app.unread.get(&ChatId::Peer([0x11; 32])), Some(&1));
     }
 
     #[test]
