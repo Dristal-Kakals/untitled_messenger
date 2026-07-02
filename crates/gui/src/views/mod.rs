@@ -101,7 +101,7 @@ pub fn format_time(unix_secs: u64) -> String {
 }
 
 pub use chat_thread::chat_thread;
-pub use contact_list::contact_list;
+pub use contact_list::{contact_list, sidebar};
 pub use group_chat::group_chat;
 pub use login::login;
 pub use settings::settings;

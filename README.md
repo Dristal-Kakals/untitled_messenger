@@ -96,7 +96,8 @@ registers its prekey bundle, and subscribes for push.
 
 ## GUI features
 
-- **Theming** — Dracula dark palette via a single `um_gui::theme` module (colors, bubble/panel/button styles), so the six views stay visually consistent and the look is decoupled from layout.
+- **Theming** — Dracula dark palette via a single `um_gui::theme` module (colors, bubble/panel/sidebar/button styles), so the views stay visually consistent and the look is decoupled from layout.
+- **Two-column layout** — post-login routes (chat, group, settings) render a persistent contact-list sidebar (fixed 300px, panel-styled) on the left and the active panel on the right, so the full 900px window width is used instead of a single 520px column. The open chat is highlighted in the sidebar; a "select a chat" placeholder fills the right pane before any chat is opened.
 - **Contact list** — add contacts by 32-byte identity pub (hex) + nickname, per-contact unread badges, fingerprint display, manual fingerprint verification (✓), connection status header.
 - **1:1 chat** — full Double-Ratchet sessions, optimistic send with `…/✓/✗` status, per-message UTC timestamps, fingerprint-verify button, auto-scroll that snaps to the latest message on send/receive.
 - **Groups** — Sender Keys group sessions; founder distributes sender-key state to each member over their 1:1 ratchet; group list with unread badges; member count in the group header; incoming rows are prefixed with the author's nickname (or short hex for unknown senders).

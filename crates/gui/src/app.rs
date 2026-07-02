@@ -574,15 +574,23 @@ fn bridge_stream(
     stream.boxed()
 }
 
-/// The iced `view` function: routes to the active view.
+/// The iced `view` function: routes to the active view. Post-login routes
+/// (ChatThread, GroupChat, Settings) render as a two-column layout — the
+/// persistent contact-list [`views::sidebar`] on the left, the active panel
+/// on the right — so the full window width is used instead of a fixed 520px
+/// column. Setup/Login stay full-window centered cards (no sidebar yet).
 pub fn view(app: &UmApp) -> Element<'_, Message> {
     let content = match app.view {
         View::Setup => views::setup(app),
         View::Login => views::login(app),
+        // Sidebar + right-pane placeholder ("select a chat").
         View::ContactList => views::contact_list(app),
-        View::ChatThread(peer) => views::chat_thread(app, peer),
-        View::GroupChat(group) => views::group_chat(app, group),
-        View::Settings => views::settings(app),
+        // Two-column: sidebar + the open 1:1 thread.
+        View::ChatThread(peer) => split(views::sidebar(app), views::chat_thread(app, peer)),
+        // Two-column: sidebar + the open group thread.
+        View::GroupChat(group) => split(views::sidebar(app), views::group_chat(app, group)),
+        // Two-column: sidebar + settings.
+        View::Settings => split(views::sidebar(app), views::settings(app)),
     };
 
     // Error banner on top of any view.
@@ -604,6 +612,16 @@ pub fn view(app: &UmApp) -> Element<'_, Message> {
     } else {
         content
     }
+}
+
+/// Compose a two-column row: `sidebar` (fixed width) + `right` (fills the
+/// rest). Both stretch to the window height.
+fn split<'a>(sidebar: Element<'a, Message>, right: Element<'a, Message>) -> Element<'a, Message> {
+    row![sidebar, right]
+        .width(Fill)
+        .height(Fill)
+        .spacing(0)
+        .into()
 }
 
 #[cfg(test)]
@@ -681,6 +699,50 @@ mod tests {
         assert_eq!(app.open_chat, Some(chat));
         assert_eq!(app.view, View::ChatThread(peer));
         assert_eq!(app.unread.get(&chat), None, "unread cleared on open");
+    }
+
+    #[test]
+    fn back_clears_open_chat_and_returns_to_contact_list() {
+        // In the two-column layout, `Back` closes the active chat so the right
+        // pane reverts to the "select a chat" placeholder while the sidebar
+        // stays. `open_chat` must be cleared so the sidebar's active-row
+        // highlight disappears.
+        let mut app = test_app();
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        let _ = update(&mut app, Message::OpenChat(peer));
+        assert_eq!(app.open_chat, Some(chat));
+        let _ = update(&mut app, Message::Back);
+        assert_eq!(app.view, View::ContactList);
+        assert!(app.open_chat.is_none(), "open_chat cleared on Back");
+    }
+
+    #[test]
+    fn opening_group_sets_open_chat_to_group() {
+        let mut app = test_app();
+        let gid = [0x22; 32];
+        let chat = ChatId::Group(gid);
+        let _ = update(&mut app, Message::OpenGroup(gid));
+        assert_eq!(app.open_chat, Some(chat));
+        assert_eq!(app.view, View::GroupChat(gid));
+    }
+
+    #[test]
+    fn opening_settings_keeps_open_chat_unchanged() {
+        // Settings is a right-pane route; the sidebar stays and the previously
+        // open chat (if any) is not disturbed — `open_chat` drives the
+        // sidebar highlight, so navigating to settings must not clear it.
+        let mut app = test_app();
+        let peer = [0x11; 32];
+        let chat = ChatId::Peer(peer);
+        let _ = update(&mut app, Message::OpenChat(peer));
+        let _ = update(&mut app, Message::OpenSettings);
+        assert_eq!(app.view, View::Settings);
+        assert_eq!(
+            app.open_chat,
+            Some(chat),
+            "settings does not clear open_chat"
+        );
     }
 
     #[test]

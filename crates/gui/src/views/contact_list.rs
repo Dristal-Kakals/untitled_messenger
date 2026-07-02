@@ -1,6 +1,12 @@
-//! Contact list view: the home screen. A header bar (status + settings), a
-//! scrollable contacts list with unread badges, an add-contact form, a groups
-//! section, and a new-group form. Layout uses `theme` styling.
+//! Contact list view. In the two-column layout this is the **sidebar**: a
+//! fixed-width, panel-styled column with a header (status + settings), a
+//! scrollable contacts list with unread badges + active-chat highlight, an
+//! add-contact form, a groups section, and a new-group form. The active chat
+//! (or settings) renders in the right pane built by `app::view`.
+//!
+//! `contact_list` remains as a standalone (sidebar-only) element for the
+//! `View::ContactList` route — the router wraps it with a right-pane
+//! placeholder so the window is fully used even before a chat is opened.
 
 use iced::alignment;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
@@ -25,7 +31,11 @@ fn unread_badge(n: u32) -> iced::widget::Text<'static> {
     }
 }
 
-pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
+/// The fixed-width sidebar column: header + scrollable contacts + forms. This
+/// is reused by every post-login route (ContactList, ChatThread, GroupChat,
+/// Settings) so the contact list stays visible while a chat or settings panel
+/// fills the right side of the window.
+pub fn sidebar(app: &UmApp) -> Element<'_, Message> {
     // ---- Header bar: status dot + title + settings button.
     let status_dot = if app.connected {
         text("●").color(theme::OK)
@@ -60,9 +70,11 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
         );
     }
     for c in &app.contacts {
+        let chat = ChatId::Peer(c.identity_pub);
+        let is_open = app.open_chat == Some(chat);
         let badge = app
             .unread
-            .get(&ChatId::Peer(c.identity_pub))
+            .get(&chat)
             .copied()
             .filter(|n| *n > 0)
             .map_or_else(|| unread_badge(0), unread_badge);
@@ -82,7 +94,16 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
         .align_y(alignment::Vertical::Center);
         // Fingerprint on a muted sub-line.
         let sub = text(hex32(&c.fingerprint)).color(theme::MUTED).size(9);
-        list = list.push(column![row, sub].spacing(2));
+        let entry = column![row, sub].spacing(2);
+        // Highlight the open chat's row.
+        let entry = if is_open {
+            container(entry)
+                .style(|_| theme::active_row_style())
+                .padding(4)
+        } else {
+            container(entry).padding(4)
+        };
+        list = list.push(entry);
     }
 
     // ---- Add-contact form.
@@ -106,25 +127,33 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
         groups = groups.push(text("(no groups yet)").color(theme::MUTED).size(13));
     }
     for g in &app.groups {
+        let chat = ChatId::Group(g.id);
+        let is_open = app.open_chat == Some(chat);
         let badge = app
             .unread
-            .get(&ChatId::Group(g.id))
+            .get(&chat)
             .copied()
             .filter(|n| *n > 0)
             .map_or_else(|| unread_badge(0), unread_badge);
-        groups = groups.push(
-            row![
-                text(g.name.clone()).size(15),
-                text(short_hex(&g.id)).color(theme::MUTED).size(11),
-                Space::new().width(Fill),
-                badge,
-                button(text("open"))
-                    .style(theme::secondary_button_style)
-                    .on_press(Message::OpenGroup(g.id)),
-            ]
-            .spacing(10)
-            .align_y(alignment::Vertical::Center),
-        );
+        let row = row![
+            text(g.name.clone()).size(15),
+            text(short_hex(&g.id)).color(theme::MUTED).size(11),
+            Space::new().width(Fill),
+            badge,
+            button(text("open"))
+                .style(theme::secondary_button_style)
+                .on_press(Message::OpenGroup(g.id)),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center);
+        let row = if is_open {
+            container(row)
+                .style(|_| theme::active_row_style())
+                .padding(4)
+        } else {
+            container(row).padding(4)
+        };
+        groups = groups.push(row);
     }
 
     // ---- New-group form.
@@ -154,5 +183,36 @@ pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
     .spacing(16)
     .padding(20);
 
-    container(body).width(Length::Fixed(520.0)).into()
+    // Fixed-width, panel-styled column. The router places this on the left of
+    // a row whose right side is the active chat / settings / placeholder.
+    container(body)
+        .style(|_| theme::sidebar_style())
+        .width(Length::Fixed(theme::SIDEBAR_WIDTH))
+        .height(Fill)
+        .into()
+}
+
+/// The standalone `ContactList` route element: the sidebar with a right-pane
+/// placeholder ("select a chat") so the window is fully used before any chat
+/// is opened. Kept as the `View::ContactList` view so `Back` has a target.
+pub fn contact_list(app: &UmApp) -> Element<'_, Message> {
+    let placeholder = container(
+        column![
+            text("untitled_messenger").size(22),
+            text("select a contact or group to start chatting")
+                .color(theme::MUTED)
+                .size(14),
+        ]
+        .spacing(8)
+        .align_x(alignment::Horizontal::Center),
+    )
+    .align_x(alignment::Horizontal::Center)
+    .align_y(alignment::Vertical::Center)
+    .width(Fill)
+    .height(Fill);
+
+    row![sidebar(app), placeholder]
+        .width(Fill)
+        .height(Fill)
+        .into()
 }

@@ -40,6 +40,43 @@ const BUBBLE_RADIUS: f32 = 12.0;
 /// Standard padding inside a bubble / card (px).
 pub const BUBBLE_PAD: f32 = 8.0;
 
+/// Sidebar (contact list) width in the two-column layout (px). Fixed so the
+/// list column does not flex with the window; the active chat fills the rest.
+pub const SIDEBAR_WIDTH: f32 = 300.0;
+
+/// Sidebar background fill — a touch darker than `panel_style` so the sidebar
+/// reads as a distinct column against the window background and the active
+/// chat panel.
+pub fn sidebar_style() -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgb8(0x21, 0x22, 0x2C))),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::default(),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// A row style for the currently-selected contact / group: accent-tinted fill
+/// so the open chat is visually marked in the sidebar.
+pub fn active_row_style() -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        text_color: Some(Color::WHITE),
+        background: Some(Background::Color(Color::from_rgba8(0xBD, 0x93, 0xF9, 0.22))),
+        border: Border {
+            color: ACCENT,
+            width: 0.0,
+            radius: rounded(8.0),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
 /// `iced::widget::container::Style` for an outgoing message bubble: filled
 /// with `BUBBLE_OUT`, rounded, no border. The text color is left to the theme.
 pub fn bubble_out_style() -> iced::widget::container::Style {
@@ -216,5 +253,33 @@ mod tests {
         // non-const binding so clippy does not flag `assertions_on_constants`.
         let c = ACCENT;
         assert!(c.r > 0.7 && c.b > 0.9 && c.g < 0.7);
+    }
+
+    #[test]
+    fn sidebar_style_has_fill_and_no_radius() {
+        let s = sidebar_style();
+        assert!(matches!(s.background, Some(Background::Color(_))));
+        assert_eq!(s.border.radius.top_left, 0.0);
+    }
+
+    #[test]
+    fn active_row_style_is_accent_tinted() {
+        let s = active_row_style();
+        // Accent-tinted fill + accent border + white text.
+        match s.background {
+            Some(Background::Color(c)) => assert!(c.a > 0.0 && c.a < 1.0, "semi-transparent"),
+            other => panic!("expected color bg, got {other:?}"),
+        }
+        assert_eq!(s.border.color, ACCENT);
+        assert_eq!(s.text_color, Some(Color::WHITE));
+    }
+
+    #[test]
+    fn sidebar_width_is_fixed_and_reasonable() {
+        // A fixed sidebar width that fits a contact row + leaves the bulk of a
+        // 900px window for the active chat. Read through a non-const binding so
+        // clippy does not flag `assertions_on_constants`.
+        let w = SIDEBAR_WIDTH;
+        assert!((200.0..=400.0).contains(&w));
     }
 }
