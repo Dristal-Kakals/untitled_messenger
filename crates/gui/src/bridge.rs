@@ -448,13 +448,13 @@ impl Bridge {
         // `um` data dir does not yet exist. `config::save` only ever creates
         // the config dir, not the data dir, so on a fresh machine the Setup
         // button always fails. Ensure the parent exists first.
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                let _ = event_tx
-                    .send(Event::Error(format!("create data dir: {e}")))
-                    .await;
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            let _ = event_tx
+                .send(Event::Error(format!("create data dir: {e}")))
+                .await;
+            return;
         }
         let store = match Store::create(&path, &passphrase) {
             Ok(s) => s,
