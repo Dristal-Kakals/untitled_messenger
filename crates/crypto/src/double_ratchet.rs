@@ -119,7 +119,9 @@ impl RatchetSession {
     }
 
     pub fn decrypt(&mut self, message: &Encrypted) -> Result<Vec<u8>, CryptoError> {
-        // 1. Check skipped cache.
+        // 1. Check skipped cache. A cached key is already committed state
+        //    (it was staged when the chain was advanced past it), so decrypt
+        //    directly and remove the entry on success.
         if let Some(msg_key) = self
             .skipped
             .remove(&(message.header.dh_pub, message.header.n))
@@ -129,70 +131,121 @@ impl RatchetSession {
         }
 
         // 2. DH ratchet step if the sender used a new DH ratchet key.
+        //
+        //    All state mutations below are STAGED into locals and committed
+        //    only after the final `open` succeeds. A tampered or corrupt
+        //    ciphertext must NOT advance the chain key / counter / skipped
+        //    cache: if it did, the next legitimate message at this `n` would
+        //    decrypt with the wrong key, permanently poisoning the receive
+        //    chain. (The relay re-delivers unacked envelopes, so a single
+        //    corrupt frame is an ordinary occurrence, not a rare edge case.)
         let new_sender = match self.peer_dh_pub {
             Some(p) => message.header.dh_pub != p,
             None => true,
         };
 
+        // Staged DH-ratchet + previous-chain skip state. Committed at the end.
+        let mut prev_chain_skipped: Vec<((PublicKey, u32), [u8; 32])> = Vec::new();
+        let mut staged_nr = self.nr;
+        let mut staged_ckr = self.ckr;
+        let mut staged_peer_dh = self.peer_dh_pub;
+        let mut staged_root_key = self.root_key;
+        let mut staged_pn = self.pn;
+        let mut staged_ns = self.ns;
+        let mut staged_cks = self.cks;
+        let mut staged_dh_priv = None::<StaticSecret>;
+        let mut staged_dh_pub = self.dh_pub;
+
         if new_sender {
-            // Skip messages in the previous recv chain up to header.pn.
-            if let (Some(old_peer), Some(mut ckr)) = (self.peer_dh_pub, self.ckr) {
-                while self.nr < message.header.pn {
+            // Skip messages in the previous recv chain up to header.pn. The
+            // derived keys are staged into `prev_chain_skipped` for commit on
+            // success; the chain key itself is discarded — the DH ratchet
+            // step below replaces `ckr` with the new chain, so advancing the
+            // old chain's `ckr` here would only be overwritten.
+            if let (Some(old_peer), Some(mut ckr)) = (self.peer_dh_pub, staged_ckr) {
+                while staged_nr < message.header.pn {
                     let (new_ckr, mk) = kdf_chain(&ckr);
-                    evict_if_full(&mut self.skipped);
-                    self.skipped.insert((old_peer, self.nr), mk);
+                    prev_chain_skipped.push(((old_peer, staged_nr), mk));
                     ckr = new_ckr;
-                    self.nr += 1;
+                    staged_nr += 1;
                 }
-                self.ckr = Some(ckr);
             }
 
             // DH ratchet (receiving): old self priv × new peer pub.
-            self.peer_dh_pub = Some(message.header.dh_pub);
+            staged_peer_dh = Some(message.header.dh_pub);
             let dh_recv = self
                 .dh_priv
                 .diffie_hellman(&message.header.dh_pub)
                 .to_bytes();
-            let (new_root, new_ckr) = kdf_root_dh(&self.root_key, &dh_recv);
-            self.root_key = new_root;
-            self.ckr = Some(new_ckr);
-            self.pn = self.ns;
-            self.nr = 0;
+            let (new_root, new_ckr) = kdf_root_dh(&staged_root_key, &dh_recv);
+            staged_root_key = new_root;
+            staged_ckr = Some(new_ckr);
+            staged_pn = self.ns;
+            staged_nr = 0;
 
             // DH ratchet (sending): new self priv × new peer pub.
             let rng = rand_core::OsRng;
-            self.dh_priv = StaticSecret::random_from_rng(rng);
-            self.dh_pub = PublicKey::from(&self.dh_priv);
-            let dh_send = self
-                .dh_priv
+            let new_dh_priv = StaticSecret::random_from_rng(rng);
+            let new_dh_pub = PublicKey::from(&new_dh_priv);
+            let dh_send = new_dh_priv
                 .diffie_hellman(&message.header.dh_pub)
                 .to_bytes();
-            let (new_root, new_cks) = kdf_root_dh(&self.root_key, &dh_send);
-            self.root_key = new_root;
-            self.cks = Some(new_cks);
-            self.ns = 0;
+            let (new_root2, new_cks) = kdf_root_dh(&staged_root_key, &dh_send);
+            staged_root_key = new_root2;
+            staged_cks = Some(new_cks);
+            staged_ns = 0;
+            staged_dh_priv = Some(new_dh_priv);
+            staged_dh_pub = new_dh_pub;
         }
 
         // 3. Skip messages in the current recv chain up to header.n.
-        if let (Some(peer), Some(mut ckr)) = (self.peer_dh_pub, self.ckr) {
-            while self.nr < message.header.n {
+        //    Staged into `cur_chain_skipped`; committed on success.
+        let mut cur_chain_skipped: Vec<(u32, [u8; 32])> = Vec::new();
+        let peer = staged_peer_dh;
+        if let (Some(_), Some(mut ckr)) = (peer, staged_ckr) {
+            while staged_nr < message.header.n {
                 let (new_ckr, mk) = kdf_chain(&ckr);
-                evict_if_full(&mut self.skipped);
-                self.skipped.insert((peer, self.nr), mk);
+                cur_chain_skipped.push((staged_nr, mk));
                 ckr = new_ckr;
-                self.nr += 1;
+                staged_nr += 1;
             }
-            self.ckr = Some(ckr);
+            staged_ckr = Some(ckr);
         }
 
-        // 4. Decrypt current message.
-        let ckr = self.ckr.ok_or(CryptoError::InvalidState)?;
+        // 4. Derive the message key for the current `n`, then decrypt BEFORE
+        //    advancing the chain. On failure, leave all state untouched.
+        let ckr = staged_ckr.ok_or(CryptoError::InvalidState)?;
         let (new_ckr, msg_key) = kdf_chain(&ckr);
-        self.ckr = Some(new_ckr);
-        self.nr += 1;
-
         let aad = header_aad(&message.header);
-        open(&msg_key, &message.header.nonce, &aad, &message.ciphertext)
+        let plaintext = open(&msg_key, &message.header.nonce, &aad, &message.ciphertext)?;
+
+        // 5. Commit all staged state only after authentication succeeded.
+        //    Previous-chain skipped keys (from the DH ratchet step).
+        for (key, mk) in prev_chain_skipped {
+            evict_if_full(&mut self.skipped);
+            self.skipped.insert(key, mk);
+        }
+        // Current-chain skipped keys.
+        for (n, mk) in cur_chain_skipped {
+            if let Some(peer) = peer {
+                evict_if_full(&mut self.skipped);
+                self.skipped.insert((peer, n), mk);
+            }
+        }
+        self.nr = staged_nr + 1;
+        self.ckr = Some(new_ckr);
+        if new_sender {
+            self.peer_dh_pub = staged_peer_dh;
+            self.root_key = staged_root_key;
+            self.pn = staged_pn;
+            self.cks = staged_cks;
+            self.ns = staged_ns;
+            if let Some(priv_) = staged_dh_priv {
+                self.dh_priv = priv_;
+            }
+            self.dh_pub = staged_dh_pub;
+        }
+        Ok(plaintext)
     }
 }
 
@@ -283,6 +336,57 @@ mod tests {
         // Session still usable.
         let ct2 = alice.encrypt(b"next").unwrap();
         assert_eq!(bob.decrypt(&ct2).unwrap(), b"next");
+    }
+
+    /// A tampered message at `n` must NOT advance the receive chain, so the
+    /// SAME `n` re-sent (untampered) still decrypts. This is the real
+    /// poisoning regression: the relay re-delivers unacked envelopes, so a
+    /// corrupt frame followed by the genuine re-delivery must recover. The
+    /// `tampered_ciphertext_fails_without_poisoning` test above only checks
+    /// the *next sequential* `n`, which happens to align with an already-
+    /// advanced counter and so hides the bug.
+    #[test]
+    fn tampered_then_resend_same_n_decrypts() {
+        let (mut alice, mut bob, _) = make_pair();
+        let ct = alice.encrypt(b"hello").unwrap(); // n=0
+        let mut tampered = ct.clone();
+        tampered.ciphertext[0] ^= 0xff;
+        // Tampered n=0 fails.
+        assert!(matches!(
+            bob.decrypt(&tampered),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        // The genuine n=0 re-delivered MUST still decrypt: the chain key and
+        // counter were not advanced by the failed attempt.
+        assert_eq!(bob.decrypt(&ct).unwrap(), b"hello");
+        // And the chain continues normally afterward.
+        let ct2 = alice.encrypt(b"second").unwrap(); // n=1
+        assert_eq!(bob.decrypt(&ct2).unwrap(), b"second");
+    }
+
+    /// Same poisoning check across a DH ratchet boundary: a tampered message
+    /// carrying a NEW DH key must not commit the new chain, so the genuine
+    /// re-delivery (same new DH key, same `n`) still decrypts.
+    #[test]
+    fn tampered_dh_ratchet_message_does_not_commit_new_chain() {
+        let (mut alice, mut bob, _) = make_pair();
+        // Establish + advance so bob has replied (forcing alice's next send to
+        // carry a fresh DH ratchet key).
+        let _ct0 = alice.encrypt(b"first").unwrap();
+        let _ = bob.decrypt(&_ct0).unwrap();
+        let reply = bob.encrypt(b"reply").unwrap();
+        let _ = alice.decrypt(&reply).unwrap();
+
+        // Alice's next message uses a new DH key (DH ratchet on her side).
+        let ct = alice.encrypt(b"ratcheted").unwrap();
+        let mut tampered = ct.clone();
+        tampered.ciphertext[0] ^= 0xff;
+        assert!(matches!(
+            bob.decrypt(&tampered),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        // Genuine re-delivery of the same ratcheted message must decrypt.
+        assert_eq!(bob.decrypt(&ct).unwrap(), b"ratcheted");
     }
 
     #[test]

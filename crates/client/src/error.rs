@@ -11,6 +11,12 @@ pub enum ClientError {
     Postcard(#[from] postcard::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A socket read or write exceeded its deadline. A hung relay (one that
+    /// accepts the connection but stops responding) or a backpressured write
+    /// (relay stops draining) would otherwise stall the recv/send path
+    /// forever; the timeout lets the caller tear down and reconnect.
+    #[error("network operation timed out")]
+    Timeout,
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("no session with peer")]

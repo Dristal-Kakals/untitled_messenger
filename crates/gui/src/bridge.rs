@@ -451,9 +451,11 @@ impl Bridge {
             .map_err(|e| humanize(&e))?;
         // Process the outbox flush: keep reading until the Subscribe AckOk,
         // decrypting every `Delivered` batch inline so offline mail is
-        // recovered, not lost.
+        // recovered, not lost. Bounded by the client's read timeout so a
+        // relay that stops mid-flush is detected instead of hanging the
+        // (re)connect handshake forever.
         loop {
-            let frame = client.recv_msg().await.map_err(|e| humanize(&e))?;
+            let frame = client.recv_msg_timeout().await.map_err(|e| humanize(&e))?;
             match frame {
                 Some(ServerMessage::AckOk) => break,
                 Some(ServerMessage::Delivered(envs)) => {
@@ -896,10 +898,13 @@ impl Bridge {
         }
         loop {
             // Re-borrow net per iteration so we can release it to process any
-            // Delivered frames (which touch self.session/self.store).
+            // Delivered frames (which touch self.session/self.store). Bounded
+            // by the read timeout so a relay that drops the FetchBundle
+            // request (buggy/malicious) is detected instead of hanging the
+            // send path forever — the timeout triggers a reconnect.
             let frame = {
                 let net = self.net.as_mut().ok_or("not connected")?;
-                net.recv_msg().await.map_err(|e| humanize(&e))?
+                net.recv_msg_timeout().await.map_err(|e| humanize(&e))?
             };
             match frame {
                 Some(ServerMessage::Bundle(b)) => return Ok(b),
@@ -1368,10 +1373,12 @@ impl Bridge {
 /// Consume server frames until an `AckOk` arrives (the Register handshake).
 /// Used only for `Register`, which does not flush the outbox; the Subscribe
 /// handshake is handled inline in `connect_and_subscribe` so its outbox
-/// flush is recovered, not discarded.
+/// flush is recovered, not discarded. Bounded by the client's read timeout so
+/// a relay that accepts Register but never replies is detected instead of
+/// hanging the handshake (and thus the whole reconnect loop).
 async fn drain_until_ack(client: &mut Client) -> Result<(), ClientError> {
     loop {
-        match client.recv_msg().await? {
+        match client.recv_msg_timeout().await? {
             Some(ServerMessage::AckOk) => return Ok(()),
             Some(ServerMessage::Delivered(_envs)) => {
                 // Discard early envelopes during the Register handshake.
@@ -1401,6 +1408,7 @@ pub fn humanize(e: &ClientError) -> String {
         }
         ClientError::Store(s) => s.clone(),
         ClientError::Io(_) => "network error".to_string(),
+        ClientError::Timeout => "connection timed out".to_string(),
         ClientError::Crypto(_) => "cryptographic error".to_string(),
         ClientError::Protocol(_) => "protocol error".to_string(),
         ClientError::Postcard(_) => "encoding error".to_string(),

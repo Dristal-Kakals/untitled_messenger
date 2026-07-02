@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use um_protocol::framing::{decode, encode};
 use um_protocol::{ClientMessage, ServerMessage};
@@ -17,30 +18,121 @@ use um_protocol::{ClientMessage, ServerMessage};
 use crate::handler::handle;
 use crate::{Store, Subscribers};
 
+/// Maximum number of concurrent connections the relay will service. Each
+/// extra connection holds a task + its read/write buffers; an unbounded
+/// accept loop lets a connection-flood attacker exhaust memory. Acquiring a
+/// permit before `handle_conn` caps live tasks at this many; a flood queues
+/// on the semaphore (backpressure) instead of spawning unbounded tasks.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Read timeout during the pre-auth (not-yet-subscribed) phase. A client that
+/// opens a connection and sends nothing — a slowloris — holds the task and
+/// its buffers forever without this. Once a connection `Subscribe`s it is
+/// long-lived by design (it may idle for hours waiting for pushes), so the
+/// timeout is NOT applied to the subscribed `select!` read branch.
+const PREAUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Write timeout for every frame write. A client that stops draining its
+/// socket stalls `write_all` via TCP backpressure; bounding it drops the
+/// connection instead of letting one slow peer wedge a push branch of the
+/// `select!` (which would also stall socket reads for that connection).
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Tunable limits for [`serve_with`]. Production uses [`ServeConfig::default`]
+/// (the constants above); tests shrink the timeouts and connection cap so the
+/// slowloris / connection-flood cases run in milliseconds instead of minutes.
+#[derive(Clone, Copy)]
+pub struct ServeConfig {
+    /// Max concurrent connections (semaphore permits).
+    pub max_connections: usize,
+    /// Pre-auth idle read timeout (slowloris guard).
+    pub preauth_read_timeout: std::time::Duration,
+    /// Per-frame write timeout (backpressure guard).
+    pub write_timeout: std::time::Duration,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONNECTIONS,
+            preauth_read_timeout: PREAUTH_READ_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
+        }
+    }
+}
+
 /// Serve the relay on `addr` until the task is cancelled. Returns the bound
-/// address (useful for ephemeral-port tests).
+/// address (useful for ephemeral-port tests). Uses production defaults for
+/// all limits; see [`serve_with`] to override them (e.g. in tests).
 pub async fn serve(
     addr: &str,
     store: Arc<Store>,
     subs: Arc<Subscribers>,
 ) -> std::io::Result<std::net::SocketAddr> {
+    serve_with(addr, store, subs, ServeConfig::default()).await
+}
+
+/// Like [`serve`] but with caller-supplied [`ServeConfig`]. Used by tests to
+/// shrink the slowloris / write timeouts and the connection cap so resource-
+/// exhaustion cases are fast and deterministic.
+pub async fn serve_with(
+    addr: &str,
+    store: Arc<Store>,
+    subs: Arc<Subscribers>,
+    cfg: ServeConfig,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
+    // Per-process connection cap. Cloned per accept (cheap — it's an
+    // `Arc<Semaphore>`); `acquire_owned` returns a guard that releases on
+    // drop, so a connection task ending frees its permit for the next
+    // accept.
+    let conn_limit = Arc::new(Semaphore::new(cfg.max_connections));
+    let preauth_read_timeout = cfg.preauth_read_timeout;
+    let write_timeout = cfg.write_timeout;
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
+            // Backpressure: if max_connections are live, wait for one to
+            // finish before accepting more. `acquire_owned` moves the guard
+            // into the task so it is released when the task ends.
+            let permit = match conn_limit.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => continue, // semaphore closed (server shutting down)
+            };
             let store = store.clone();
             let subs = subs.clone();
-            tokio::spawn(handle_conn(stream, store, subs));
+            tokio::spawn(handle_conn(
+                stream,
+                store,
+                subs,
+                permit,
+                preauth_read_timeout,
+                write_timeout,
+            ));
         }
     });
     Ok(local)
 }
 
-/// Handle one connection to completion.
-async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers>) {
+/// Handle one connection to completion. `_permit` is the connection-cap
+/// guard; dropping it (when this function returns) frees a slot for the next
+/// accept. `preauth_read_timeout` bounds idle reads before the first frame
+/// (slowloris guard); `write_timeout` bounds every frame write (backpressure
+/// guard).
+async fn handle_conn(
+    stream: TcpStream,
+    store: Arc<Store>,
+    subs: Arc<Subscribers>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    preauth_read_timeout: std::time::Duration,
+    write_timeout: std::time::Duration,
+) {
+    // Reduce per-frame latency for small framed messages (acks, single
+    // envelopes) that would otherwise be Nagle-delayed up to ~40ms.
+    let _ = stream.set_nodelay(true);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::new();
@@ -60,6 +152,10 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
             // periodic eviction check. The eviction check closes this
             // connection if a newer Subscribe for the same identity replaced
             // our entry in the registry (last-Subscribe-wins).
+            //
+            // No read timeout here: a subscribed connection may legitimately
+            // idle for hours waiting for a push. A slow client is bounded by
+            // the write timeout on push frames instead.
             let mut chunk = [0u8; 4096];
             tokio::select! {
                 read = reader.read(&mut chunk) => {
@@ -75,7 +171,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                             let Ok(frame) = encode(&server_msg) else {
                                 break;
                             };
-                            if writer.write_all(&frame).await.is_err() {
+                            if !write_frame(&mut writer, &frame, write_timeout).await {
                                 break;
                             }
                             // Continue the loop; do not also read this iteration.
@@ -100,12 +196,16 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                 }
             }
         } else {
-            // Not-subscribed mode: just read.
+            // Not-subscribed mode: just read, with a slowloris timeout. A
+            // client that connects but never sends a frame (or sends one
+            // byte per minute) is dropped after `preauth_read_timeout` of
+            // idle rather than holding the task forever.
             let mut chunk = [0u8; 4096];
-            match reader.read(&mut chunk).await {
-                Ok(0) => break, // EOF
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => break,
+            match tokio::time::timeout(preauth_read_timeout, reader.read(&mut chunk)).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => break, // timed out waiting for bytes
             }
         }
 
@@ -121,7 +221,12 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                     // is still closed — the oversized frame cannot be skipped
                     // because the length prefix is untrusted and the stream is
                     // no longer frame-aligned.
-                    send_error(&mut writer, um_protocol::ServerError::TooLarge).await;
+                    send_error(
+                        &mut writer,
+                        um_protocol::ServerError::TooLarge,
+                        write_timeout,
+                    )
+                    .await;
                     return;
                 }
                 Err(_) => {
@@ -130,7 +235,12 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                     // we *could* drain and continue, but a malformed frame
                     // indicates a protocol/version mismatch; per the spec we
                     // surface the error and close the connection.
-                    send_error(&mut writer, um_protocol::ServerError::MalformedFrame).await;
+                    send_error(
+                        &mut writer,
+                        um_protocol::ServerError::MalformedFrame,
+                        write_timeout,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -148,7 +258,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                     // Non-Register before auth: reject and close.
                     let err = ServerMessage::Error(um_protocol::ServerError::NotRegistered);
                     if let Ok(frame) = encode(&err) {
-                        let _ = writer.write_all(&frame).await;
+                        let _ = write_frame(&mut writer, &frame, write_timeout).await;
                     }
                     return;
                 }
@@ -169,7 +279,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                     let Ok(frame) = encode(&ServerMessage::Delivered(chunk.to_vec())) else {
                         return;
                     };
-                    if writer.write_all(&frame).await.is_err() {
+                    if !write_frame(&mut writer, &frame, write_timeout).await {
                         return;
                     }
                 }
@@ -177,7 +287,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
                 let Ok(ack) = encode(&ServerMessage::AckOk) else {
                     return;
                 };
-                if writer.write_all(&ack).await.is_err() {
+                if !write_frame(&mut writer, &ack, write_timeout).await {
                     return;
                 }
                 continue;
@@ -186,7 +296,7 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
             let reply = handle(&store, &subs, &id, msg);
             match encode(&reply) {
                 Ok(frame) => {
-                    if writer.write_all(&frame).await.is_err() {
+                    if !write_frame(&mut writer, &frame, write_timeout).await {
                         return;
                     }
                 }
@@ -201,12 +311,31 @@ async fn handle_conn(stream: TcpStream, store: Arc<Store>, subs: Arc<Subscribers
     }
 }
 
+/// Write one framed message with a `write_timeout` deadline. Returns `false`
+/// if the write timed out or errored, signaling the caller to close the
+/// connection. A slow client that stops draining its socket would otherwise
+/// stall `write_all` indefinitely via TCP backpressure.
+async fn write_frame(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    frame: &[u8],
+    write_timeout: std::time::Duration,
+) -> bool {
+    match tokio::time::timeout(write_timeout, writer.write_all(frame)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 /// Best-effort write of a single `ServerError` frame, then the caller closes
 /// the connection. A write failure is ignored — the connection is being torn
 /// down regardless, and the error frame is advisory (the client observes it if
-/// it can, EOF otherwise).
-async fn send_error(writer: &mut tokio::net::tcp::OwnedWriteHalf, err: um_protocol::ServerError) {
+/// it can, EOF otherwise). Uses the same `write_timeout` as normal frames.
+async fn send_error(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    err: um_protocol::ServerError,
+    write_timeout: std::time::Duration,
+) {
     if let Ok(frame) = encode(&ServerMessage::Error(err)) {
-        let _ = writer.write_all(&frame).await;
+        let _ = write_frame(writer, &frame, write_timeout).await;
     }
 }
