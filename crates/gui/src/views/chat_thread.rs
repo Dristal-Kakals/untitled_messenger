@@ -8,7 +8,7 @@ use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, format_time, hex32};
+use super::{Message, TopHint, UmApp, format_time, hex32, history_top_hint};
 use crate::ChatId;
 use crate::theme;
 
@@ -64,6 +64,21 @@ fn message_row(
         .into()
 }
 
+/// A dim centered line shown at the top of the thread (above the oldest cached
+/// message) when an older page is loading or the start of history has been
+/// reached. Pure over the `TopHint`; returns `None` when no hint applies so the
+/// caller can skip pushing anything.
+fn top_hint_line(hint: TopHint) -> Element<'static, Message> {
+    let (label, color) = match hint {
+        TopHint::Loading => ("loading older…", theme::MUTED),
+        TopHint::StartOfHistory => ("start of history", theme::MUTED),
+    };
+    container(text(label).color(color).size(11))
+        .align_x(alignment::Horizontal::Center)
+        .width(Fill)
+        .into()
+}
+
 pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
     let contact = app.contacts.iter().find(|c| c.identity_pub == peer);
     let title = match contact {
@@ -83,15 +98,31 @@ pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
     .spacing(10)
     .align_y(alignment::Vertical::Center);
 
+    let chat = ChatId::Peer(peer);
     let mut msgs = column![].spacing(6);
-    if let Some(thread) = app.threads.get(&ChatId::Peer(peer)) {
+    // Top-of-thread hint: a "loading older…" line while a page is in flight, or
+    // a "start of history" marker once the oldest row is reached. Only shown
+    // once the thread has at least one cached message — a bare "no messages
+    // yet" thread has no pagination state to hint about.
+    let thread_nonempty = app
+        .threads
+        .get(&chat)
+        .is_some_and(|t| !t.is_empty());
+    if thread_nonempty {
+        let loading = app.loading_older.contains(&chat);
+        let has_more = app.has_more_history.get(&chat).copied().unwrap_or(false);
+        if let Some(hint) = history_top_hint(loading, has_more) {
+            msgs = msgs.push(top_hint_line(hint));
+        }
+    }
+    if let Some(thread) = app.threads.get(&chat) {
         for m in thread {
             msgs = msgs.push(message_row(&m.text, m.dir, m.timestamp, m.status));
         }
     }
     if app
         .threads
-        .get(&ChatId::Peer(peer))
+        .get(&chat)
         .is_none_or(|t| t.is_empty())
     {
         msgs = msgs.push(

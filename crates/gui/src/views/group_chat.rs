@@ -6,7 +6,7 @@ use iced::widget::scrollable::Viewport;
 use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 
-use super::{Message, UmApp, format_time, hex32, short_hex};
+use super::{Message, TopHint, UmApp, format_time, hex32, history_top_hint, short_hex};
 use super::chat_thread::SCROLL_AT_TOP_EPS;
 use crate::ChatId;
 use crate::ContactView;
@@ -71,6 +71,21 @@ fn message_row<'a>(
         .into()
 }
 
+/// A dim centered line shown at the top of the group thread (above the oldest
+/// cached message) when an older page is loading or the start of history has
+/// been reached. Mirrors [`chat_thread::top_hint_line`]; kept here so the group
+/// view stays self-contained (no shared widget module yet).
+fn top_hint_line(hint: TopHint) -> Element<'static, Message> {
+    let (label, color) = match hint {
+        TopHint::Loading => ("loading older…", theme::MUTED),
+        TopHint::StartOfHistory => ("start of history", theme::MUTED),
+    };
+    container(text(label).color(color).size(11))
+        .align_x(alignment::Horizontal::Center)
+        .width(Fill)
+        .into()
+}
+
 pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
     let title = match app.groups.iter().find(|g| g.id == group) {
         Some(g) => {
@@ -88,8 +103,23 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
     .spacing(10)
     .align_y(alignment::Vertical::Center);
 
+    let chat = ChatId::Group(group);
     let mut msgs = column![].spacing(6);
-    if let Some(thread) = app.threads.get(&ChatId::Group(group)) {
+    // Top-of-thread hint (see chat_thread::chat_thread): only once the thread
+    // has cached messages — an empty group thread shows "no group messages
+    // yet" instead.
+    let thread_nonempty = app
+        .threads
+        .get(&chat)
+        .is_some_and(|t| !t.is_empty());
+    if thread_nonempty {
+        let loading = app.loading_older.contains(&chat);
+        let has_more = app.has_more_history.get(&chat).copied().unwrap_or(false);
+        if let Some(hint) = history_top_hint(loading, has_more) {
+            msgs = msgs.push(top_hint_line(hint));
+        }
+    }
+    if let Some(thread) = app.threads.get(&chat) {
         for m in thread {
             msgs = msgs.push(message_row(
                 app,
@@ -103,7 +133,7 @@ pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
     }
     if app
         .threads
-        .get(&ChatId::Group(group))
+        .get(&chat)
         .is_none_or(|t| t.is_empty())
     {
         msgs = msgs.push(

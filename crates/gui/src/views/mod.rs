@@ -224,6 +224,47 @@ pub fn highlighted_name<'a>(query: &str, label: &'a str) -> Vec<iced::widget::te
     spans
 }
 
+/// What (if anything) to show at the top of a chat thread above the oldest
+/// cached message. Pure data derived from the app's pagination state
+/// (`loading_older` / `has_more_history`) by [`history_top_hint`]; the chat
+/// views render it as a small dim line so the user gets feedback while an older
+/// page is in flight, and a "start of history" marker once the oldest row is
+/// reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopHint {
+    /// An older page is being fetched — show a "loading older…" line.
+    Loading,
+    /// The oldest row has been reached (`has_more = false`) — show a "start of
+    /// history" marker.
+    StartOfHistory,
+}
+
+/// Decide whether a chat thread should show a top-of-list hint, and which one.
+///
+/// `loading` is whether a `LoadOlder` page is currently in flight for the chat
+/// (`UmApp::loading_older`); `has_more` is whether older history is known to
+/// exist beyond the cached page (`UmApp::has_more_history`, defaulting to
+/// `false` for a chat with no entry — i.e. no history loaded yet, so no marker
+/// is shown until the first page arrives and reports `has_more`).
+///
+/// Precedence: a fetch in flight always wins (the user just scrolled to the
+/// top and is waiting on the page). Otherwise, once `has_more` flips false the
+/// oldest row has been reached and a "start of history" marker is shown. While
+/// `has_more` is still true and nothing is loading, there is nothing to show —
+/// the user is mid-thread, not at either end.
+///
+/// Pure, testable. The chat views call this with the looked-up state and render
+/// the matching `TopHint` as a dim centered line above the message list.
+pub fn history_top_hint(loading: bool, has_more: bool) -> Option<TopHint> {
+    if loading {
+        return Some(TopHint::Loading);
+    }
+    if !has_more {
+        return Some(TopHint::StartOfHistory);
+    }
+    None
+}
+
 pub use chat_thread::chat_thread;
 pub use contact_list::{contact_list, sidebar};
 pub use group_chat::group_chat;
@@ -457,5 +498,32 @@ mod tests {
         // original capitalization — the highlighter keeps "Bob" not "bob".
         let (s, e) = match_range("ob", "Bob").unwrap();
         assert_eq!(&"Bob"[s..e], "ob");
+    }
+
+    #[test]
+    fn history_top_hint_loading_wins_over_has_more() {
+        // A fetch in flight shows the loading line even if more history exists.
+        assert_eq!(history_top_hint(true, true), Some(TopHint::Loading));
+    }
+
+    #[test]
+    fn history_top_hint_loading_wins_over_start_of_history() {
+        // If a (final, empty) older page is still in flight when has_more is
+        // already false, the loading line wins — the marker appears once the
+        // page lands and the in-flight marker clears.
+        assert_eq!(history_top_hint(true, false), Some(TopHint::Loading));
+    }
+
+    #[test]
+    fn history_top_hint_no_more_shows_start_of_history() {
+        // has_more = false and nothing loading → oldest row reached.
+        assert_eq!(history_top_hint(false, false), Some(TopHint::StartOfHistory));
+    }
+
+    #[test]
+    fn history_top_hint_more_and_idle_shows_nothing() {
+        // Mid-thread: more history exists, nothing loading, user not at the
+        // top → no hint.
+        assert_eq!(history_top_hint(false, true), None);
     }
 }
