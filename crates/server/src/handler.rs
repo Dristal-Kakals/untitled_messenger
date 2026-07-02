@@ -135,6 +135,14 @@ pub fn handle(
             // the client knows the mode was accepted.
             ServerMessage::AckOk
         }
+        ClientMessage::Ping => {
+            // Application-level liveness probe. The client sends `Ping` on a
+            // fixed interval to detect a half-open connection (a NAT/firewall
+            // that dropped the path without a FIN — the socket looks idle but
+            // is dead). The server echoes `Pong` so the client's grace timer
+            // resets; no store mutation, no subscriber interaction.
+            ServerMessage::Pong
+        }
     }
 }
 
@@ -521,6 +529,33 @@ mod tests {
         let (id, _) = real_bundle(true);
         let reply = handle(&store, &Subscribers::new(), &id, ClientMessage::Subscribe);
         assert_eq!(reply, ServerMessage::AckOk);
+    }
+
+    /// `Ping` is answered with `Pong` — a stateless liveness echo. No store
+    /// mutation, no subscriber interaction; the relay is just confirming the
+    /// connection is alive so the client's grace timer can reset.
+    #[test]
+    fn ping_replies_pong() {
+        let store = Store::new();
+        let (id, _) = real_bundle(true);
+        let reply = handle(&store, &Subscribers::new(), &id, ClientMessage::Ping);
+        assert_eq!(reply, ServerMessage::Pong);
+    }
+
+    /// `Ping` does not require the connection to be registered first — it is a
+    /// pure liveness echo with no store dependency, so it works on a fresh
+    /// (pre-Register) connection too. This keeps the heartbeat robust even if
+    /// it races the handshake.
+    #[test]
+    fn ping_replies_pong_even_unregistered() {
+        let store = Store::new();
+        let reply = handle(
+            &store,
+            &Subscribers::new(),
+            &[0x77; 32],
+            ClientMessage::Ping,
+        );
+        assert_eq!(reply, ServerMessage::Pong);
     }
 
     #[test]

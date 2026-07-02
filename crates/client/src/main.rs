@@ -137,6 +137,7 @@ async fn run(addr: SocketAddr) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Some(ServerMessage::AckOk) => {}
+                    Some(ServerMessage::Pong) => {}
                     Some(ServerMessage::Bundle(_)) => {
                         // A stray bundle reply outside of /msg (e.g. a late
                         // FetchBundle answer). Nothing to do with it here.
@@ -246,6 +247,7 @@ async fn send_message(
                         }
                     }
                     Some(ServerMessage::AckOk) => {}
+                    Some(ServerMessage::Pong) => {}
                     Some(ServerMessage::Error(e)) => {
                         return Err(ClientError::Store(format!("server: {e:?}")));
                     }

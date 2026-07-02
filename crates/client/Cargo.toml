@@ -12,6 +12,7 @@ workspace = true
 um_protocol = { path = "../protocol" }
 um_crypto = { path = "../crypto" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "macros", "time"] }
+socket2 = { version = "0.6", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

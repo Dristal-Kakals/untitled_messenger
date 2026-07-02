@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use um_client::session::ClientSession;
@@ -69,6 +69,27 @@ const CHAN_CAP: usize = 256;
 /// Reconnect backoff ceiling (seconds). The loop retries 1→2→4→…→30 forever.
 const BACKOFF_CAP_SECS: u64 = 30;
 
+/// Application-level heartbeat interval (seconds). A subscribed connection may
+/// legitimately idle for hours between pushes, so neither side can otherwise
+/// tell a live-but-quiet peer from a half-open one (a NAT/firewall that
+/// silently dropped the path without a FIN — no EOF, no RST, the socket just
+/// looks idle). The bridge sends `Ping` on this cadence; the server echoes
+/// `Pong`, and the bridge resets its liveness clock. The OS TCP keepalive
+/// (set in `Client::connect`) is a backstop that probes at the kernel level;
+/// this heartbeat is the portable, application-level probe that works
+/// regardless of keepalive tuning and also catches a relay that has gone
+/// unresponsive while keeping the TCP socket open.
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Grace window for a `Pong` reply (seconds). If no `Pong` (or any other
+/// frame — any traffic proves the link is alive) arrives within this window
+/// after the last liveness mark, the bridge treats the connection as
+/// half-open: it tears down and reconnects so offline mail is recovered
+/// instead of the recv loop hanging forever on a dead-but-not-EOF socket.
+/// Generously larger than `HEARTBEAT_INTERVAL_SECS` so a temporarily slow
+/// link does not spuriously trip it.
+const HEARTBEAT_GRACE_SECS: u64 = 90;
+
 /// Keyset page size for history loading. `LoadThread`/`LoadGroupThread` fetch
 /// the newest `HISTORY_PAGE_SIZE` rows; `LoadOlder`/`LoadOlderGroup` fetch the
 /// next older page of the same size on scroll-to-top. Tuned for a chat view:
@@ -90,6 +111,21 @@ pub struct Bridge {
     /// Last delivered envelope id seen (informational; the server flushes
     /// unacked outbox on Subscribe).
     last_delivered_id: u64,
+    /// Liveness clock for the application-level heartbeat. Set to `now` on
+    /// `connect_and_subscribe` success and reset on every `Pong` (and on any
+    /// received frame — any traffic proves the link is alive). The heartbeat
+    /// arm of the `select!` compares `now - last_pong` against the grace
+    /// window; exceeding it means the connection is half-open and the bridge
+    /// tears down + reconnects. `None` while not connected.
+    last_pong: Option<Instant>,
+    /// Heartbeat probe interval. Production uses
+    /// [`HEARTBEAT_INTERVAL_SECS`]; tests shrink it so the liveness path is
+    /// exercised in milliseconds instead of tens of seconds.
+    heartbeat_interval: std::time::Duration,
+    /// Liveness grace window. Production uses [`HEARTBEAT_GRACE_SECS`]; tests
+    /// shrink it so a half-open connection is detected and torn down within
+    /// the test deadline.
+    heartbeat_grace: std::time::Duration,
     /// Group rosters the bridge knows about: group id → member identity pubs.
     /// Mirrored to the store's `groups` + `group_members` tables so a
     /// close/reopen (Unlock) rebuilds the roster and group sends still fan out
@@ -126,10 +162,29 @@ impl Bridge {
             config,
             store_path: None,
             last_delivered_id: 0,
+            last_pong: None,
+            heartbeat_interval: std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+            heartbeat_grace: std::time::Duration::from_secs(HEARTBEAT_GRACE_SECS),
             group_rosters: HashMap::new(),
             group_names: HashMap::new(),
             dist_sent: HashSet::new(),
         }
+    }
+
+    /// Override the heartbeat probe interval and liveness grace window.
+    /// Production leaves the defaults ([`HEARTBEAT_INTERVAL_SECS`] /
+    /// [`HEARTBEAT_GRACE_SECS`]); tests shrink both so the liveness path and
+    /// the half-open detection are exercised in milliseconds. The grace must
+    /// be at least the interval, otherwise a healthy connection that simply
+    /// has not yet answered its first probe would spuriously trip.
+    pub fn with_heartbeat_params(
+        mut self,
+        interval: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Self {
+        self.heartbeat_interval = interval;
+        self.heartbeat_grace = grace;
+        self
     }
 
     /// Spawn the bridge on the current runtime: creates the two GUI channels,
@@ -179,6 +234,19 @@ impl Bridge {
                 let _ = event_tx.send(Event::UnreadLoaded(unread)).await;
             }
         }
+        // Application-level heartbeat tick. Fires every `heartbeat_interval`;
+        // on each tick the bridge sends a `Ping` (if connected) and checks
+        // whether the liveness grace window has expired (no `Pong`/any frame
+        // within `heartbeat_grace` → half-open → tear down + reconnect). The
+        // first tick fires immediately, so we discard it (the connection is
+        // freshly alive, `last_pong` just set) and start probing one interval
+        // in. `MissedTickBehavior::Delay` keeps the cadence from bursting
+        // after a long blocking command (e.g. a slow bundle fetch).
+        let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Discard the immediate first tick so we do not ping the instant we
+        // connect (the grace clock is freshly seeded; a ping now is noise).
+        let _ = heartbeat.tick().await;
         loop {
             tokio::select! {
                 cmd = command_rx.recv() => match cmd {
@@ -198,12 +266,33 @@ impl Bridge {
                     }
                 } => match frame {
                     Ok(Some(ServerMessage::Delivered(envs))) => {
+                        // Any frame proves the link is alive — refresh the
+                        // liveness clock so the heartbeat grace does not trip
+                        // on a connection that is actively receiving mail.
+                        if self.last_pong.is_some() {
+                            self.last_pong = Some(Instant::now());
+                        }
                         let _ = self.handle_delivered(&envs, &event_tx).await;
                     }
-                    Ok(Some(ServerMessage::AckOk)) => {}
+                    Ok(Some(ServerMessage::Pong)) => {
+                        // Heartbeat reply: the connection is alive. Reset the
+                        // liveness clock; the grace window restarts.
+                        if self.last_pong.is_some() {
+                            self.last_pong = Some(Instant::now());
+                        }
+                    }
+                    Ok(Some(ServerMessage::AckOk)) => {
+                        if self.last_pong.is_some() {
+                            self.last_pong = Some(Instant::now());
+                        }
+                    }
                     Ok(Some(ServerMessage::Bundle(_))) => {
                         // A stray bundle reply outside a StartSession fetch.
                         // Nothing to do; the inline fetch consumes its own.
+                        // Still counts as liveness traffic.
+                        if self.last_pong.is_some() {
+                            self.last_pong = Some(Instant::now());
+                        }
                     }
                     Ok(Some(ServerMessage::Error(e))) => {
                         let _ = event_tx
@@ -213,6 +302,40 @@ impl Bridge {
                     Ok(None) => self.handle_disconnect(&event_tx).await,
                     Err(_e) => self.handle_disconnect(&event_tx).await,
                 },
+                _tick = heartbeat.tick() => {
+                    // Only act on the heartbeat while connected. When not
+                    // connected the recv branch parks and `handle_disconnect`
+                    // drives the reconnect loop; the heartbeat tick is a no-op
+                    // here and re-arms for the next interval.
+                    if let (Some(net), Some(_)) = (self.net.as_mut(), self.last_pong) {
+                        // Grace check: if no frame (Pong or otherwise) has
+                        // landed within the grace window, the connection is
+                        // half-open. Tear down and let the reconnect loop
+                        // recover offline mail instead of hanging forever.
+                        let elapsed = self
+                            .last_pong
+                            .map(|t| t.elapsed())
+                            .unwrap_or(std::time::Duration::ZERO);
+                        match heartbeat_decision(elapsed, self.heartbeat_grace) {
+                            HeartbeatAction::Disconnect => {
+                                tracing::warn!(
+                                    "heartbeat grace expired ({}s > {}s), \
+                                     connection presumed half-open — reconnecting",
+                                    elapsed.as_secs(),
+                                    self.heartbeat_grace.as_secs(),
+                                );
+                                self.handle_disconnect(&event_tx).await;
+                            }
+                            HeartbeatAction::Ping => {
+                                // Send a liveness probe. Best-effort: a send
+                                // failure surfaces as a disconnect on the next
+                                // recv (the socket is failing), so we do not
+                                // double-handle it here.
+                                let _ = net.send_msg(&ClientMessage::Ping).await;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -486,11 +609,15 @@ impl Bridge {
                 .await;
         }
         self.net = Some(client);
+        // Seed the liveness clock: the connection is freshly alive, so the
+        // heartbeat grace window starts counting from now.
+        self.last_pong = Some(Instant::now());
         Ok(())
     }
 
     async fn handle_disconnect(&mut self, event_tx: &mpsc::Sender<Event>) {
         self.net = None;
+        self.last_pong = None;
         let _ = event_tx
             .send(Event::Disconnected {
                 reason: "connection closed".into(),
@@ -519,6 +646,7 @@ impl Bridge {
     async fn handle_change_server(&mut self, addr: SocketAddr, event_tx: &mpsc::Sender<Event>) {
         // Drop the old connection.
         self.net = None;
+        self.last_pong = None;
         self.config.server_addr = addr.to_string();
         if let Err(reason) = self.connect_and_subscribe(event_tx).await {
             let _ = event_tx.send(Event::Error(reason)).await;
@@ -882,6 +1010,7 @@ impl Bridge {
     async fn handle_logout(&mut self, event_tx: &mpsc::Sender<Event>) {
         self.store = None;
         self.net = None;
+        self.last_pong = None;
         self.store_path = None;
         // Clear the in-memory group maps so a subsequent Unlock of a different
         // identity does not carry over a stale roster. The persisted tables are
@@ -930,6 +1059,14 @@ impl Bridge {
                     let _ = self.handle_delivered(&envs, event_tx).await;
                 }
                 Some(ServerMessage::AckOk) => {}
+                Some(ServerMessage::Pong) => {
+                    // Heartbeat reply arriving during an inline fetch. Treat
+                    // as liveness traffic (refresh the clock) and keep waiting
+                    // for the Bundle reply.
+                    if self.last_pong.is_some() {
+                        self.last_pong = Some(Instant::now());
+                    }
+                }
                 Some(ServerMessage::Error(e)) => {
                     return Err(format!("server: {e:?}"));
                 }
@@ -1576,6 +1713,28 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// What the heartbeat tick should do, given the time since the last liveness
+/// mark (`elapsed`) and the configured grace window. Pure so the decision is
+/// unit-testable without a live connection.
+///
+/// - `elapsed > grace` → [`HeartbeatAction::Disconnect`]: no `Pong` (or any
+///   frame) within the grace window means the connection is half-open; tear
+///   it down so the reconnect loop recovers offline mail.
+/// - otherwise → [`HeartbeatAction::Ping`]: send a liveness probe and re-arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeartbeatAction {
+    Ping,
+    Disconnect,
+}
+
+fn heartbeat_decision(elapsed: std::time::Duration, grace: std::time::Duration) -> HeartbeatAction {
+    if elapsed > grace {
+        HeartbeatAction::Disconnect
+    } else {
+        HeartbeatAction::Ping
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1622,5 +1781,46 @@ mod tests {
         let b = now_secs();
         assert!(b >= a);
         assert!(a > 0);
+    }
+
+    #[test]
+    fn heartbeat_decision_pings_within_grace() {
+        // Well within the grace window → probe, do not disconnect.
+        let grace = std::time::Duration::from_secs(90);
+        assert_eq!(
+            heartbeat_decision(std::time::Duration::from_secs(30), grace),
+            HeartbeatAction::Ping,
+        );
+        // Exactly at the grace boundary is still Ping (the check is strict `>`).
+        assert_eq!(heartbeat_decision(grace, grace), HeartbeatAction::Ping,);
+    }
+
+    #[test]
+    fn heartbeat_decision_disconnects_when_grace_expired() {
+        // Past the grace window → half-open, tear down.
+        let grace = std::time::Duration::from_secs(90);
+        assert_eq!(
+            heartbeat_decision(std::time::Duration::from_secs(91), grace),
+            HeartbeatAction::Disconnect,
+        );
+        assert_eq!(
+            heartbeat_decision(std::time::Duration::from_secs(600), grace),
+            HeartbeatAction::Disconnect,
+        );
+    }
+
+    #[test]
+    fn heartbeat_decision_respects_shrunk_test_grace() {
+        // Tests shrink the grace to milliseconds; the decision must follow the
+        // configured window, not a hardcoded constant.
+        let grace = std::time::Duration::from_millis(200);
+        assert_eq!(
+            heartbeat_decision(std::time::Duration::from_millis(50), grace),
+            HeartbeatAction::Ping,
+        );
+        assert_eq!(
+            heartbeat_decision(std::time::Duration::from_millis(250), grace),
+            HeartbeatAction::Disconnect,
+        );
     }
 }

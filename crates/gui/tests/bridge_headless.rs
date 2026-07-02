@@ -26,6 +26,8 @@ use um_client::Store;
 use um_client::session::ClientSession;
 use um_gui::config::Config;
 use um_gui::{Bridge, Command, Event};
+use um_protocol::framing::{decode, encode};
+use um_protocol::{ClientMessage, ServerMessage};
 use um_server::{Store as ServerStore, Subscribers, listener::serve};
 
 /// A unique temp dir per test run: `um-bridge-test-<unix_nanos>-<pid>`.
@@ -1295,6 +1297,176 @@ async fn bridge_redelivery_dedups_decrypted_event() {
             assert_eq!(page.rows[0].msg.text, "offline dedup me");
 
             let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
+}
+
+/// A minimal framing-speaking relay stub for the heartbeat test. It does NOT
+/// run `um_server` — it speaks the raw `um_protocol` framing directly so we
+/// can control exactly when it stops answering, simulating a half-open path
+/// (the socket stays open, but the relay stops replying to `Ping`).
+///
+/// The first connection completes the Register/Subscribe handshake and then
+/// goes silent on `Ping` — never `Pong`, never EOF — which is exactly the
+/// half-open condition the heartbeat must detect. Every subsequent connection
+/// answers `Ping` with `Pong`, so the bridge's reconnect lands on a live peer
+/// and re-emits `Event::Connected`.
+async fn spawn_silent_after_subscribe_relay(
+    addr: std::net::SocketAddr,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind stub");
+    let bound = listener.local_addr().expect("local addr");
+    let conn_count = Arc::new(AtomicUsize::new(0));
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let n = conn_count.fetch_add(1, Ordering::SeqCst);
+            let first = n == 0;
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    // Read until we have at least one full frame.
+                    loop {
+                        match decode::<ClientMessage>(&buf) {
+                            Ok(_) => break,
+                            Err(um_protocol::error::ProtocolError::Incomplete) => {
+                                let mut chunk = [0u8; 4096];
+                                match reader.read(&mut chunk).await {
+                                    Ok(0) => return, // EOF
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                    Err(_) => return,
+                                }
+                            }
+                            Err(_) => return, // fatal framing error: drop conn
+                        }
+                    }
+                    let (msg, consumed) = match decode::<ClientMessage>(&buf) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    buf.drain(..consumed);
+                    match msg {
+                        ClientMessage::Register { .. } | ClientMessage::Subscribe => {
+                            let Ok(frame) = encode(&ServerMessage::AckOk) else {
+                                break;
+                            };
+                            if writer.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        ClientMessage::Ping => {
+                            // First connection: go silent (half-open). Hold the
+                            // socket open without replying so the bridge's recv
+                            // branch never sees an EOF — only the heartbeat
+                            // grace timer can detect this. Later connections
+                            // echo Pong so reconnect succeeds.
+                            if first {
+                                continue;
+                            }
+                            let Ok(frame) = encode(&ServerMessage::Pong) else {
+                                break;
+                            };
+                            if writer.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        // Anything else (Send/Ack/StartSession/FetchBundle):
+                        // ignore. The heartbeat test sends no mail.
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    (bound, handle)
+}
+
+/// The bridge's application-level heartbeat must detect a half-open relay —
+/// one that holds the TCP socket open but stops replying to `Ping` (a NAT/
+/// firewall that silently dropped the path, or a relay that has gone
+/// unresponsive) — and tear down + reconnect instead of hanging on the dead
+/// socket forever. With shrunk heartbeat params (interval/grace in tens of
+/// ms) this exercises the full path in well under the test deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_heartbeat_detects_half_open_and_reconnects() {
+    let dir = test_dir();
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    // Stub relay: conn #1 goes silent after Subscribe, conn #2+ answers Pong.
+    let (addr, _stub) = spawn_silent_after_subscribe_relay("127.0.0.1:0".parse().unwrap()).await;
+    let server_addr = addr.to_string();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let (mut bridge, _id_pub) = make_bridge(&dir, &server_addr);
+            // Shrink the heartbeat so the half-open path fires in well under a
+            // second, not the 30s/90s production cadence. Grace is kept
+            // comfortably larger than the interval and generously sized so a
+            // scheduler stall under parallel-test load (the stub task not
+            // getting CPU for a few intervals) does not spuriously trip a live
+            // link — the test asserts the *detection* path, not tight timing.
+            bridge = bridge.with_heartbeat_params(
+                std::time::Duration::from_millis(150),
+                std::time::Duration::from_millis(800),
+            );
+            let (cmd, mut ev) = spawn_bridge(bridge);
+
+            // Initial connect: Register + Subscribe handshake completes, the
+            // stub answers AckOk, the bridge emits Connected.
+            cmd.send(Command::Connect { addr })
+                .await
+                .expect("send connect");
+            expect_event(&mut ev, |e| matches!(e, Event::Connected)).await;
+
+            // The stub now goes silent on Ping. The heartbeat grace (150ms)
+            // expires with no Pong/any frame → the bridge presumes half-open,
+            // emits Disconnected, and reconnects. The second connection answers
+            // Pong, so the bridge re-emits Connected.
+            expect_event(&mut ev, |e| matches!(e, Event::Disconnected { .. })).await;
+            expect_event(&mut ev, |e| matches!(e, Event::Connected)).await;
+
+            // After reconnect the link is live: the bridge should NOT emit
+            // another Disconnected within a window covering several heartbeat
+            // intervals (the second conn answers Pong, so the heartbeat stays
+            // satisfied). A window too short would not actually verify
+            // stability; ~10 intervals gives the heartbeat real chances to
+            // re-probe and re-confirm.
+            let deadline = tokio::time::sleep(std::time::Duration::from_millis(1500));
+            tokio::pin!(deadline);
+            let mut spuriously_disconnected = false;
+            tokio::select! {
+                biased;
+                () = &mut deadline => {}
+                ev2 = ev.recv() => {
+                    if matches!(ev2, Some(Event::Disconnected { .. })) {
+                        spuriously_disconnected = true;
+                    }
+                }
+            }
+            assert!(
+                !spuriously_disconnected,
+                "reconnected link answers Pong — heartbeat must not trip again"
+            );
+
+            drop(cmd);
         })
         .await;
 }

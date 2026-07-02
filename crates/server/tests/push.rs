@@ -334,3 +334,31 @@ async fn poll_still_works_alongside_subscribe() {
         other => panic!("expected Delivered from Poll, got {other:?}"),
     }
 }
+
+/// `Ping` is answered with `Pong` over the real relay, including on a
+/// long-lived subscribed connection (the heartbeat's actual operating mode).
+/// This is the liveness probe the client uses to detect a half-open path; the
+/// relay must echo it regardless of subscription state.
+#[tokio::test]
+async fn ping_pong_round_trips_over_real_server() {
+    let addr = spawn_server().await;
+    let (id, bundle) = real_bundle();
+
+    let mut client = TestClient::connect(addr).await;
+    client.send(&ClientMessage::Register { bundle }).await;
+    assert!(matches!(client.recv().await, ServerMessage::AckOk));
+
+    // Pre-subscribe Ping → Pong (works before the connection subscribes).
+    client.send(&ClientMessage::Ping).await;
+    assert!(matches!(client.recv().await, ServerMessage::Pong));
+
+    // Subscribe, then Ping again — the heartbeat runs in subscribed mode, so
+    // the relay must echo Pong there too (the subscribed `select!` read branch
+    // decodes the frame and dispatches through `handle`).
+    client.send(&ClientMessage::Subscribe).await;
+    assert!(matches!(client.recv().await, ServerMessage::AckOk));
+    client.send(&ClientMessage::Ping).await;
+    assert!(matches!(client.recv().await, ServerMessage::Pong));
+
+    let _ = id;
+}

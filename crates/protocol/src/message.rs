@@ -105,6 +105,16 @@ pub enum ClientMessage {
     Ack { envelope_ids: Vec<u64> },
     /// Long-lived poll: the server pushes new envelopes on this connection.
     Subscribe,
+    /// Application-level liveness probe. The server replies with
+    /// [`ServerMessage::Pong`]. A subscribed connection may legitimately idle
+    /// for hours between pushes, so neither side can otherwise tell a live-but-
+    /// quiet peer from a half-open one (a NAT/firewall that silently dropped
+    /// the path without a FIN — no EOF, no RST, the socket just looks idle).
+    /// The client sends `Ping` on a fixed interval and treats a missing `Pong`
+    /// within a grace window as a dead link, tearing down and reconnecting so
+    /// offline mail is recovered instead of the connection hanging forever.
+    /// The server treats `Ping` as a no-op liveness check (no store mutation).
+    Ping,
 }
 
 /// Messages sent from the relay server to a client.
@@ -117,6 +127,10 @@ pub enum ServerMessage {
     Delivered(Vec<EncryptedEnvelope>),
     /// Acknowledgement that `Ack` was processed.
     AckOk,
+    /// Reply to [`ClientMessage::Ping`]. A liveness probe that carries no
+    /// data; the client uses its (non-)arrival within a grace window to decide
+    /// the connection is half-open and should be torn down.
+    Pong,
     /// A structured error from the server.
     Error(ServerError),
 }
@@ -240,6 +254,7 @@ mod tests {
             envelope_ids: vec![1, 2, 3],
         });
         round_trip(&ClientMessage::Subscribe);
+        round_trip(&ClientMessage::Ping);
     }
 
     #[test]
@@ -263,6 +278,7 @@ mod tests {
     #[test]
     fn server_message_ackok_and_error_round_trip() {
         round_trip(&ServerMessage::AckOk);
+        round_trip(&ServerMessage::Pong);
         round_trip(&ServerMessage::Error(ServerError::UnknownRecipient));
         round_trip(&ServerMessage::Error(ServerError::BadSender));
     }

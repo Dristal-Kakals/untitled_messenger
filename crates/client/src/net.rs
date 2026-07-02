@@ -48,6 +48,20 @@ impl Client {
         // (acks, single envelopes) and a ~40ms Nagle delay hurts latency on
         // chatty 1:1 conversations.
         let _ = stream.set_nodelay(true);
+        // Enable OS TCP keepalive as a backstop liveness probe. A subscribed
+        // connection may idle for hours between pushes; without keepalive the
+        // OS never probes a quiet socket, so a NAT/firewall that silently
+        // dropped the path (no FIN, no RST) leaves the socket looking idle
+        // forever — `recv_msg` blocks indefinitely and the client never
+        // reconnects to recover offline mail. Keepalive makes the kernel probe
+        // after an idle window and surface a dead path as an EOF/error that the
+        // caller's reconnect logic handles. This complements (does not replace)
+        // the application-level `Ping`/`Pong` heartbeat, which detects dead
+        // links on platforms/configs where keepalive is unavailable or tuned
+        // conservatively. Best-effort: a failure to set the option (unsupported
+        // platform, permission) is ignored — the heartbeat still guards the
+        // connection.
+        enable_tcp_keepalive(&stream);
         let (r, w) = stream.into_split();
         Ok(Self {
             reader: BufReader::new(r),
@@ -257,6 +271,82 @@ async fn write_frame(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(ClientError::Io(e)),
         Err(_) => Err(ClientError::Timeout),
+    }
+}
+
+/// Idle time before the kernel starts sending TCP keepalive probes on a quiet
+/// socket. Tuned to detect a silently-dropped NAT/firewall path well within a
+/// typical session: a subscribed connection that has gone quiet for this long
+/// is either legitimately idle (the probe is cheap and ignored by a live peer)
+/// or dead (the probe fails and the OS surfaces an error). Sub-second
+/// precision is dropped on platforms that round to seconds.
+const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Interval between keepalive probes once probing starts, and the number of
+/// failed probes before the OS declares the connection dead. Together with
+/// [`TCP_KEEPALIVE_IDLE`] this bounds detection of a half-open path to roughly
+/// idle + interval × retries. Only applied on platforms whose `socket2` build
+/// exposes the interval/retries knobs; on others the idle-only keepalive still
+/// runs (the OS defaults take over for the probe cadence).
+const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const TCP_KEEPALIVE_RETRIES: u32 = 4;
+
+/// Enable TCP keepalive on `stream` (best-effort). Borrows the socket via
+/// `socket2::SockRef` so the tokio `TcpStream` stays owned. On platforms where
+/// `socket2` exposes `set_tcp_keepalive` (Linux, macOS, Windows, the BSDs,
+/// etc.) the full idle/interval/retries profile is applied; everywhere else
+/// the bare `SO_KEEPALIVE` flag is enabled so the OS at least probes with its
+/// defaults. Any error is ignored — keepalive is a backstop, not a guarantee,
+/// and the application-level heartbeat still guards the connection.
+fn enable_tcp_keepalive(stream: &TcpStream) {
+    // Platforms with a full keepalive profile via `socket2` `set_tcp_keepalive`.
+    // The `all` feature on our `socket2` dependency unlocks the interval/retries
+    // builders; the call itself is only available on these targets.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+    ))]
+    {
+        use socket2::{SockRef, TcpKeepalive};
+        let ka = TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_IDLE)
+            .with_interval(TCP_KEEPALIVE_INTERVAL)
+            .with_retries(TCP_KEEPALIVE_RETRIES);
+        let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
+    }
+    // Fallback: platforms without the full profile still get the bare
+    // `SO_KEEPALIVE` flag so the OS probes with its default cadence.
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+    )))]
+    {
+        use socket2::SockRef;
+        let _ = SockRef::from(stream).set_keepalive(true);
     }
 }
 
@@ -582,6 +672,38 @@ mod tests {
         assert!(
             got_timeout,
             "expected a write to time out against a non-draining relay"
+        );
+    }
+
+    /// `Client::connect` enables TCP keepalive on its socket. We cannot
+    /// observe the kernel probing within a unit test, but we can assert the
+    /// `SO_KEEPALIVE` option is set on the connected socket — the precondition
+    /// for the OS to probe a quiet, half-open path instead of leaving it
+    /// looking idle forever. The probe cadence (idle/interval/retries) is
+    /// platform-dependent and not asserted here.
+    #[tokio::test]
+    async fn connect_enables_tcp_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept the connection so `connect` completes; we do not need to read.
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let client = Client::connect(addr).await.expect("connect");
+        // Re-borrow the underlying socket via socket2 to read SO_KEEPALIVE. The
+        // client owns the split halves; `OwnedWriteHalf: AsRef<TcpStream>` and
+        // `TcpStream: AsFd`, so `SockRef::from` can borrow through the writer.
+        use socket2::SockRef;
+        let sock_ref = SockRef::from(client.writer.as_ref());
+        let keepalive = sock_ref
+            .keepalive()
+            .expect("SO_KEEPALIVE is readable on a connected TCP socket");
+        assert!(
+            keepalive,
+            "Client::connect must enable TCP keepalive so a half-open subscribed connection is detected by the OS instead of hanging forever"
         );
     }
 }
