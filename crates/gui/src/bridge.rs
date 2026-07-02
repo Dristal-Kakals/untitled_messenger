@@ -441,6 +441,21 @@ impl Bridge {
                 .await;
             return;
         };
+        // `Store::create` opens the SQLite file directly and does NOT create
+        // its parent directory, so the first-run store path
+        // (`~/.local/share/um/<hex>.db`) fails with `rusqlite::UnableToOpen`
+        // → `ClientError::Sqlite` → humanized as "local store error" when the
+        // `um` data dir does not yet exist. `config::save` only ever creates
+        // the config dir, not the data dir, so on a fresh machine the Setup
+        // button always fails. Ensure the parent exists first.
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let _ = event_tx
+                    .send(Event::Error(format!("create data dir: {e}")))
+                    .await;
+                return;
+            }
+        }
         let store = match Store::create(&path, &passphrase) {
             Ok(s) => s,
             Err(e) => {
