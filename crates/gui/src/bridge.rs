@@ -1007,6 +1007,7 @@ impl Bridge {
                     status: Status::Delivered.as_u8(),
                 },
                 timestamp as i64,
+                sender.as_ref(),
             );
         }
         let msg = MessageView {
@@ -1147,6 +1148,7 @@ impl Bridge {
                     status: status.as_u8(),
                 },
                 timestamp as i64,
+                None,
             );
         }
         MessageView {
@@ -1205,9 +1207,12 @@ impl Bridge {
                 },
                 timestamp: r.timestamp as u64,
                 status: Status::from_u8(r.msg.status),
-                // The persisted store does not record the per-message sender
-                // (see `um_client::store`), so reloaded rows carry no author.
-                sender: None,
+                // The author pub is persisted in the `sender` column for
+                // incoming group messages, so reloaded group history keeps its
+                // "author: …" label after a restart. 1:1 and outgoing rows
+                // have `sender = None` (the peer is implied by the thread /
+                // the author is us).
+                sender: r.sender,
             })
             .collect()
     }

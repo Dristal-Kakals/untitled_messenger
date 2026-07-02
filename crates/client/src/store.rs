@@ -14,8 +14,16 @@
 //!   — nickname/fingerprint are plaintext metadata (pub keys are already
 //!   public).
 //! - `messages(id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB,
-//!   timestamp INT)` — `sealed` is the XChaCha-encrypted postcard of the
-//!   message plaintext + status.
+//!   timestamp INT, sender BLOB)` — `sealed` is the XChaCha-encrypted postcard
+//!   of the message plaintext + status. `sender` is the author identity pub for
+//!   an incoming group message (so the view can prefix "author: …" after a
+//!   restart), `NULL` for 1:1 (the peer is implied by the thread) and for
+//!   outgoing messages. `sender` is public metadata — a pub key, like `peer` —
+//!   so it is stored in plaintext alongside the row, NOT inside the sealed
+//!   blob, and is NOT part of the AEAD associated data (changing it does not
+//!   break the seal). The sealed `StoredMessage` is unchanged, so existing
+//!   rows (written before this column existed) re-open unchanged; the
+//!   `ALTER TABLE ADD COLUMN` migration backfills `NULL`.
 //! - `groups(group_id BLOB PRIMARY KEY, name TEXT)` — group id + display name.
 //!   The group id is public (a `SHA-256` of name+members+founder, not a secret);
 //!   the name is plaintext metadata. Persists the roster's identity so the
@@ -263,18 +271,26 @@ impl Store {
     /// group id (group). `direction` is 0 = outgoing, 1 = incoming. `payload`
     /// is the postcard-serialized `StoredMessage` (text + status); it is
     /// XChaCha-sealed under the store key with AAD = the row's auto id, then
-    /// written. `timestamp` is unix seconds. Returns the assigned row id.
+    /// written. `sender` is the author identity pub for an incoming group
+    /// message (so the view can label it after a restart); pass `None` for 1:1
+    /// messages and for all outgoing messages. `sender` is stored as a
+    /// plaintext column — it is a public key, not secret — and is deliberately
+    /// kept OUT of the sealed blob and the AEAD AAD so adding it never
+    /// invalidates existing rows. `timestamp` is unix seconds. Returns the
+    /// assigned row id.
     pub fn put_message(
         &self,
         peer: &[u8; 32],
         direction: i64,
         payload: &StoredMessage,
         timestamp: i64,
+        sender: Option<&[u8; 32]>,
     ) -> Result<i64, ClientError> {
         let bytes = postcard::to_allocvec(payload)?;
         // AAD binds the sealed blob to the peer + direction + timestamp so a
         // row-swap attack (copying one message's sealed blob into another's
-        // slot) fails to open.
+        // slot) fails to open. `sender` is intentionally excluded: it is public
+        // metadata and excluding it keeps the AAD identical to pre-column rows.
         let mut aad = Vec::with_capacity(32 + 1 + 8);
         aad.extend_from_slice(peer);
         aad.push(direction as u8);
@@ -282,8 +298,15 @@ impl Store {
         let sealed = seal(&self.key, &aad, &bytes)?;
         self.conn
             .execute(
-                "INSERT INTO messages (peer, direction, sealed, timestamp) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![peer.as_slice(), direction, sealed, timestamp],
+                "INSERT INTO messages (peer, direction, sealed, timestamp, sender) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    peer.as_slice(),
+                    direction,
+                    sealed,
+                    timestamp,
+                    sender.map(|s| s.as_slice())
+                ],
             )
             .map_err(|e| ClientError::Store(format!("put_message: {e}")))?;
         Ok(self.conn.last_insert_rowid())
@@ -292,12 +315,15 @@ impl Store {
     /// Load all messages for `peer` (1:1 or group id), oldest first. Each row
     /// is unsealed and decoded into a `StoredMessage`. Corrupt rows are
     /// skipped with a `Store` error for that row only (the rest still load),
-    /// so a single bad blob never hides the whole thread.
+    /// so a single bad blob never hides the whole thread. The `sender` column
+    /// (author pub for incoming group messages) is read back as plaintext
+    /// metadata; rows written before the column existed have `NULL` and load
+    /// as `sender = None`.
     pub fn messages(&self, peer: &[u8; 32]) -> Result<Vec<StoredMessageRow>, ClientError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, direction, sealed, timestamp FROM messages WHERE peer = ?1 ORDER BY id ASC",
+                "SELECT id, direction, sealed, timestamp, sender FROM messages WHERE peer = ?1 ORDER BY id ASC",
             )
             .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
         let rows = stmt
@@ -306,12 +332,13 @@ impl Store {
                 let direction: i64 = r.get(1)?;
                 let sealed: Vec<u8> = r.get(2)?;
                 let timestamp: i64 = r.get(3)?;
-                Ok((id, direction, sealed, timestamp))
+                let sender: Option<Vec<u8>> = r.get(4)?;
+                Ok((id, direction, sealed, timestamp, sender))
             })
             .map_err(|e| ClientError::Store(format!("messages: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, direction, sealed, timestamp) =
+            let (id, direction, sealed, timestamp, sender_bytes) =
                 row.map_err(|e| ClientError::Store(format!("messages: {e}")))?;
             let mut aad = Vec::with_capacity(32 + 1 + 8);
             aad.extend_from_slice(peer);
@@ -321,10 +348,22 @@ impl Store {
                 continue; // corrupt/tampered row: skip, keep loading
             };
             let msg: StoredMessage = postcard::from_bytes(&bytes)?;
+            // A present-but-wrong-length sender is corruption, not a 1:1 row:
+            // surface it rather than silently dropping the author.
+            let sender = match sender_bytes {
+                None => None,
+                Some(s) if s.len() == 32 => {
+                    let mut p = [0u8; 32];
+                    p.copy_from_slice(&s);
+                    Some(p)
+                }
+                Some(_) => return Err(ClientError::Store("corrupt sender in message row".into())),
+            };
             out.push(StoredMessageRow {
                 id,
                 direction,
                 timestamp,
+                sender,
                 msg,
             });
         }
@@ -447,13 +486,18 @@ pub struct StoredMessage {
     pub status: u8,
 }
 
-/// A loaded message row: row id, direction (0=out,1=in), unix timestamp, and
-/// the decoded `StoredMessage`.
+/// A loaded message row: row id, direction (0=out,1=in), unix timestamp, the
+/// decoded `StoredMessage`, and the author identity pub for an incoming group
+/// message (`None` for 1:1 and for outgoing). `sender` is plaintext metadata
+/// read from a dedicated column, not unsealed from the blob.
 #[derive(Debug, Clone)]
 pub struct StoredMessageRow {
     pub id: i64,
     pub direction: i64,
     pub timestamp: i64,
+    /// Author identity pub for an incoming group message; `None` for 1:1
+    /// messages (the peer is the thread key) and for all outgoing messages.
+    pub sender: Option<[u8; 32]>,
     pub msg: StoredMessage,
 }
 
@@ -490,6 +534,15 @@ fn init_schema(conn: &Connection) -> Result<(), ClientError> {
         "ALTER TABLE contacts ADD COLUMN verified INT NOT NULL DEFAULT 0",
         [],
     );
+    // Backfill the `sender` column on pre-existing message stores created
+    // before the column existed. `sender` is public metadata (an author pub
+    // key), stored in plaintext, deliberately excluded from the sealed blob
+    // and the AEAD AAD — so adding the column does NOT invalidate any existing
+    // sealed row: old rows simply load with `sender = NULL` (no author label
+    // in reloaded group history, same as before this column shipped). The
+    // `ALTER TABLE ADD COLUMN` is a no-op if the column already exists, so
+    // this is idempotent across reopen.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN sender BLOB", []);
     Ok(())
 }
 
@@ -762,6 +815,116 @@ mod tests {
         store.add_group_member(&[0xAA; 32], &[0x01; 32]).unwrap();
         assert_eq!(store.groups().unwrap().len(), 1);
         assert_eq!(store.group_members(&[0xAA; 32]).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_message_with_sender_round_trips() {
+        let path = tmp();
+        let peer = [0x11; 32];
+        let author = [0x22; 32];
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .put_message(
+                    &peer,
+                    1,
+                    &StoredMessage {
+                        text: "hi group".into(),
+                        status: 2,
+                    },
+                    1_700_000_000,
+                    Some(&author),
+                )
+                .unwrap();
+            // A 1:1 incoming message carries no sender.
+            store
+                .put_message(
+                    &peer,
+                    1,
+                    &StoredMessage {
+                        text: "hi dm".into(),
+                        status: 2,
+                    },
+                    1_700_000_001,
+                    None,
+                )
+                .unwrap();
+            // An outgoing message carries no sender.
+            store
+                .put_message(
+                    &peer,
+                    0,
+                    &StoredMessage {
+                        text: "out".into(),
+                        status: 1,
+                    },
+                    1_700_000_002,
+                    None,
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, "pw").unwrap();
+        let msgs = store.messages(&peer).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].sender, Some(author));
+        assert_eq!(msgs[0].msg.text, "hi group");
+        assert_eq!(msgs[1].sender, None);
+        assert_eq!(msgs[2].sender, None);
+        assert_eq!(msgs[2].direction, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_store_without_sender_column_is_migrated() {
+        // Simulate a store created before the `sender` column existed: write a
+        // row via the old 5-column schema, drop the column, reopen — the
+        // migration must add `sender` back, and the pre-existing row must
+        // still load (the seal is unchanged) with `sender = None`.
+        let path = tmp();
+        let peer = [0x11; 32];
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .put_message(
+                    &peer,
+                    1,
+                    &StoredMessage {
+                        text: "legacy".into(),
+                        status: 2,
+                    },
+                    1_700_000_000,
+                    None,
+                )
+                .unwrap();
+            // Wipe the column to force the ALTER TABLE migration path.
+            store
+                .conn
+                .execute("ALTER TABLE messages RENAME TO messages_old", [])
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB, timestamp INT)",
+                    [],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages SELECT id, peer, direction, sealed, timestamp FROM messages_old",
+                    [],
+                )
+                .unwrap();
+            store.conn.execute("DROP TABLE messages_old", []).unwrap();
+        }
+        // Reopen: init_schema runs ALTER TABLE ADD COLUMN sender, backfilling
+        // NULL. The legacy row re-opens (seal untouched) with no author.
+        let store = Store::open(&path, "pw").unwrap();
+        let msgs = store.messages(&peer).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].msg.text, "legacy");
+        assert_eq!(msgs[0].sender, None);
         let _ = fs::remove_file(&path);
     }
 
