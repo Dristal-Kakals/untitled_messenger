@@ -16,6 +16,16 @@
 //! - `messages(id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB,
 //!   timestamp INT)` — `sealed` is the XChaCha-encrypted postcard of the
 //!   message plaintext + status.
+//! - `groups(group_id BLOB PRIMARY KEY, name TEXT)` — group id + display name.
+//!   The group id is public (a `SHA-256` of name+members+founder, not a secret);
+//!   the name is plaintext metadata. Persists the roster's identity so the
+//!   ContactList "Groups" section and the bridge's send fan-out survive a
+//!   store close/reopen (the in-memory `group_rosters` would otherwise be lost
+//!   on restart, breaking group sends even though the Sender-Key sessions are
+//!   restored from the persisted `ClientSession`).
+//! - `group_members(group_id BLOB, identity_pub BLOB)` — the member identity
+//!   pubs per group, so the bridge knows who to fan a group send out to after a
+//!   restart. `(group_id, identity_pub)` is unique; re-adding is a no-op.
 //!
 //! No panics; all fallible paths return `Result<_, ClientError>`.
 
@@ -320,6 +330,110 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ---- Groups --------------------------------------------------------
+
+    /// Persist (or refresh) a group's display name. Upserts: re-recording an
+    /// existing group updates the name. The group id is the deterministic
+    /// `SHA-256(name ‖ members ‖ founder)` chosen by the bridge, so a re-found
+    /// of the same membership resolves to the same row.
+    pub fn put_group(&self, group_id: &[u8; 32], name: &str) -> Result<(), ClientError> {
+        self.conn
+            .execute(
+                "INSERT INTO groups (group_id, name) VALUES (?1, ?2) \
+                 ON CONFLICT(group_id) DO UPDATE SET name = excluded.name",
+                rusqlite::params![group_id.as_slice(), name],
+            )
+            .map_err(|e| ClientError::Store(format!("put_group: {e}")))?;
+        Ok(())
+    }
+
+    /// Set/refresh a group's name without touching its members (used when a
+    /// distribution arrives with a refreshed name for an already-known group).
+    pub fn set_group_name(&self, group_id: &[u8; 32], name: &str) -> Result<(), ClientError> {
+        self.conn
+            .execute(
+                "UPDATE groups SET name = ?2 WHERE group_id = ?1",
+                rusqlite::params![group_id.as_slice(), name],
+            )
+            .map_err(|e| ClientError::Store(format!("set_group_name: {e}")))?;
+        Ok(())
+    }
+
+    /// List all known groups (id + name), ordered by id for stable output.
+    pub fn groups(&self) -> Result<Vec<StoredGroup>, ClientError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id, name FROM groups ORDER BY group_id ASC")
+            .map_err(|e| ClientError::Store(format!("groups: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: Vec<u8> = r.get(0)?;
+                let name: String = r.get(1)?;
+                Ok((id, name))
+            })
+            .map_err(|e| ClientError::Store(format!("groups: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name) = row.map_err(|e| ClientError::Store(format!("groups: {e}")))?;
+            if id.len() != 32 {
+                return Err(ClientError::Store("corrupt group row".into()));
+            }
+            let mut gid = [0u8; 32];
+            gid.copy_from_slice(&id);
+            out.push(StoredGroup {
+                group_id: gid,
+                name,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Add a member to a group's roster. Idempotent: re-adding an existing
+    /// `(group_id, identity_pub)` is a no-op (the bridge re-records peers on
+    /// every distribution, and a duplicate would make the relay deliver the
+    /// same group envelope twice, which the receiver's sender-key generation
+    /// check rejects).
+    pub fn add_group_member(
+        &self,
+        group_id: &[u8; 32],
+        identity_pub: &[u8; 32],
+    ) -> Result<(), ClientError> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO group_members (group_id, identity_pub) VALUES (?1, ?2)",
+                rusqlite::params![group_id.as_slice(), identity_pub.as_slice()],
+            )
+            .map_err(|e| ClientError::Store(format!("add_group_member: {e}")))?;
+        Ok(())
+    }
+
+    /// List the member identity pubs for `group_id`, ordered for stable output.
+    pub fn group_members(&self, group_id: &[u8; 32]) -> Result<Vec<[u8; 32]>, ClientError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT identity_pub FROM group_members WHERE group_id = ?1 ORDER BY identity_pub ASC",
+            )
+            .map_err(|e| ClientError::Store(format!("group_members: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id.as_slice()], |r| {
+                let pub_bytes: Vec<u8> = r.get(0)?;
+                Ok(pub_bytes)
+            })
+            .map_err(|e| ClientError::Store(format!("group_members: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let pub_bytes = row.map_err(|e| ClientError::Store(format!("group_members: {e}")))?;
+            if pub_bytes.len() != 32 {
+                return Err(ClientError::Store("corrupt group member row".into()));
+            }
+            let mut p = [0u8; 32];
+            p.copy_from_slice(&pub_bytes);
+            out.push(p);
+        }
+        Ok(out)
+    }
 }
 
 /// A stored chat message: plaintext text + delivery status. Sealed into the
@@ -352,11 +466,21 @@ pub struct Contact {
     pub verified: bool,
 }
 
+/// A stored group: the deterministic group id + display name. The member roster
+/// lives in the `group_members` table and is read via
+/// [`Store::group_members`].
+pub struct StoredGroup {
+    pub group_id: [u8; 32],
+    pub name: String,
+}
+
 fn init_schema(conn: &Connection) -> Result<(), ClientError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, blob BLOB);
          CREATE TABLE IF NOT EXISTS contacts (identity_pub BLOB PRIMARY KEY, nickname TEXT, fingerprint BLOB, verified INT NOT NULL DEFAULT 0);
-         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB, timestamp INT);",
+         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, peer BLOB, direction INT, sealed BLOB, timestamp INT);
+         CREATE TABLE IF NOT EXISTS groups (group_id BLOB PRIMARY KEY, name TEXT);
+         CREATE TABLE IF NOT EXISTS group_members (group_id BLOB, identity_pub BLOB, PRIMARY KEY (group_id, identity_pub));",
     )
     .map_err(|e| ClientError::Store(format!("init_schema: {e}")))?;
     // Backfill the `verified` column on pre-existing stores created before
@@ -571,6 +695,75 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
         assert!(open(&key, b"aad", &tampered).is_err());
+    }
+
+    #[test]
+    fn group_and_members_round_trip_persists_across_reopen() {
+        let path = tmp();
+        let gid = [0xAA; 32];
+        let m1 = [0x01; 32];
+        let m2 = [0x02; 32];
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store.put_group(&gid, "team").unwrap();
+            store.add_group_member(&gid, &m1).unwrap();
+            store.add_group_member(&gid, &m2).unwrap();
+            // Re-adding a member is a no-op (no duplicate row).
+            store.add_group_member(&gid, &m1).unwrap();
+
+            let groups = store.groups().unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].group_id, gid);
+            assert_eq!(groups[0].name, "team");
+
+            let mut members = store.group_members(&gid).unwrap();
+            members.sort_unstable();
+            assert_eq!(members, vec![m1, m2]);
+
+            // Refreshing the name via put_group updates without duplicating.
+            store.put_group(&gid, "team v2").unwrap();
+            let groups = store.groups().unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].name, "team v2");
+        }
+        // Reopen: groups + members survive to disk.
+        let store = Store::open(&path, "pw").unwrap();
+        let groups = store.groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "team v2");
+        let mut members = store.group_members(&gid).unwrap();
+        members.sort_unstable();
+        assert_eq!(members, vec![m1, m2]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn group_members_for_unknown_group_is_empty() {
+        let path = tmp();
+        let store = Store::create(&path, "pw").unwrap();
+        let members = store.group_members(&[0x77; 32]).unwrap();
+        assert!(members.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_store_without_groups_tables_is_migrated() {
+        // Simulate a store created before the groups/group_members tables
+        // existed: create the store, drop both tables, reopen — init_schema
+        // must recreate them (CREATE TABLE IF NOT EXISTS is idempotent).
+        let path = tmp();
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store.conn.execute("DROP TABLE groups", []).unwrap();
+            store.conn.execute("DROP TABLE group_members", []).unwrap();
+        }
+        let store = Store::open(&path, "pw").unwrap();
+        // Tables exist again and are usable.
+        store.put_group(&[0xAA; 32], "team").unwrap();
+        store.add_group_member(&[0xAA; 32], &[0x01; 32]).unwrap();
+        assert_eq!(store.groups().unwrap().len(), 1);
+        assert_eq!(store.group_members(&[0xAA; 32]).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
     }
 
     /// Minimal hex encoder for test temp-file names (avoids an extra dep).

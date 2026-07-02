@@ -37,9 +37,10 @@ pub struct UmApp {
     pub open_chat: Option<ChatId>,
     /// In-memory message cache per open chat. The store is source of truth.
     pub threads: HashMap<ChatId, Vec<MessageView>>,
-    /// Group threads the app knows about, rebuilt from `Event::GroupCreated` /
-    /// `Event::GroupInvited` each session (v1 has no persisted group table).
-    /// Drives the ContactList "Groups" section.
+    /// Group threads the app knows about. Hydrated from `Event::GroupsLoaded`
+    /// on Unlock (the persisted `groups` table) and updated by
+    /// `Event::GroupCreated` / `Event::GroupInvited` at runtime. Drives the
+    /// ContactList "Groups" section.
     pub groups: Vec<GroupView>,
     /// Unread-message count per chat, bumped on `Event::Decrypted` when that
     /// chat is not the open one, cleared when the chat is opened. Drives the
@@ -396,6 +397,14 @@ fn handle_event(app: &mut UmApp, ev: Event) {
         Event::ContactsLoaded(contacts) => {
             app.contacts = contacts;
         }
+        Event::GroupsLoaded(groups) => {
+            // Hydrate the ContactList "Groups" section from the persisted
+            // roster. Upsert so a later runtime `GroupCreated`/`GroupInvited`
+            // for the same id only refreshes the name, never duplicates.
+            for g in groups {
+                app.upsert_group(g.id, g.name);
+            }
+        }
         Event::HistoryLoaded(chat, msgs) => {
             app.threads.insert(chat, msgs);
         }
@@ -595,6 +604,42 @@ mod tests {
         );
         assert_eq!(app.groups.len(), 1);
         assert_eq!(app.groups[0].name, "team v2");
+    }
+
+    #[test]
+    fn groups_loaded_hydrates_without_duplicate() {
+        // Restart path: Unlock emits GroupsLoaded with the persisted groups.
+        // The app must populate `groups` so the ContactList "Groups" section
+        // lists them before any runtime GroupCreated/GroupInvited.
+        let mut app = test_app();
+        handle_event(
+            &mut app,
+            Event::GroupsLoaded(vec![
+                GroupView {
+                    id: [0x22; 32],
+                    name: "team".into(),
+                },
+                GroupView {
+                    id: [0x33; 32],
+                    name: "squad".into(),
+                },
+            ]),
+        );
+        assert_eq!(app.groups.len(), 2);
+        // A later runtime GroupInvited for an already-loaded group refreshes,
+        // it does not duplicate.
+        handle_event(
+            &mut app,
+            Event::GroupInvited {
+                group: [0x22; 32],
+                name: "team v2".into(),
+            },
+        );
+        assert_eq!(app.groups.len(), 2);
+        assert_eq!(
+            app.groups.iter().find(|g| g.id == [0x22; 32]).unwrap().name,
+            "team v2"
+        );
     }
 
     #[test]

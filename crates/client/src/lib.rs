@@ -15,4 +15,4 @@ pub mod store;
 pub use error::ClientError;
 pub use net::{Client, ClientReader, ClientWriter};
 pub use session::ClientSession;
-pub use store::{Contact, Store, StoreKey, StoredMessage, StoredMessageRow};
+pub use store::{Contact, Store, StoreKey, StoredGroup, StoredMessage, StoredMessageRow};

@@ -37,10 +37,11 @@ pub struct ContactView {
 }
 
 /// A group thread as the GUI lists it: group id + display name. Plain data
-/// mirroring the bridge's in-memory `group_names`; the app keeps a `Vec` of
-/// these so the ContactList "Groups" section can list + open group threads
-/// (v1 has no persisted group table, so this is rebuilt from
-/// `Event::GroupCreated` / `Event::GroupInvited` each session).
+/// mirroring the bridge's in-memory `group_names` (itself persisted to the
+/// store's `groups` table). The app keeps a `Vec` of these — hydrated from
+/// `Event::GroupsLoaded` on Unlock and updated by `Event::GroupCreated` /
+/// `Event::GroupInvited` at runtime — so the ContactList "Groups" section can
+/// list + open group threads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupView {
     pub id: [u8; 32],

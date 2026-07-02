@@ -1,7 +1,7 @@
 //! Events the bridge emits to the GUI (bridge → GUI), delivered to iced
 //! through `iced::subscription::run` as `Message::Event(Event)`.
 
-use crate::types::{ChatId, ContactView, MessageView};
+use crate::types::{ChatId, ContactView, GroupView, MessageView};
 
 /// An event from the async bridge to the iced UI.
 #[derive(Debug, Clone)]
@@ -20,6 +20,10 @@ pub enum Event {
     // ---- Data ----------------------------------------------------------
     /// Contacts loaded from the store (after Unlock).
     ContactsLoaded(Vec<ContactView>),
+    /// Groups loaded from the store (after Unlock). Lets the ContactList
+    /// "Groups" section list known groups immediately on restart, before any
+    /// fresh distribution arrives. Each entry is id + display name.
+    GroupsLoaded(Vec<GroupView>),
     /// Thread history loaded from the store (response to `LoadThread` /
     /// `LoadGroupThread`). Replaces the cache for that chat.
     HistoryLoaded(ChatId, Vec<MessageView>),

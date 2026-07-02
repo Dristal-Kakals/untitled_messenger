@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use um_client::session::ClientSession;
-use um_client::store::StoredMessage;
+use um_client::store::{StoredGroup, StoredMessage};
 use um_client::{Client, ClientError, Store};
 use um_crypto::sender_keys::SenderKeyState;
 use um_protocol::{ClientMessage, EncryptedEnvelope, MessageKind, ServerMessage};
@@ -35,7 +35,7 @@ use um_protocol::{ClientMessage, EncryptedEnvelope, MessageKind, ServerMessage};
 use crate::command::Command;
 use crate::config::Config;
 use crate::event::Event;
-use crate::types::{ChatId, ContactView, Direction, MessageView, Status};
+use crate::types::{ChatId, ContactView, Direction, GroupView, MessageView, Status};
 
 /// The plaintext carried inside every 1:1 Double-Ratchet message the bridge
 /// sends. Wrapping the payload lets the bridge multiplex two logical 1:1
@@ -83,11 +83,14 @@ pub struct Bridge {
     /// unacked outbox on Subscribe).
     last_delivered_id: u64,
     /// Group rosters the bridge knows about: group id → member identity pubs.
-    /// In-memory in v1 (the server is group-oblivious and the store schema
-    /// does not yet have a `group_members` table); used to fan group sends.
+    /// Mirrored to the store's `groups` + `group_members` tables so a
+    /// close/reopen (Unlock) rebuilds the roster and group sends still fan out
+    /// after a restart (the Sender-Key sessions themselves are restored from
+    /// the persisted `ClientSession`, but without the roster the bridge would
+    /// have no recipients).
     group_rosters: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// Group display names, for `Event::GroupInvited` and re-emitting on
-    /// later distribution. group id → name.
+    /// later distribution. group id → name. Persisted to the `groups` table.
     group_names: HashMap<[u8; 32], String>,
     /// Records of `(group_id, peer)` pairs we have already shipped our own
     /// Sender-Key distribution to, so the invite-ack handshake does not loop
@@ -145,6 +148,19 @@ impl Bridge {
     /// Run the bridge to completion. `select!`s over GUI commands and relay
     /// frames; exits when the command channel closes (GUI dropped).
     async fn run(mut self, mut command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<Event>) {
+        // If the bridge was constructed with a store already attached (the
+        // headless test harness embeds the store directly, bypassing
+        // `Command::Unlock`), hydrate the in-memory group rosters + names now
+        // and emit `GroupsLoaded` so the UI lists known groups immediately —
+        // the same thing `handle_unlock` does for the app's Unlock path. In the
+        // app the store is `None` at startup, so this is a no-op there and the
+        // real load happens on Unlock (no double emit).
+        if self.store.is_some() {
+            let groups = self.load_groups();
+            if !groups.is_empty() {
+                let _ = event_tx.send(Event::GroupsLoaded(groups)).await;
+            }
+        }
         loop {
             tokio::select! {
                 cmd = command_rx.recv() => match cmd {
@@ -332,8 +348,14 @@ impl Bridge {
         self.store_path = Some(path);
         let identity_pub = self.session.identity_pub();
         let contacts = self.load_contacts().unwrap_or_default();
+        // Rebuild the in-memory group rosters + names from the persisted
+        // `groups`/`group_members` tables so group sends and the ContactList
+        // "Groups" section work right after a restart (the Sender-Key sessions
+        // are restored from `session`, but the rosters are bridge-local).
+        let groups = self.load_groups();
         let _ = event_tx.send(Event::Ready { identity_pub }).await;
         let _ = event_tx.send(Event::ContactsLoaded(contacts)).await;
+        let _ = event_tx.send(Event::GroupsLoaded(groups)).await;
     }
 
     // ---- Connect / reconnect -------------------------------------------
@@ -623,6 +645,10 @@ impl Bridge {
         // recipients and the UI can label the thread.
         self.group_rosters.insert(group_id, members.clone());
         self.group_names.insert(group_id, name.clone());
+        // Persist the group + roster so a restart rebuilds them from disk
+        // (the Sender-Key session is restored from `session`, but the roster
+        // is bridge-local and would otherwise be lost).
+        self.persist_group(&group_id, &name, &members);
         let mut failed = 0usize;
         for member in &members {
             match self.session.send(member, &dist_bytes) {
@@ -755,6 +781,12 @@ impl Bridge {
         self.store = None;
         self.net = None;
         self.store_path = None;
+        // Clear the in-memory group maps so a subsequent Unlock of a different
+        // identity does not carry over a stale roster. The persisted tables are
+        // keyed per-identity (separate store file), so they are untouched.
+        self.group_rosters.clear();
+        self.group_names.clear();
+        self.dist_sent.clear();
         let _ = event_tx
             .send(Event::Disconnected {
                 reason: "logged out".into(),
@@ -1043,6 +1075,16 @@ impl Bridge {
         if !roster.contains(&from) {
             roster.push(from);
         }
+        // Persist the group name + roster so a restart rebuilds them. The name
+        // refreshes on every distribution (the inviter may rename); members are
+        // `INSERT OR IGNORE`'d so re-distribution never duplicates.
+        if let Some(name) = self.group_names.get(&group).cloned() {
+            self.persist_group(
+                &group,
+                &name,
+                self.group_rosters.get(&group).unwrap_or(&Vec::new()),
+            );
+        }
         self.persist_session();
         let _ = event_tx
             .send(Event::GroupInvited {
@@ -1131,6 +1173,49 @@ impl Bridge {
                 status: Status::from_u8(r.msg.status),
             })
             .collect()
+    }
+
+    /// Persist a group's name + full roster to the store. Write-through on
+    /// group create / distribution so a restart rebuilds the roster from disk.
+    /// The `members` list is the authoritative roster for `group_id`: every
+    /// member is `INSERT OR IGNORE`'d (re-adding is a no-op, never a
+    /// duplicate).
+    fn persist_group(&self, group_id: &[u8; 32], name: &str, members: &[[u8; 32]]) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if store.put_group(group_id, name).is_err() {
+            return;
+        }
+        for m in members {
+            let _ = store.add_group_member(group_id, m);
+        }
+    }
+
+    /// Load every persisted group + its member roster into the bridge's
+    /// in-memory maps. Called on Unlock so group sends and the ContactList
+    /// "Groups" section work immediately after a restart, without waiting for
+    /// a fresh distribution. Returns the `GroupView` list (id + name) for
+    /// `Event::GroupsLoaded`.
+    fn load_groups(&mut self) -> Vec<GroupView> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        let groups: Vec<StoredGroup> = match store.groups() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut views = Vec::with_capacity(groups.len());
+        for g in groups {
+            let members = store.group_members(&g.group_id).unwrap_or_default();
+            self.group_rosters.insert(g.group_id, members);
+            self.group_names.insert(g.group_id, g.name.clone());
+            views.push(GroupView {
+                id: g.group_id,
+                name: g.name,
+            });
+        }
+        views
     }
 
     /// Emit a `SendFailed` event for a chat + local_id.
