@@ -32,6 +32,9 @@ pub enum View {
 pub struct UmApp {
     pub view: View,
     pub identity_pub: Option<[u8; 32]>,
+    /// This identity's fingerprint (`SHA-256` of the identity pub), surfaced
+    /// in the Settings view per the spec. `None` until `Event::Ready`.
+    pub identity_fingerprint: Option<[u8; 32]>,
     pub contacts: Vec<ContactView>,
     /// Which thread is open (peer or group).
     pub open_chat: Option<ChatId>,
@@ -56,6 +59,8 @@ pub struct UmApp {
     pub add_contact_nick: String,
     pub compose_input: String,
     pub new_group_name: String,
+    /// Settings: how many one-time prekeys to replenish (spec: count input).
+    pub replenish_count: String,
     /// A single banner error string.
     pub error: Option<String>,
     /// Connection status banner.
@@ -80,6 +85,8 @@ pub enum Message {
     AddContactNickChanged(String),
     ComposeChanged(String),
     NewGroupNameChanged(String),
+    /// Settings: edit the one-time-prekey replenish count.
+    ReplenishCountChanged(String),
     // Setup / Login.
     SetupSubmit,
     UnlockSubmit,
@@ -122,6 +129,7 @@ impl UmApp {
         Self {
             view: initial_view,
             identity_pub: None,
+            identity_fingerprint: None,
             contacts: Vec::new(),
             open_chat: None,
             threads: HashMap::new(),
@@ -135,6 +143,7 @@ impl UmApp {
             add_contact_nick: String::new(),
             compose_input: String::new(),
             new_group_name: String::new(),
+            replenish_count: "10".to_string(),
             error: None,
             connected: false,
             bridge_cmd,
@@ -185,16 +194,19 @@ impl UmApp {
         }
     }
 
-    /// Record (or refresh) a known group thread. Idempotent: a re-emit for an
-    /// existing id updates the name but never duplicates.
-    fn upsert_group(&mut self, id: [u8; 32], name: String) {
+    /// Record (or refresh) a known group thread, including its member count.
+    /// Idempotent: a re-emit for an existing id updates the name + member
+    /// count but never duplicates. The member count is authoritative from the
+    /// bridge (it owns the roster); a stale UI count is always overwritten.
+    fn upsert_group(&mut self, id: [u8; 32], name: String, members: u32) {
         if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
             if g.name != name {
                 g.name = name;
             }
+            g.members = members;
             return;
         }
-        self.groups.push(GroupView { id, name });
+        self.groups.push(GroupView { id, name, members });
     }
 
     /// Mark a contact's fingerprint as verified in the cached contact list.
@@ -218,6 +230,7 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::AddContactNickChanged(s) => app.add_contact_nick = s,
         Message::ComposeChanged(s) => app.compose_input = s,
         Message::NewGroupNameChanged(s) => app.new_group_name = s,
+        Message::ReplenishCountChanged(s) => app.replenish_count = s,
 
         Message::SetupSubmit => {
             if app.passphrase_input.len() < 8 {
@@ -339,7 +352,16 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
 
         Message::RotateSignedPrekey => app.send_cmd(Command::RotateSignedPrekey),
         Message::ReplenishOneTimePrekeys => {
-            app.send_cmd(Command::ReplenishOneTimePrekeys { count: 10 });
+            // Parse the Settings count input; reject non-numeric / empty /
+            // zero with a banner (a zero-count replenish is a no-op that
+            // still re-registers, which is misleading).
+            match app.replenish_count.trim().parse::<u32>() {
+                Ok(count) if count > 0 => {
+                    app.error = None;
+                    app.send_cmd(Command::ReplenishOneTimePrekeys { count });
+                }
+                _ => app.error = Some("replenish count must be a positive number".into()),
+            }
         }
         Message::ChangeServer => match app.server_input.trim().parse() {
             Ok(addr) => {
@@ -353,6 +375,7 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
         Message::Logout => {
             app.send_cmd(Command::Logout);
             app.identity_pub = None;
+            app.identity_fingerprint = None;
             app.contacts.clear();
             app.threads.clear();
             app.groups.clear();
@@ -373,8 +396,12 @@ pub fn update(app: &mut UmApp, msg: Message) -> Task<Message> {
 /// Apply a bridge `Event` to the app state.
 fn handle_event(app: &mut UmApp, ev: Event) {
     match ev {
-        Event::Ready { identity_pub } => {
+        Event::Ready {
+            identity_pub,
+            identity_fingerprint,
+        } => {
             app.identity_pub = Some(identity_pub);
+            app.identity_fingerprint = Some(identity_fingerprint);
             app.passphrase_input.clear();
             app.passphrase_confirm.clear();
             // After Ready, connect to the configured server.
@@ -400,9 +427,9 @@ fn handle_event(app: &mut UmApp, ev: Event) {
         Event::GroupsLoaded(groups) => {
             // Hydrate the ContactList "Groups" section from the persisted
             // roster. Upsert so a later runtime `GroupCreated`/`GroupInvited`
-            // for the same id only refreshes the name, never duplicates.
+            // for the same id only refreshes the name/count, never duplicates.
             for g in groups {
-                app.upsert_group(g.id, g.name);
+                app.upsert_group(g.id, g.name, g.members);
             }
         }
         Event::HistoryLoaded(chat, msgs) => {
@@ -436,17 +463,25 @@ fn handle_event(app: &mut UmApp, ev: Event) {
             // Mirror the bridge's verification into the cached contact row.
             app.mark_verified(identity_pub);
         }
-        Event::GroupCreated { group, name } => {
-            app.upsert_group(group, name.clone());
+        Event::GroupCreated {
+            group,
+            name,
+            members,
+        } => {
+            app.upsert_group(group, name.clone(), members);
             let chat = ChatId::Group(group);
             app.open_chat = Some(chat);
             app.unread.remove(&chat);
             app.view = View::GroupChat(group);
         }
-        Event::GroupInvited { group, name } => {
+        Event::GroupInvited {
+            group,
+            name,
+            members,
+        } => {
             // Record the group so it appears in the ContactList "Groups"
             // section, then surface a notification banner.
-            app.upsert_group(group, name);
+            app.upsert_group(group, name, members);
             app.error = Some("you were added to a group".into());
         }
     }
@@ -589,21 +624,25 @@ mod tests {
             Event::GroupCreated {
                 group: gid,
                 name: "team".into(),
+                members: 2,
             },
         );
         assert_eq!(app.groups.len(), 1);
         assert_eq!(app.groups[0].name, "team");
+        assert_eq!(app.groups[0].members, 2);
         assert_eq!(app.view, View::GroupChat(gid));
-        // A re-invite with the same id refreshes the name, no duplicate row.
+        // A re-invite with the same id refreshes the name + count, no dup row.
         handle_event(
             &mut app,
             Event::GroupInvited {
                 group: gid,
                 name: "team v2".into(),
+                members: 3,
             },
         );
         assert_eq!(app.groups.len(), 1);
         assert_eq!(app.groups[0].name, "team v2");
+        assert_eq!(app.groups[0].members, 3);
     }
 
     #[test]
@@ -618,10 +657,12 @@ mod tests {
                 GroupView {
                     id: [0x22; 32],
                     name: "team".into(),
+                    members: 2,
                 },
                 GroupView {
                     id: [0x33; 32],
                     name: "squad".into(),
+                    members: 4,
                 },
             ]),
         );
@@ -633,12 +674,21 @@ mod tests {
             Event::GroupInvited {
                 group: [0x22; 32],
                 name: "team v2".into(),
+                members: 5,
             },
         );
         assert_eq!(app.groups.len(), 2);
         assert_eq!(
             app.groups.iter().find(|g| g.id == [0x22; 32]).unwrap().name,
             "team v2"
+        );
+        assert_eq!(
+            app.groups
+                .iter()
+                .find(|g| g.id == [0x22; 32])
+                .unwrap()
+                .members,
+            5
         );
     }
 
@@ -674,12 +724,15 @@ mod tests {
         app.groups.push(GroupView {
             id: [0x22; 32],
             name: "team".into(),
+            members: 2,
         });
         app.unread.insert(ChatId::Peer([0x11; 32]), 2);
         let _ = update(&mut app, Message::Logout);
         assert!(app.groups.is_empty());
         assert!(app.unread.is_empty());
         assert_eq!(app.view, View::Login);
+        assert!(app.identity_pub.is_none());
+        assert!(app.identity_fingerprint.is_none());
     }
 
     #[test]
@@ -704,5 +757,49 @@ mod tests {
             },
         );
         assert_eq!(app.threads.get(&chat).unwrap()[0].status, Status::Sent);
+    }
+
+    #[test]
+    fn replenish_count_change_updates_field() {
+        let mut app = test_app();
+        let _ = update(&mut app, Message::ReplenishCountChanged("42".into()));
+        assert_eq!(app.replenish_count, "42");
+    }
+
+    #[test]
+    fn replenish_rejects_non_positive_count() {
+        let mut app = test_app();
+        app.replenish_count = "0".into();
+        let _ = update(&mut app, Message::ReplenishOneTimePrekeys);
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("positive number"));
+        // Non-numeric is also rejected.
+        app.replenish_count = "lots".into();
+        let _ = update(&mut app, Message::ReplenishOneTimePrekeys);
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("positive number"));
+    }
+
+    #[test]
+    fn ready_event_stores_identity_fingerprint() {
+        let mut app = test_app();
+        let pub_ = [0x11; 32];
+        let fp = [0xAB; 32];
+        handle_event(
+            &mut app,
+            Event::Ready {
+                identity_pub: pub_,
+                identity_fingerprint: fp,
+            },
+        );
+        assert_eq!(app.identity_pub, Some(pub_));
+        assert_eq!(app.identity_fingerprint, Some(fp));
+        assert_eq!(app.view, View::ContactList);
     }
 }

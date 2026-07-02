@@ -8,9 +8,19 @@ use super::{hex32, Message, UmApp};
 use crate::ChatId;
 
 pub fn group_chat(app: &UmApp, group: [u8; 32]) -> Element<'_, Message> {
+    // Header: group name + member count, per the spec ("Header shows group
+    // name + member count"). Falls back to the raw group-id hex for an
+    // unknown group.
+    let title = match app.groups.iter().find(|g| g.id == group) {
+        Some(g) => {
+            let noun = if g.members == 1 { "member" } else { "members" };
+            format!("{} · {} {noun}", g.name, g.members)
+        }
+        None => format!("group {}", hex32(&group)),
+    };
     let header = row![
         button("← back").on_press(Message::Back),
-        text(format!("group {}", hex32(&group))).size(12),
+        text(title).size(12),
     ]
     .spacing(10);
 

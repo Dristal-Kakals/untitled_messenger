@@ -36,16 +36,21 @@ pub struct ContactView {
     pub verified: bool,
 }
 
-/// A group thread as the GUI lists it: group id + display name. Plain data
-/// mirroring the bridge's in-memory `group_names` (itself persisted to the
-/// store's `groups` table). The app keeps a `Vec` of these — hydrated from
-/// `Event::GroupsLoaded` on Unlock and updated by `Event::GroupCreated` /
-/// `Event::GroupInvited` at runtime — so the ContactList "Groups" section can
-/// list + open group threads.
+/// A group thread as the GUI lists it: group id, display name, and the member
+/// count (number of identity pubs in the roster). Plain data mirroring the
+/// bridge's in-memory `group_names` + `group_rosters` (themselves persisted to
+/// the store's `groups` / `group_members` tables). The app keeps a `Vec` of
+/// these — hydrated from `Event::GroupsLoaded` on Unlock and updated by
+/// `Event::GroupCreated` / `Event::GroupInvited` at runtime — so the
+/// ContactList "Groups" section can list + open group threads, and the
+/// GroupChat header can show "group name (N members)" per the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupView {
     pub id: [u8; 32],
     pub name: String,
+    /// Number of members in the roster (excludes nobody; the founder is a
+    /// member of their own group). Drives the GroupChat header member count.
+    pub members: u32,
 }
 
 /// A single chat message as the GUI displays it. `local_id` is the app's
@@ -124,6 +129,7 @@ mod tests {
         let g = GroupView {
             id: [0x55; 32],
             name: "team".into(),
+            members: 3,
         };
         assert_eq!(g, g.clone());
         assert_ne!(
@@ -137,6 +143,13 @@ mod tests {
             g,
             GroupView {
                 name: "squad".into(),
+                ..g.clone()
+            }
+        );
+        assert_ne!(
+            g,
+            GroupView {
+                members: 4,
                 ..g.clone()
             }
         );

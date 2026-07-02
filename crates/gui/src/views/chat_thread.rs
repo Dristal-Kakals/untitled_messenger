@@ -8,9 +8,17 @@ use super::{hex32, Message, UmApp};
 use crate::ChatId;
 
 pub fn chat_thread(app: &UmApp, peer: [u8; 32]) -> Element<'_, Message> {
+    // Header: peer nickname (if the peer is a known contact) + their
+    // fingerprint, per the spec ("header with peer nickname + fingerprint").
+    // Falls back to the raw identity-pub hex for an unknown peer.
+    let contact = app.contacts.iter().find(|c| c.identity_pub == peer);
+    let title = match contact {
+        Some(c) => format!("{} · {}", c.nickname, hex32(&c.fingerprint)),
+        None => format!("peer {}", hex32(&peer)),
+    };
     let header = row![
         button("← back").on_press(Message::Back),
-        text(format!("peer {}", hex32(&peer))).size(12),
+        text(title).size(12),
         button("verify fingerprint").on_press(Message::VerifyFingerprint(peer)),
     ]
     .spacing(10);

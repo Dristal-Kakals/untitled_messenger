@@ -271,8 +271,15 @@ async fn bridge_group_exchange_over_real_server() {
             let created =
                 expect_event(&mut alice_ev, |e| matches!(e, Event::GroupCreated { .. })).await;
             let group = match created {
-                Event::GroupCreated { group, name } => {
+                Event::GroupCreated {
+                    group,
+                    name,
+                    members,
+                } => {
                     assert_eq!(name, "team");
+                    // Alice founded a group with bob as the sole invitee;
+                    // member count = invitees (1) + founder (1) = 2.
+                    assert_eq!(members, 2, "GroupCreated member count = invitees + founder");
                     group
                 }
                 other => panic!("expected GroupCreated, got {other:?}"),
@@ -282,9 +289,16 @@ async fn bridge_group_exchange_over_real_server() {
             let invited =
                 expect_event(&mut bob_ev, |e| matches!(e, Event::GroupInvited { .. })).await;
             match invited {
-                Event::GroupInvited { group: g, name } => {
+                Event::GroupInvited {
+                    group: g,
+                    name,
+                    members,
+                } => {
                     assert_eq!(g, group);
                     assert_eq!(name, "team");
+                    // Bob's roster at invite time = {alice} (the inviter) →
+                    // count = roster (1) + self (1) = 2.
+                    assert_eq!(members, 2, "GroupInvited member count = inviter + self");
                 }
                 other => panic!("expected GroupInvited, got {other:?}"),
             }

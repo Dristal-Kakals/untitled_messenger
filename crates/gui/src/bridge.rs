@@ -299,9 +299,12 @@ impl Bridge {
         self.store_path = Some(path);
         self.config.last_identity_pub = pub_hex;
         let _ = crate::config::save(&self.config);
+        let identity_pub = self.session.identity_pub();
+        let identity_fingerprint = self.session.fingerprint();
         let _ = event_tx
             .send(Event::Ready {
-                identity_pub: self.session.identity_pub(),
+                identity_pub,
+                identity_fingerprint,
             })
             .await;
     }
@@ -347,13 +350,19 @@ impl Bridge {
         self.store = Some(store);
         self.store_path = Some(path);
         let identity_pub = self.session.identity_pub();
+        let identity_fingerprint = self.session.fingerprint();
         let contacts = self.load_contacts().unwrap_or_default();
         // Rebuild the in-memory group rosters + names from the persisted
         // `groups`/`group_members` tables so group sends and the ContactList
         // "Groups" section work right after a restart (the Sender-Key sessions
         // are restored from `session`, but the rosters are bridge-local).
         let groups = self.load_groups();
-        let _ = event_tx.send(Event::Ready { identity_pub }).await;
+        let _ = event_tx
+            .send(Event::Ready {
+                identity_pub,
+                identity_fingerprint,
+            })
+            .await;
         let _ = event_tx.send(Event::ContactsLoaded(contacts)).await;
         let _ = event_tx.send(Event::GroupsLoaded(groups)).await;
     }
@@ -683,10 +692,15 @@ impl Bridge {
             }
         }
         self.persist_session();
+        // Roster size = invitees + the founder (us). The founder is always a
+        // member of their own group; the roster stored above is invitees-only,
+        // so add 1 for the GroupChat header member count.
+        let member_count = (members.len() as u32).saturating_add(1);
         let _ = event_tx
             .send(Event::GroupCreated {
                 group: group_id,
                 name: name.clone(),
+                members: member_count,
             })
             .await;
         if failed > 0 {
@@ -1086,10 +1100,20 @@ impl Bridge {
             );
         }
         self.persist_session();
+        // Roster size the bridge knows so far: the peers we have exchanged
+        // distributions with (the roster map) plus ourselves. At minimum this
+        // is the inviter + us = 2.
+        let roster_len = self
+            .group_rosters
+            .get(&group)
+            .map(|r| r.len() as u32)
+            .unwrap_or(0);
+        let member_count = roster_len.saturating_add(1);
         let _ = event_tx
             .send(Event::GroupInvited {
                 group,
                 name: self.group_names.get(&group).cloned().unwrap_or_default(),
+                members: member_count,
             })
             .await;
     }
@@ -1208,11 +1232,16 @@ impl Bridge {
         let mut views = Vec::with_capacity(groups.len());
         for g in groups {
             let members = store.group_members(&g.group_id).unwrap_or_default();
+            // Member count = persisted roster + ourselves (we are a member of
+            // every group we know). The roster table holds the *other*
+            // members; the founder/invitee self-entry is implicit.
+            let member_count = (members.len() as u32).saturating_add(1);
             self.group_rosters.insert(g.group_id, members);
             self.group_names.insert(g.group_id, g.name.clone());
             views.push(GroupView {
                 id: g.group_id,
                 name: g.name,
+                members: member_count,
             });
         }
         views

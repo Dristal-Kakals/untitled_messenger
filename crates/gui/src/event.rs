@@ -8,8 +8,13 @@ use crate::types::{ChatId, ContactView, GroupView, MessageView};
 pub enum Event {
     // ---- Lifecycle -----------------------------------------------------
     /// Setup or Unlock succeeded; the identity is ready. Carries the identity
-    /// pub so the UI can display it.
-    Ready { identity_pub: [u8; 32] },
+    /// pub (so the UI can display it) and the identity fingerprint
+    /// (`SHA-256` of the pub, so the Settings view can show it per the spec
+    /// without re-deriving it in the display layer).
+    Ready {
+        identity_pub: [u8; 32],
+        identity_fingerprint: [u8; 32],
+    },
     /// Connected to the relay, registered, and subscribed for push.
     Connected,
     /// The recv-loop died; the bridge will retry with backoff.
@@ -45,8 +50,18 @@ pub enum Event {
     FingerprintVerified { identity_pub: [u8; 32] },
 
     // ---- Group ---------------------------------------------------------
-    /// A group was created locally.
-    GroupCreated { group: [u8; 32], name: String },
-    /// We were added to a group (received a sender-key distribution).
-    GroupInvited { group: [u8; 32], name: String },
+    /// A group was created locally. `members` is the roster size (founder +
+    /// invitees), so the GroupChat header can show "name (N members)".
+    GroupCreated {
+        group: [u8; 32],
+        name: String,
+        members: u32,
+    },
+    /// We were added to a group (received a sender-key distribution). `members`
+    /// is the roster size the bridge knows so far (at least the inviter + us).
+    GroupInvited {
+        group: [u8; 32],
+        name: String,
+        members: u32,
+    },
 }

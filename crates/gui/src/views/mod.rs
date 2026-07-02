@@ -55,7 +55,6 @@ pub fn route_after_event(ev: &crate::Event, _current: &View) -> Option<View> {
         _ => None,
     }
 }
-
 /// Render the first 4 bytes of a key as short hex for display.
 pub fn short_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(11);
@@ -105,6 +104,7 @@ mod tests {
     fn route_after_event_ready_goes_to_contact_list() {
         let ev = Event::Ready {
             identity_pub: [0x11; 32],
+            identity_fingerprint: [0xAB; 32],
         };
         assert_eq!(
             route_after_event(&ev, &View::Login),
@@ -118,6 +118,7 @@ mod tests {
         let ev = Event::GroupCreated {
             group: gid,
             name: "team".into(),
+            members: 2,
         };
         assert_eq!(
             route_after_event(&ev, &View::ContactList),
